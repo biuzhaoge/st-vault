@@ -1,0 +1,189 @@
+name: Publish release
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: dockerhub-release
+  queue: max
+env:
+  IMAGE: biuzhaoge/st-vault
+jobs:
+  plan:
+    if: github.repository == 'biuzhaoge/st-vault' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: plan
+        run: node scripts/dockerhub-release.mjs plan
+      - env:
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [[ -z "$DOCKERHUB_TOKEN" ]]; then
+            echo '::error::Configure the DOCKERHUB_TOKEN repository secret.'
+            exit 1
+          fi
+  verify:
+    needs: plan
+    uses: ./.github/workflows/ci.yml
+  runtime:
+    needs: [plan, verify]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    env:
+      ARCH: ${{ matrix.arch }}
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Build the runtime image
+        run: |
+          docker build --provenance=false --target runtime -f deploy/Dockerfile \
+            --build-arg STV_BUILD_REVISION="$GITHUB_SHA" \
+            --build-arg STV_SOURCE_URL="https://github.com/$GITHUB_REPOSITORY" \
+            -t "$IMAGE:build-$GITHUB_RUN_ID-$ARCH" .
+          actual="$(docker run --rm --network none --entrypoint node "$IMAGE:build-$GITHUB_RUN_ID-$ARCH" \
+            -p 'require("./apps/server/package.json").version')"
+          [[ "$actual" == "$VERSION" ]]
+      - name: Test the runtime lifecycle on its native architecture
+        shell: pwsh
+        run: |
+          $image = '{0}:build-{1}-{2}' -f $env:IMAGE, $env:GITHUB_RUN_ID, $env:ARCH
+          ./tests/deployment/lifecycle.ps1 -Image $image -Platform "linux/$env:ARCH"
+      - name: Push the tested image directly to Docker Hub
+        env:
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          printf '%s' "$DOCKERHUB_TOKEN" | docker login --username biuzhaoge --password-stdin
+          docker push "$IMAGE:build-$GITHUB_RUN_ID-$ARCH"
+  publish:
+    needs: [plan, runtime]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      promoted: ${{ steps.publish.outputs.promoted }}
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Publish the verified image and GitHub Release
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          printf '%s' "$DOCKERHUB_TOKEN" | docker login --username biuzhaoge --password-stdin
+          verify_arch() {
+            docker buildx imagetools inspect "$1" --format '{{json .Image}}' | jq -e \
+              --arg arch "$2" --arg revision "$GITHUB_SHA" '
+                .os == "linux" and .architecture == $arch and
+                .config.Labels["org.opencontainers.image.revision"] == $revision' >/dev/null
+          }
+          verify_index() {
+            index="$(docker buildx imagetools inspect --raw "$1")"
+            jq -e '[.manifests[].platform | (.os + "/" + .architecture)]
+              | sort == ["linux/amd64", "linux/arm64"]' <<< "$index" >/dev/null
+            for arch in amd64 arm64; do
+              digest="$(jq -er --arg arch "$arch" '.manifests[] | select(.platform.architecture == $arch) | .digest' <<< "$index")"
+              verify_arch "$IMAGE@$digest" "$arch"
+            done
+          }
+          existing="$(node scripts/dockerhub-release.mjs tag "$VERSION")"
+          if [[ -z "$existing" ]]; then
+            sources=()
+            for arch in amd64 arm64; do
+              candidate="$IMAGE:build-$GITHUB_RUN_ID-$arch"
+              verify_arch "$candidate" "$arch"
+              digest="$(docker buildx imagetools inspect "$candidate" --format '{{json .Manifest}}' | jq -er .digest)"
+              sources+=("$IMAGE@$digest")
+            done
+          else
+            verify_index "$IMAGE@$existing"
+          fi
+          git_tag="v$VERSION"
+          ref="refs/tags/$git_tag"
+          # Reserve the source version without replacing an earlier publication.
+          if reserved="$(git rev-parse --verify --quiet "$ref^{commit}")"; then
+            [[ "$reserved" == "$GITHUB_SHA" ]]
+          else
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" -f ref="$ref" -f sha="$GITHUB_SHA" --silent
+          fi
+          if [[ -z "$existing" ]]; then
+            docker buildx imagetools create --tag "$IMAGE:$VERSION" "${sources[@]}"
+            verify_index "$IMAGE:$VERSION"
+          fi
+          main="$(git ls-remote origin refs/heads/main | cut -f1)"
+          [[ "$main" =~ ^[0-9a-f]{40}$ ]]
+          # Only current main can promote a new release. A retry may finish an already promoted release.
+          promote=false
+          version_digest="$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' | jq -er .digest)"
+          latest="$(node scripts/dockerhub-release.mjs tag latest)"
+          if [[ "$main" == "$GITHUB_SHA" || "$latest" == "$version_digest" ]]; then
+            promote=true
+          fi
+          node scripts/dockerhub-release.mjs notes "$RUNNER_TEMP/release-notes.md"
+          if ! gh release view "$git_tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$git_tag" --repo "$GITHUB_REPOSITORY" --verify-tag \
+              --title "ST-Vault $VERSION" --notes-file "$RUNNER_TEMP/release-notes.md" --latest="$promote"
+          fi
+          if [[ "$promote" == true ]]; then
+            gh release edit "$git_tag" --repo "$GITHUB_REPOSITORY" --latest
+            if [[ "$latest" != "$version_digest" ]]; then
+              docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE@$version_digest"
+              actual="$(docker buildx imagetools inspect "$IMAGE:latest" --format '{{json .Manifest}}' | jq -er .digest)"
+              [[ "$actual" == "$version_digest" ]]
+            fi
+          fi
+          echo "promoted=$promote" >> "$GITHUB_OUTPUT"
+  cleanup:
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Remove temporary Docker Hub tags for this run
+        env:
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: node scripts/dockerhub-release.mjs cleanup
+  overview:
+    needs: [plan, publish]
+    if: needs.publish.outputs.promoted == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Render the current release overview
+        run: node scripts/dockerhub-release.mjs overview "$RUNNER_TEMP/dockerhub-overview.md"
+      - name: Sync the Docker Hub Overview
+        uses: peter-evans/dockerhub-description@e98e4d1628a5f3be2be7c231e50981aee98723ae # v4.0.0
+        with:
+          username: biuzhaoge
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: biuzhaoge/st-vault
+          short-description: Record public livestreams and browse the replay timeline on your NAS.
+          readme-filepath: ${{ runner.temp }}/dockerhub-overview.md

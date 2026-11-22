@@ -1,0 +1,109 @@
+.status-line {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  height: calc(100% / 6);
+  overflow: hidden;
+  border-radius: var(--radius-small);
+  background: #24262a;
+}
+.recording-line,
+.track-loading {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: calc(100% / 6 + 4px);
+  bottom: 4px;
+  overflow: hidden;
+  border-radius: var(--radius-small);
+}
+.recording-line {
+  background: #1e2023;
+}
+.track-loading {
+  display: none;
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    opacity var(--motion-fast) var(--motion-ease),
+    display var(--motion-fast) allow-discrete;
+}
+.track-loading::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(105deg, transparent 36%, #fff3 50%, transparent 64%);
+  animation: track-loading-sweep 1.35s ease-in-out infinite;
+}
+.track-row .track-lane[data-track-state='loading'] .track-loading {
+  display: block;
+  opacity: 1;
+  transition-delay: 90ms, 0s;
+}
+@starting-style {
+  .track-row .track-lane[data-track-state='loading'] .track-loading {
+    opacity: 0;
+  }
+}
+.track-table-scroll[data-scrolling='true'] .track-loading,
+.track-lane[data-track-state='idle'] .track-loading,
+.track-lane[data-track-state='failed'] .track-loading {
+  display: none;
+  transition: none;
+}
+.track-table-scroll[data-scrolling='false']
+  .track-row
+  .track-lane[data-track-state='ready']
+  .timeline-content {
+  animation: track-data-reveal var(--motion-fast) var(--motion-ease) var(--track-reveal-delay, 0ms)
+    backwards;
+}
+.track-row .track-lane[data-track-state='ready'] .track-loading {
+  transition-delay: var(--track-reveal-delay, 0ms);
+}
+@keyframes track-loading-sweep {
+  from {
+    transform: translateX(-65%);
+  }
+  to {
+    transform: translateX(65%);
+  }
+}
+@keyframes track-data-reveal {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+.track-clip {
+  position: absolute;
+  top: 0;
+  height: 100%;
+  min-width: 1px;
+  background: #bd4049;
+  pointer-events: none;
+}
+.timeline-content {
+  position: absolute;
+  inset: 0;
+}
+.timeline-hover-preview {
+  position: fixed;
+  z-index: 1000;
+  pointer-events: none;
+  overflow: hidden;
+  border: 1px solid var(--glass-border, #ffffff24);
+  border-radius: var(--radius-small);
+  background: #181818f2;
+  box-shadow: 0 8px 28px #0008;
+}
+.timeline-hover-preview img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #000;
+}

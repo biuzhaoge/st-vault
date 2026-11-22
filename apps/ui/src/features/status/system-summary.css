@@ -1,0 +1,66 @@
+.system-summary {
+  display: grid;
+  gap: 0;
+  font-variant-numeric: tabular-nums;
+}
+.system-summary .panel-status {
+  gap: 0;
+  padding-inline-start: 8px;
+}
+.system-summary .panel-status-notes {
+  padding-block-end: 4px;
+  overflow-wrap: anywhere;
+}
+.system-summary .panel-status.is-error .panel-status-notes {
+  color: var(--accent-hover);
+}
+.system-group {
+  padding-block: 4px;
+  border-top: 1px solid var(--line);
+}
+.system-group h3 {
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.4;
+  margin: 0;
+}
+.system-summary .panel-status-row {
+  min-block-size: 22px;
+}
+.system-summary .panel-badge {
+  flex: 0 1 auto;
+  min-inline-size: 0;
+  text-align: end;
+  white-space: normal;
+}
+.system-summary .panel-badge.is-busy::before {
+  display: none;
+}
+.system-summary .operation-spinner {
+  width: 11px;
+  height: 11px;
+}
+.system-retry {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  min-inline-size: 64px;
+}
+.system-summary .disk-track {
+  flex: none;
+  inline-size: 40px;
+  block-size: 4px;
+  border-radius: var(--radius-pill);
+  background: var(--line);
+  overflow: hidden;
+}
+.system-summary .disk-track > span {
+  display: block;
+  block-size: 100%;
+  background: var(--success);
+}
+.system-row.is-warning .disk-track > span {
+  background: currentColor;
+}
