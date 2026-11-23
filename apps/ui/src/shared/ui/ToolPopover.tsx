@@ -3,7 +3,11 @@ import { useId, useLayoutEffect, useRef, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom';
 import { Icon, type IconName } from '../../design/Icon';
 import { animateSurface, interruptSurface } from '../../design/motion';
-import { popoverPlacement, type PopoverSide } from '../lib/popover-placement';
+import {
+  popoverPlacement,
+  visiblePopoverViewport,
+  type PopoverSide,
+} from '../lib/popover-placement';
 
 export function ToolPopover({
   title,
@@ -21,7 +25,7 @@ export function ToolPopover({
 }: {
   title: string;
   icon: IconName;
-  size?: 'narrow' | 'compact' | 'regular' | 'wide';
+  size?: 'compact' | 'regular' | 'wide';
   open: boolean;
   onToggle: () => void;
   onClose: () => void;
@@ -80,10 +84,12 @@ export function ToolPopover({
         anchor = button.current;
       if (!element || !anchor) return;
       const box = anchor.getBoundingClientRect();
+      const viewport = visiblePopoverViewport();
+      element.style.maxWidth = `${Math.max(0, viewport.width - 24)}px`;
       const placement = popoverPlacement(
         box,
         { width: element.offsetWidth, height: element.offsetHeight },
-        { width: window.innerWidth, height: window.innerHeight },
+        viewport,
         side,
       );
       side = placement.side;
@@ -146,6 +152,8 @@ export function ToolPopover({
       if (!element.contains(event.target as Node)) place();
     };
     window.addEventListener('resize', resize);
+    window.visualViewport?.addEventListener('resize', resize);
+    window.visualViewport?.addEventListener('scroll', resize);
     document.addEventListener('scroll', scroll, true);
     document.addEventListener('pointerdown', outside);
     document.addEventListener('keydown', escape);
@@ -154,6 +162,8 @@ export function ToolPopover({
       observer.disconnect();
       mutations.disconnect();
       window.removeEventListener('resize', resize);
+      window.visualViewport?.removeEventListener('resize', resize);
+      window.visualViewport?.removeEventListener('scroll', resize);
       document.removeEventListener('scroll', scroll, true);
       document.removeEventListener('pointerdown', outside);
       document.removeEventListener('keydown', escape);

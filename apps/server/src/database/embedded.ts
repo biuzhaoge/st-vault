@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
-import { mkdir, lstat, mkdtemp, readFile, writeFile, rename, rm } from 'node:fs/promises';
+import { mkdir, lstat, mkdtemp, readFile, writeFile, rename, rm, statfs } from 'node:fs/promises';
+import { createInterface } from 'node:readline';
 import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
@@ -15,6 +16,7 @@ import type { PostgresClusterIdentity } from './postgres-processes.js';
 import { Client } from 'pg';
 import type { PoolConfig } from 'pg';
 import { getExecutionPolicy } from '../runtime/execution-policy.js';
+import { boundedLogMirror } from '../runtime/runtime-logs.js';
 
 interface Options {
   root: string;
@@ -46,6 +48,36 @@ async function directory(filename: string): Promise<void> {
   await mkdir(filename, { recursive: true, mode: 0o700 });
   const info = await lstat(filename);
   if (!info.isDirectory() || info.isSymbolicLink()) throw Error('UNSAFE_POSTGRES_PATH');
+}
+async function checkPostgresFilesystem(directory: string): Promise<void> {
+  const type = (await statfs(directory)).type >>> 0;
+  const filesystem =
+    type === 0x01021997 ? '9p' : [0xfe534d42, 0xff534d42].includes(type) ? 'SMB' : null;
+  if (filesystem)
+    throw Error(
+      `UNSUPPORTED_POSTGRES_FILESYSTEM: ${filesystem} at ${directory}. Use Linux-native storage or a local Docker volume for the PostgreSQL directory. Preserve existing data when changing mounts.`,
+    );
+}
+
+function observePostgresStderr(child: ChildProcess): void {
+  if (!child.stderr) throw Error('POSTGRES_STDERR_UNAVAILABLE');
+  const mirror = boundedLogMirror(
+    (line) => process.stderr.write(line),
+    () => process.stderr.writableLength,
+    (listener) => process.stderr.once('drain', listener),
+  );
+  createInterface({ input: child.stderr, crlfDelay: Infinity }).on('line', (line) => {
+    mirror(line + '\n');
+    const terminated = /\bLOG:\s+.+? \(PID (\d+)\) was terminated by signal (\d+)/.exec(line);
+    if (terminated)
+      console.warn(
+        JSON.stringify({
+          event: 'postgres_child_terminated',
+          childPid: Number(terminated[1]),
+          signal: Number(terminated[2]),
+        }),
+      );
+  });
 }
 /** Owns one private, Unix-socket-only PostgreSQL child, not the application process. */
 export class EmbeddedPostgres {
@@ -97,13 +129,25 @@ export class EmbeddedPostgres {
     const uid = process.getuid?.();
     if (!uid) throw Error('POSTGRES_REQUIRES_NON_ROOT');
     const root = path.resolve(options.root);
+    const storageRoot = path.join(root, 'postgres');
+    const cluster = path.join(storageRoot, '18');
     await directory(root);
+    await directory(storageRoot);
+    await checkPostgresFilesystem(storageRoot);
+    if (await exists(cluster)) {
+      await checkPostgresFilesystem(cluster);
+      const wal = path.join(cluster, 'pg_wal');
+      try {
+        await checkPostgresFilesystem(wal);
+      } catch (error) {
+        if (!(error instanceof Error && 'code' in error && error.code === 'ENOENT')) throw error;
+      }
+    }
     await directory(path.join(root, 'private'));
-    await directory(path.join(root, 'postgres'));
-    const lease = await FileLease.acquire(path.join(root, 'postgres', '.instance.lock'));
+    const lease = await FileLease.acquire(path.join(storageRoot, '.instance.lock'));
     const ownership = { transferred: false };
     try {
-      return await EmbeddedPostgres.openLocked(options, root, uid, lease, ownership);
+      return await EmbeddedPostgres.openLocked(options, root, cluster, uid, lease, ownership);
     } catch (error) {
       if (!ownership.transferred) await lease.close();
       throw error;
@@ -112,6 +156,7 @@ export class EmbeddedPostgres {
   private static async openLocked(
     options: Options,
     root: string,
+    cluster: string,
     uid: number,
     lease: FileLease,
     ownership: { transferred: boolean },
@@ -135,7 +180,6 @@ export class EmbeddedPostgres {
       password = randomBytes(32).toString('hex');
       atomicJson(credentials, { password });
     }
-    const cluster = path.join(root, 'postgres', '18');
     const temporary = await mkdtemp(path.join(tmpdir(), 'stv-postgres-'));
     const environment = { ...process.env };
     if (options.nssWrapper) {
@@ -152,13 +196,11 @@ export class EmbeddedPostgres {
     let service: EmbeddedPostgres | undefined;
     try {
       if (!(await exists(cluster))) {
-        const staging = path.join(root, 'postgres', 'initializing');
+        const staging = path.join(path.dirname(cluster), 'initializing');
         if (await exists(staging)) {
           if (!initializing) throw Error('POSTGRES_INITIALIZATION_INCOMPLETE');
           // Only our marked, reserved initdb staging directory is disposable.
           // A completed cluster is never removed by this recovery path.
-          if (path.dirname(staging) !== path.join(root, 'postgres'))
-            throw Error('UNSAFE_POSTGRES_PATH');
           await rm(staging, { recursive: true });
         }
         atomicJson(credentials, { password, initializing: true });
@@ -212,6 +254,8 @@ export class EmbeddedPostgres {
           'log_min_messages=warning',
           'log_statement=none',
           'log_min_error_statement=panic',
+          'log_error_verbosity=terse',
+          "lc_messages='C'",
           'logging_collector=off',
         ].join('\n') + '\n',
         { mode: 0o600 },
@@ -220,8 +264,9 @@ export class EmbeddedPostgres {
       const child = spawn(
         path.join(options.binaries, 'postgres'),
         ['-D', cluster, '-c', `config_file=${configuration}`],
-        { env: environment, stdio: ['ignore', 'inherit', 'inherit'], detached: true },
+        { env: environment, stdio: ['ignore', 'inherit', 'pipe'], detached: true },
       );
+      observePostgresStderr(child);
       service = new EmbeddedPostgres(
         child,
         temporary,

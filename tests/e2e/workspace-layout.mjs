@@ -24,10 +24,8 @@ try {
       [1440, 900],
       [1280, 720],
       [1920, 1080],
-      [900, 900],
-      [768, 1024],
       [1024, 768],
-      [800, 600],
+      [744, 600],
     ])
       for (const english of [false, true]) {
         await page.setViewportSize({ width, height });
@@ -50,15 +48,14 @@ try {
             header: rect('.topbar'),
             viewer: rect('.studio-viewer'),
             list: rect('.aligned-arrangement'),
+            rail: rect('.connection-rail'),
             picture: rect('.player-picture'),
             review: rect('.media-review'),
             tools: rect('.header-tools'),
             visibleLabels: [
               ...document.querySelectorAll('.tool-label, .logout-button > span'),
             ].filter((label) => label.getBoundingClientRect().width > 0).length,
-            gap: parseFloat(
-              getComputedStyle(document.documentElement).getPropertyValue('--workspace-gap'),
-            ),
+            gap: parseFloat(getComputedStyle(document.querySelector('.studio-shell')).rowGap),
             radii: ['.topbar', '.player-stage', '.media-review', '.aligned-arrangement'].map(
               (selector) => getComputedStyle(document.querySelector(selector)).borderTopLeftRadius,
             ),
@@ -81,6 +78,8 @@ try {
         assert.equal(new Set(boxes.radii).size, 1, 'Main module corners share one radius');
         near(boxes.list.top, boxes.viewer.top, 'top alignment');
         near(boxes.list.bottom, boxes.viewer.bottom, 'bottom alignment');
+        near(boxes.rail.top, boxes.viewer.top, 'connection rail starts with the workspace');
+        near(boxes.rail.bottom, boxes.viewer.bottom, 'connection rail fills the workspace');
         near(boxes.viewer.top - boxes.header.bottom, boxes.gap, 'header gap');
         near(boxes.list.left - boxes.viewer.right, boxes.gap, 'column gap');
         near(boxes.review.top - boxes.picture.bottom, boxes.gap, 'player/review gap');

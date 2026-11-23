@@ -1,6 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
 import type { SessionInfo } from '@st-vault/api-schema';
-import { allowsCredentialUrl } from '@st-vault/api-schema';
 import { tr } from '../../shared/lib/i18n';
 import { ApiError, request } from '../../shared/lib/api';
 import { messageFor } from '../../shared/lib/errors';
@@ -141,10 +140,6 @@ export function AuthGate({
   const initializing = localSession.setupRequired || localSession.credential === 'password';
   const migration = localSession.credential === 'password';
   const authorized = localSession.setupAuthorized === true;
-  const insecure = typeof window !== 'undefined' && !allowsCredentialUrl(window.location.href);
-  const transportError = insecure
-    ? tr('公网地址发送登录凭据必须使用 HTTPS；局域网私有 IP 和 localhost 可使用 HTTP。')
-    : '';
   useEffect(() => {
     if (busy) return;
     if (error) form.current?.querySelector<HTMLInputElement>('[name="pin"]')?.focus();
@@ -159,7 +154,7 @@ export function AuthGate({
   }, []);
 
   async function begin(legacyPassword?: string): Promise<void> {
-    if (locked.current || insecure) return;
+    if (locked.current) return;
     locked.current = true;
     setBusy(true);
     setError('');
@@ -181,12 +176,11 @@ export function AuthGate({
     }
   }
   useEffect(() => {
-    if (!localSession.setupRequired || authorized || attempted.current || insecure || committed)
-      return;
+    if (!localSession.setupRequired || authorized || attempted.current || committed) return;
     // A ref survives StrictMode's effect replay, so only one lease request is issued.
     attempted.current = true;
     void begin();
-  }, [localSession.setupRequired, authorized, insecure, committed]);
+  }, [localSession.setupRequired, authorized, committed]);
 
   async function readCompletedSession(kind: 'setup' | 'login'): Promise<void> {
     try {
@@ -229,7 +223,7 @@ export function AuthGate({
     setError(tr('初始化会话已过期，请重新验证后继续。'));
   }
   async function submitPin(value: string, confirmation = confirm): Promise<void> {
-    if (locked.current || insecure || committed) return;
+    if (locked.current || committed) return;
     if (!/^\d{6}$/.test(value)) {
       setError(tr('请输入 6 位数字 PIN。'));
       return;
@@ -297,9 +291,7 @@ export function AuthGate({
           </div>
           <h1 id="auth-title">{title}</h1>
         </header>
-        {!committed && (transportError || error) && (
-          <PanelFeedback kind="error">{transportError || error}</PanelFeedback>
-        )}
+        {!committed && error && <PanelFeedback kind="error">{error}</PanelFeedback>}
         {committed ? (
           <AuthCompletion busy={busy} error={error} onRetry={() => void retryEntry()} />
         ) : initializing && !authorized ? (
@@ -324,27 +316,25 @@ export function AuthGate({
                   autoFocus
                   maxLength={256}
                   value={password}
-                  disabled={busy || insecure}
+                  disabled={busy}
                   onChange={(event) => {
                     setPassword(event.target.value);
                     setError('');
                   }}
                 />
               </label>
-              <button className="primary auth-submit" disabled={busy || insecure || !password}>
+              <button className="primary auth-submit" disabled={busy || !password}>
                 {busy && <ProgressRing />}
                 {busy ? tr('正在验证…') : tr('验证并继续')}
               </button>
             </form>
           ) : (
             <div className="auth-form">
-              {!error && !insecure && (
-                <PanelFeedback kind="busy">{tr('正在准备初始化…')}</PanelFeedback>
-              )}
+              {!error && <PanelFeedback kind="busy">{tr('正在准备初始化…')}</PanelFeedback>}
               {!!error && (
                 <button
                   className="primary auth-submit"
-                  disabled={busy || insecure}
+                  disabled={busy}
                   onClick={() => void begin()}
                 >
                   {busy && <ProgressRing />}
@@ -367,7 +357,7 @@ export function AuthGate({
               creating={initializing}
               pin={pin}
               confirm={confirm}
-              disabled={busy || insecure}
+              disabled={busy}
               onPin={(value) => {
                 setPin(value);
                 setConfirm('');

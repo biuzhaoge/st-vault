@@ -4,6 +4,7 @@ import type { FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 import { ioCode } from './derivative-diagnostics.js';
 import type { DerivativeDiagnostics } from './derivative-diagnostics.js';
+import type { SubjectImageKind } from '../library/paths.js';
 
 const uuid = '[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}';
 const cacheTemporary = new RegExp(
@@ -15,7 +16,7 @@ const snapshotTemporary = new RegExp(
 async function* knownFiles(
   root: string,
   kind: 'cache' | 'snapshot' | 'library',
-  owner?: 'cover' | 'avatar' | 'snapshot',
+  owner?: SubjectImageKind | 'snapshot',
 ): AsyncGenerator<string | null> {
   const directory = await opendir(root);
   for await (const entry of directory) {
@@ -88,7 +89,7 @@ export class AtomicDerivativeWriter {
     private readonly root: string,
     private readonly kind: 'cache' | 'snapshot' | 'library',
     private readonly diagnostics: DerivativeDiagnostics,
-    private readonly owner?: 'cover' | 'avatar' | 'snapshot',
+    private readonly owner?: SubjectImageKind | 'snapshot',
   ) {
     this.scan = knownFiles(root, kind, owner);
   }
@@ -200,7 +201,7 @@ export class AtomicDerivativeWriter {
         this.kind === 'cache'
           ? /^[a-f0-9]{64}\.img$/
           : this.kind === 'library'
-            ? /^stripchat-[1-9]\d*\/(?:images\/(?:cover|avatar)\.img|thumbnails\/\d{4}-\d{2}-\d{2}\/\d{2}\/\d+-\d+(?:-[a-f0-9]{64})?\.jpg(?:\.json)?)$/
+            ? /^stripchat-[1-9]\d*\/(?:images\/(?:cover|default-cover|avatar)\.img|thumbnails\/\d{4}-\d{2}-\d{2}\/\d{2}\/\d+-\d+(?:-[a-f0-9]{64})?\.jpg(?:\.json)?)$/
             : /^[1-9]\d*\/\d+-\d+(?:-[a-f0-9]{64})?\.jpg(?:\.json)?$/
       ).test(relative)
     )

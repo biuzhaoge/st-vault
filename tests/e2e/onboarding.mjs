@@ -5,7 +5,7 @@ import { chromium } from 'playwright-core';
 import { startFixture } from './support/fixture.mjs';
 import { outputRoot } from './support/media.mjs';
 
-const origin = 'http://127.0.0.1:10085';
+const origin = `http://${process.env.STV_QA_ONBOARDING_HOST ?? '127.0.0.1'}:10085`;
 const report = { synthetic: true, productionCredentialsRead: false, checks: {}, passed: false };
 const errors = [];
 let browser, fixture, context, page;
@@ -170,13 +170,15 @@ try {
   assert.equal((await (await context.request.get(origin + '/api/keys')).json()).keyCount, 0);
   await keyInput.fill('onboarding:sample-key');
   await keyPanel.getByRole('button', { name: '添加密钥', exact: true }).click();
+  await keyPanel.getByText('onboarding', { exact: true }).waitFor();
   await keyPanel.getByText('sample-key', { exact: true }).waitFor();
   await keyPanel.getByText('等待直播验证', { exact: true }).waitFor();
   assert.equal(await keyInput.inputValue(), '');
   await keyInput.fill('replacement : new-sample-key');
   await keyPanel.getByRole('button', { name: '更换密钥', exact: true }).click();
+  await keyPanel.getByText('replacement', { exact: true }).waitFor();
   await keyPanel.getByText('new-sample-key', { exact: true }).waitFor();
-  assert.equal(await keyPanel.getByText('sample-key', { exact: true }).count(), 0);
+  assert.equal(await keyPanel.getByText('onboarding', { exact: true }).count(), 0);
   assert.equal((await (await context.request.get(origin + '/api/keys')).json()).keyCount, 1);
   await page.keyboard.press('Escape');
   assert.equal(

@@ -26,6 +26,7 @@ const scenarios = [
   'snapshot-roll',
   'review-layout',
   'workspace-layout',
+  'tablet-layout',
   'localization-layout',
   'history-follow',
   'display-clock',

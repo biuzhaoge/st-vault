@@ -1,4 +1,5 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { once } from 'node:events';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -23,6 +24,46 @@ afterEach(async () => {
   for (const action of cleanup.splice(0).reverse()) await action();
 });
 describe.skipIf(process.env.STV_TEST_POSTGRES !== '1')('embedded PostgreSQL contracts', () => {
+  it('reports backend termination even while the postmaster survives', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'stv-pg-backend-'));
+    cleanup.push(() => rm(root, { recursive: true, force: true }));
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const server = await EmbeddedPostgres.open({
+      root,
+      binaries: process.env.STV_POSTGRES_BIN ?? '/usr/lib/postgresql/18/bin',
+    });
+    cleanup.push(() => server.close());
+    const client = new Client(server.connection);
+    try {
+      await client.connect();
+      const facts = await client.query<{ pid: number; worker: string }>(
+        "SELECT pg_backend_pid() AS pid,current_setting('io_method') AS worker",
+      );
+      expect(facts.rows[0].worker).toBe('worker');
+      const { pid } = facts.rows[0];
+      const terminated = once(client, 'error');
+      // SIGKILL exercises postmaster recovery without producing a test core dump.
+      process.kill(pid, 'SIGKILL');
+      await terminated;
+      await vi.waitFor(() =>
+        expect(warning).toHaveBeenCalledWith(
+          JSON.stringify({ event: 'postgres_child_terminated', childPid: pid, signal: 9 }),
+        ),
+      );
+      const db = new Postgres({ connection: server.connection });
+      try {
+        await vi.waitFor(async () => expect(await db.query('SELECT 1 AS n')).toEqual([{ n: 1 }]), {
+          timeout: 10000,
+          interval: 100,
+        });
+      } finally {
+        await db.close();
+      }
+    } finally {
+      warning.mockRestore();
+      await client.end();
+    }
+  }, 30000);
   async function fixture(
     budgets: Omit<ConstructorParameters<typeof Postgres>[0], 'connection'> = {},
   ) {
@@ -54,6 +95,15 @@ describe.skipIf(process.env.STV_TEST_POSTGRES !== '1')('embedded PostgreSQL cont
       },
     };
   }
+  it('reopens the existing cluster at data/postgres with the persisted data', async () => {
+    const f = await fixture();
+    const version = await readFile(path.join(f.root, 'postgres', '18', 'PG_VERSION'), 'utf8');
+    expect(version.trim()).toBe('18');
+    await f.db.query('CREATE TABLE storage_contract (id INTEGER PRIMARY KEY)');
+    await f.db.query('INSERT INTO storage_contract VALUES (42)');
+    await f.restart();
+    expect(await f.db.query('SELECT id FROM storage_contract')).toEqual([{ id: 42 }]);
+  }, 30000);
   it('cancels an overlong interactive read and returns a clean reusable connection', async () => {
     const f = await fixture({ interactiveConnections: 1 });
     await expect(

@@ -17,6 +17,7 @@ interface ResourceOptions {
   clock?: SyncClock;
   root: string;
   dataRoot?: string;
+  databaseRoot?: string;
   archive: Pick<ArchivePort, 'pruneBefore' | 'scrub'>;
   settings: () => RuntimeSettings;
   changed?: () => void;
@@ -166,39 +167,35 @@ export class ResourceMonitor {
     const settings = this.options.settings();
     const previously = this.canRecord();
     try {
-      const stats = this.options.readDisk
-        ? await this.options.readDisk(this.options.root)
-        : await statfs(this.options.root, { bigint: true }).then((value) => ({
+      const { root, dataRoot, databaseRoot } = this.options;
+      const paths = [
+        ...new Set([root, ...[dataRoot, databaseRoot].filter((item): item is string => !!item)]),
+      ];
+      const readDisk =
+        this.options.readDisk ??
+        ((directory: string) =>
+          statfs(directory, { bigint: true }).then((value) => ({
             freeBytes: Math.min(Number.MAX_SAFE_INTEGER, Number(value.bavail * value.bsize)),
             totalBytes: Math.min(Number.MAX_SAFE_INTEGER, Number(value.blocks * value.bsize)),
-          }));
+          })));
+      const all = await Promise.all(paths.map(readDisk));
+      const [stats, ...data] = all;
       if (
-        !Number.isFinite(stats.freeBytes) ||
-        !Number.isFinite(stats.totalBytes) ||
-        stats.freeBytes < 0 ||
-        stats.totalBytes <= 0
+        all.some(
+          (stats) =>
+            !Number.isFinite(stats.freeBytes) ||
+            !Number.isFinite(stats.totalBytes) ||
+            stats.freeBytes < 0 ||
+            stats.totalBytes <= 0,
+        )
       )
         throw new Error('INVALID_DISK_STATS');
-      let dataLow = false;
-      if (this.options.dataRoot) {
-        const info = this.options.readDisk
-          ? await this.options.readDisk(this.options.dataRoot)
-          : await statfs(this.options.dataRoot, { bigint: true }).then((value) => ({
-              freeBytes: Number(value.bavail * value.bsize),
-              totalBytes: Number(value.blocks * value.bsize),
-            }));
-        if (!Number.isFinite(info.freeBytes) || info.freeBytes < 0 || !(info.totalBytes > 0))
-          throw Error('INVALID_DISK_STATS');
-        dataLow = info.freeBytes < settings.minFreeBytes;
-      }
+      const dataLow = data.some((info) => info.freeBytes < settings.minFreeBytes);
       if (stats.freeBytes >= settings.minFreeBytes && now - this.lastWriteProbe >= 30000) {
         this.lastWriteProbe = now;
         try {
-          await (this.options.writeProbe?.(this.options.root) ??
-            probeWritableDirectory(this.options.root));
-          if (this.options.dataRoot)
-            await (this.options.writeProbe?.(this.options.dataRoot) ??
-              probeWritableDirectory(this.options.dataRoot));
+          for (const directory of paths)
+            await (this.options.writeProbe?.(directory) ?? probeWritableDirectory(directory));
           this.writeError = null;
         } catch (error) {
           const code = (error as NodeJS.ErrnoException).code;

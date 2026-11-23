@@ -47,7 +47,7 @@ it('advances a backed-off deletion intent when manually retried after storage re
       uncertaintyMs: 0,
       discontinuity: false,
     });
-    await archive.admitDeletion!(subjectId, commandId, {
+    const accepted = await archive.admitDeletion!(subjectId, commandId, {
       kind: 'range',
       mode: 'all',
       fromMs: 60000,
@@ -68,6 +68,8 @@ it('advances a backed-off deletion intent when manually retried after storage re
       processed: 1,
       error: null,
     });
+    const coverage = await archive.coverage(subjectId, 60000, 120000);
+    expect(coverage.revision).toBe(accepted.deletionRevision);
   } finally {
     await archive.close();
     await rm(root, { recursive: true, force: true });

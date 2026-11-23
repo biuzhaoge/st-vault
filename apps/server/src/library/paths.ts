@@ -18,7 +18,8 @@ export function subjectDirectory(mediaRoot: string, id: string): string {
     throw Error('INVALID_SUBJECT_ID');
   return path.join(mediaRoot, 'subjects', `stripchat-${id.slice(10)}`);
 }
-export function subjectImagePath(mediaRoot: string, id: string, kind: 'cover' | 'avatar'): string {
+export type SubjectImageKind = 'cover' | 'default-cover' | 'avatar';
+export function subjectImagePath(mediaRoot: string, id: string, kind: SubjectImageKind): string {
   return path.join(subjectDirectory(mediaRoot, id), 'images', `${kind}.img`);
 }
 export function snapshotFilePath(

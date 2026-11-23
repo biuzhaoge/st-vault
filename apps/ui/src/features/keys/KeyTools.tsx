@@ -105,8 +105,8 @@ export function KeyTools({
         <PanelIdentity
           icon={<Icon name="key" />}
           label={current.key.name}
-          value={<code>{current.key.value}</code>}
-          status={
+          value={<code tabIndex={0}>{current.key.value}</code>}
+          accessory={
             <PanelBadge
               live
               tone={

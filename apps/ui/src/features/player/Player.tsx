@@ -512,14 +512,16 @@ export const Player = forwardRef<PlayerHandle, Props>(function Player(
       data-chrome={visible ? 'visible' : 'hidden'}
       data-review={reviewCollapsed ? 'collapsed' : 'expanded'}
       tabIndex={0}
-      onPointerOverCapture={(event) =>
+      onPointerOverCapture={(event) => {
+        if (event.pointerType === 'touch') return;
         updateHover(
           (event.target as Element).closest('.player-picture')
             ? { x: event.clientX, y: event.clientY }
             : null,
-        )
-      }
+        );
+      }}
       onPointerMoveCapture={(event) => {
+        if (event.pointerType === 'touch') return;
         if (!(event.target as Element).closest('.player-picture')) {
           updateHover(null);
           return;
@@ -533,8 +535,8 @@ export const Player = forwardRef<PlayerHandle, Props>(function Player(
       onWheelCapture={(event) => {
         if ((event.target as Element).closest('.player-picture')) activity.current!.wake();
       }}
-      onPointerLeave={() => {
-        if (fullscreen) {
+      onPointerLeave={(event) => {
+        if (fullscreen && event.pointerType !== 'touch') {
           lastPointer.current = null;
           activity.current!.hide();
         }
@@ -568,13 +570,22 @@ export const Player = forwardRef<PlayerHandle, Props>(function Player(
           className="player-picture"
           data-chrome={visible ? 'visible' : 'hidden'}
           data-heading={press.value.heading ? 'visible' : 'hidden'}
-          onPointerLeave={() => {
+          onPointerLeave={(event) => {
+            if (event.pointerType === 'touch') return;
             lastPointer.current = null;
             activity.current!.hide();
           }}
-          onPointerDownCapture={() => {
+          onPointerDownCapture={(event) => {
             press.hold();
+            if (event.pointerType === 'touch') {
+              lastPointer.current = null;
+              activity.current!.setInteractive(false);
+            }
             activity.current!.wake();
+          }}
+          onPointerUpCapture={(event) => {
+            // Touch has no hover to hold the controls while a second tap is aimed.
+            if (event.pointerType === 'touch') activity.current!.wake(2400);
           }}
         >
           {poster && (

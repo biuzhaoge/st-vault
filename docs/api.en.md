@@ -4,19 +4,19 @@
 
 These endpoints serve the workbench in this repository; no independently versioned public API compatibility is promised. Request constraints are defined by [api-schema](../packages/api-schema/src/index.ts) and the HTTP modules' Zod schemas. Times are UTC epoch milliseconds and broadcaster IDs are `stripchat:<providerId>`; the UI uses `timeZone` returned by `/api/session` (deployment `TZ`). Calendar queries allow up to 8 UTC days to accommodate 7 local days across a DST fallback.
 
-Except for health, static resources and local login/setup entry points, business endpoints require an administrator session. Routine status responses never return cookies or address keys; the explicit disconnect response below returns the former cookies for a reconnect draft. The `GET /api/keys/current` endpoint returns the single saved key to the administrator over HTTPS or a trusted local connection. Use `PUT /api/keys/current` with `{name, value}` to add or replace it. Mutations validate Origin and sensitive endpoints disable caching.
+Except for health, static resources, and local login/setup entry points, business endpoints require an administrator session. Use `GET /api/keys/current` to read the saved key and `PUT /api/keys/current` with `{name, value}` to add or replace it. Mutations validate Origin and sensitive endpoints disable caching. See [Security and data protection](SECURITY.en.md) for HTTP deployment guidance.
 
 ## Sessions and accounts
 
-| Method and path                        | Behavior                                                                                                        |
-| -------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
-| `GET /api/session`                     | Administrator authentication and setup stage                                                                    |
-| `POST /api/setup/session`              | Restricted setup authorization; legacy installations must verify the old password                               |
-| `POST /api/setup`                      | Complete setup with `{pin}`, without requiring a site account                                                   |
-| `POST /api/login` / `POST /api/logout` | PIN unlock / revoke current session                                                                             |
-| `GET /api/account-sync`                | Account metadata and sync status, without credentials                                                           |
-| `PUT /api/account-sync`                | Import `{cookiesText, origin}`                                                                                  |
-| `DELETE /api/account-sync`             | Disconnect; return `{status, draft}` with former `{cookiesText, origin}` or null; HTTPS/loopback only, no-store |
+| Method and path                        | Behavior                                                                                                         |
+| -------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `GET /api/session`                     | Administrator authentication and setup stage                                                                     |
+| `POST /api/setup/session`              | Restricted setup authorization; legacy installations must verify the old password                                |
+| `POST /api/setup`                      | Complete setup with `{pin}`, without requiring a site account                                                    |
+| `POST /api/login` / `POST /api/logout` | PIN unlock / revoke current session                                                                              |
+| `GET /api/account-sync`                | Account metadata and sync status, without credentials                                                            |
+| `PUT /api/account-sync`                | Import `{cookiesText, origin}`                                                                                   |
+| `DELETE /api/account-sync`             | Disconnect and return `{status, draft}` with former `{cookiesText, origin}` or null. The response uses no-store. |
 
 Setup authorization is only for completing the PIN, not account, media or settings access. There are no site-password login, verification-code task or direct following-list import endpoints. Accounts use pasted cookies only. See [http/app.ts](../apps/server/src/http/app.ts).
 
@@ -56,6 +56,10 @@ Screenshot unitId identifies a stable set of complete source fragments. slotFrom
 recording-bounds snaps a drag selection outward to complete intersecting units. Live time, playback cursor and disk end remain distinct. An open unit's openUnitId allows replay to await new members of that unit without importing unrelated later recordings.
 
 Nonempty coverage buckets include mediaFromMs/mediaToMs, the earliest/latest actual media inside the bucket; empty buckets omit them. They reuse minute coverage indexes and logical deletion projections for drawing and immediate drag feedback without changing storage format. Internal gaps may remain. Final selection is precisely checked by recording-bounds; bucket endpoints do not prove continuity.
+
+Coverage includes `favoriteSpans` when the window contains favorite footage. The read uses accepted favorites and playable unit fragments, with a bucket limit for wide windows. Both timelines paint these spans in pink over the seen and unread colors. Unfavoriting restores the existing seen or unread color.
+
+Deletion admission publishes the visibility change once. Background work on already hidden fragments updates task progress. If deletion affects the current selection, the workbench uses the same `recording-bounds` endpoint as drag selection to snap its edges again. Playback continues inside the surviving selection. An empty selection returns the player and screenshot grid to their initial state.
 
 Hover previews use `GET /api/subjects/:id/snapshot-point?at=<milliseconds>` and return one unit or null; the old whole-range snapshots list is removed. Replay creation can specify unitId to distinguish units sharing PDT; missing explicit IDs are rejected, not guessed by time. Ordinary coverage reads neither compute nor return protectedSpans. Only unliked deletion tasks awaiting a published deletion revision request this bounded mask through the workbench protection subject-ID parameter. It shares the read snapshot with seenSpans and can reuse a cache keyed by media and favorite versions. Delete clicks immediately reuse loaded screenshot favorite ranges without awaiting this query. Demand stops after revision publication, failure or completion. Backend deletion independently validates all favorite relationships; display masks never authorize deletion. These spans create no standalone markers and do not define editing boundaries.
 

@@ -1,5 +1,27 @@
 # 更新日志 · Changelog
 
+## 0.1.1
+
+### 简体中文
+
+- **工作台与触屏。** 桌面和平板横屏共用布局，缩放时菜单、时间线和截图按钮保持可用。触屏可上下滚动主播列表、横拖时间线取段、上下滑动截图翻页。手机、竖屏和过小的窗口显示尺寸提示。
+- **时间线与列表滚动。** 滚动时保留仍在视野内的行和轨道，只为新进入视野的行加载并呈现数据。视图最右可浏览到今天午夜。状态轨道和录像覆盖轨道使用一致的底纹，便于辨认空白和实际覆盖。
+- **截图与收藏。** 收藏按钮移到截图左上角，移除图片上的时间戳。已收藏的覆盖范围用粉色显示，优先于已看和未看颜色。删除非喜欢录像后，从原选区重新吸附到剩余覆盖。选区清空时关闭回放并保持列表浏览位置。
+- **账户同步与状态。** 登录后后台立即补齐头像和默认封面，新加入的主播也立即排队下载，已有图片只在变化时更新。状态面板按事项展示结果、说明和可用的重试操作，存储条合并显示已用比例和剩余空间。密钥面板的输入、可用标签与账户面板对齐。
+- **部署与存储。** Compose 默认映射 `10002:10002`，可信局域网可直接用 HTTP，现有 HTTPS 反向代理可继续使用。启动时检查 PostgreSQL 数据目录和 WAL 所在文件系统，避免在 9p 或 SMB 挂载上运行。PostgreSQL 仍为 18，升级时保留现有 `data`、`media` 和数据库挂载。Windows Docker Desktop 可将数据库放在 WSL 的 Linux 文件系统或本地 Docker 卷。
+
+镜像 `biuzhaoge/st-vault:0.1.1` 和 `latest` 同时支持 `linux/amd64` 与 `linux/arm64`。
+
+### English
+
+- **Workspace and touch controls.** Desktop and landscape tablets share one layout that keeps menus, timelines, and screenshot controls usable as the window resizes. Swipe vertically to scroll the list or page through screenshots, and drag horizontally on a timeline to select footage. Phones, portrait screens, and undersized windows show a display-size prompt.
+- **Timeline and list scrolling.** Rows that remain visible keep their loaded tracks. Only newly visible rows load and reveal data as you scroll. The view extends through midnight today. Matching status and coverage tracks make gaps and recorded footage easier to distinguish.
+- **Screenshots and favorites.** The favorite button sits in the top-left corner of each screenshot, with no timestamp overlay. Favorite footage appears pink above the seen or unseen color. Deleting non-favorites snaps the original selection to remaining footage. If the range is empty, playback closes and the list stays at its current scroll position.
+- **Account sync and status.** Sign-in immediately queues missing avatars and default covers, and newly followed broadcasters get the same treatment. Cached images refresh only when they change. Status rows show results, explanations, and retry actions where available. One storage bar shows used capacity and free space. The key panel aligns its entry and availability indicator with the Account panel.
+- **Deployment and storage.** Compose publishes `10002:10002` by default. Direct HTTP works on trusted LANs, and existing HTTPS reverse proxies remain supported. Startup checks the PostgreSQL data and WAL filesystems and refuses 9p and SMB mounts. PostgreSQL stays on version 18. Keep your existing `data`, `media`, and database mounts when upgrading. On Windows Docker Desktop, database storage can use a WSL Linux filesystem or a local Docker volume.
+
+The `biuzhaoge/st-vault:0.1.1` and `latest` tags support both `linux/amd64` and `linux/arm64`.
+
 ## 0.1.0
 
 ### 简体中文

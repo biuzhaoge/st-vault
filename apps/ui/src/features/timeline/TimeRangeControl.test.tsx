@@ -43,22 +43,28 @@ it('uses compact English units on the same slider', async () => {
   }
 });
 
-it('uses the exact fractional-day rail extent and disables navigation beyond morning noon', () => {
-  const today = Date.UTC(2026, 10, 4, 16);
-  const html = renderToStaticMarkup(
-    <TimeRangeControl
-      fromMs={today}
-      toMs={today + DAY_MS / 2}
-      timelineStartMs={today - DAY_MS}
-      nowMs={today + 3600000}
-      onMove={() => undefined}
-      onChange={() => undefined}
-    />,
-  );
-  expect(html).toContain('aria-label="后12小时" disabled=""');
-  expect(html).toContain('33.33333333333333%');
-  expect(html.match(/class="view-position-ridges"/g)).toHaveLength(2);
-  expect(html).toContain(
-    'left:calc((100% - min(100%, max(var(--view-window-min-width), 33.33333333333333%))) * 1)',
-  );
-});
+it.each([
+  ['morning', 0, 2 / 3, false],
+  ['afternoon', DAY_MS / 2, 1, true],
+] as const)(
+  'positions the %s window against the full-day rail even before noon',
+  (_, offset, travel, atEnd) => {
+    const today = Date.UTC(2026, 10, 4, 16);
+    const html = renderToStaticMarkup(
+      <TimeRangeControl
+        fromMs={today + offset}
+        toMs={today + offset + DAY_MS / 2}
+        timelineStartMs={today - DAY_MS}
+        nowMs={today + 3600000}
+        onMove={() => undefined}
+        onChange={() => undefined}
+      />,
+    );
+    expect(html.includes('aria-label="后12小时" disabled=""')).toBe(atEnd);
+    expect(html).toContain('width:min(100%, max(var(--view-window-min-width), 25%))');
+    expect(html.match(/class="view-position-ridges"/g)).toHaveLength(2);
+    expect(html).toContain(
+      `left:calc((100% - min(100%, max(var(--view-window-min-width), 25%))) * ${travel})`,
+    );
+  },
+);

@@ -61,6 +61,21 @@ try {
   await page.getByLabel('6 位 PIN', { exact: true }).fill('012345');
   const row = page.locator(`.track-row[data-subject-id="${fixture.info.subjectId}"]`);
   await row.waitFor();
+  const assertReviewGlass = async () => {
+    const [status, coverage] = await page.locator('.viewer-focus .focus-lane').evaluate((lane) =>
+      ['::before', '::after'].map((part) => {
+        const rail = getComputedStyle(lane, part);
+        return { fill: rail.backgroundImage, outline: rail.boxShadow };
+      }),
+    );
+    assert.deepEqual(coverage, status, 'The review rails share the same glass and reflection');
+    assert(status.fill.includes('linear-gradient') && status.outline !== 'none');
+  };
+  assert.equal(
+    await page.locator('.viewer-focus .status-band, .viewer-focus .track-clip').count(),
+    0,
+  );
+  await assertReviewGlass();
   const from = await row.locator('.track-lane').evaluate((node) => Number(node.dataset.from));
   // Include the complete history when this fixture straddles midnight.
   if (history.fromMs < from)
@@ -108,6 +123,12 @@ try {
         columns: getComputedStyle(grid).gridTemplateColumns.split(' ').length,
         rows: getComputedStyle(grid).gridTemplateRows.split(' ').length,
         mounted: grid.querySelectorAll('.snapshot-cell,.snapshot-slot-empty,.snapshot-gap').length,
+        timestampOverlays: grid.querySelectorAll('.snapshot-cell time').length,
+        favoritesAtLeft: [...grid.querySelectorAll('.snapshot-favorite')].every((node) => {
+          const button = node.getBoundingClientRect();
+          const cell = node.parentElement.getBoundingClientRect();
+          return button.left - cell.left <= 3 && button.top - cell.top <= 3;
+        }),
         fit: getComputedStyle(document.querySelector('video[data-media-slot="active"]')).objectFit,
         nestedCorners: [document.querySelector('.snapshot-viewport')].every(
           (node) =>
@@ -139,7 +160,6 @@ try {
       .viewer-focus .status-line, .viewer-focus .status-band {
         background: #00ff00 !important; box-shadow: none !important;
       }
-      .viewer-focus .status-line::after { display: none !important; }
       .viewer-focus .focus-playhead { visibility: hidden !important; }
     `,
     });
@@ -164,6 +184,9 @@ try {
     }
   };
   const normal = await geometry();
+  await assertReviewGlass();
+  assert.equal(normal.timestampOverlays, 0, 'Thumbnail images must have no timestamp overlay');
+  assert(normal.favoritesAtLeft, 'Thumbnail favorites belong in the top-left corner');
   await assertStatusEdges();
   assert(
     normal.trackCorners && normal.imageCorners && normal.cursorUnclipped && normal.nestedCorners,
@@ -351,6 +374,9 @@ try {
   await page.waitForFunction(() => !!document.fullscreenElement);
   await page.mouse.move(10, 100);
   const full = await geometry();
+  await assertReviewGlass();
+  assert.equal(full.timestampOverlays, 0, 'Fullscreen thumbnails must have no timestamp overlay');
+  assert(full.favoritesAtLeft, 'Fullscreen thumbnail favorites belong in the top-left corner');
   await assertStatusEdges();
   assert(full.trackCorners && full.imageCorners && full.cursorUnclipped && full.nestedCorners);
   assert.equal(full.columns, 3);

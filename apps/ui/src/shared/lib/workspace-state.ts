@@ -3,7 +3,6 @@ import type { ViewWindow } from './time';
 export interface ListPosition {
   id: string;
   offset: number;
-  left: number;
 }
 export interface WorkspaceState {
   list: ListPosition | null;
@@ -27,7 +26,9 @@ export function readWorkspace(key: string): WorkspaceState {
       typeof at === 'number' && Number.isSafeInteger(at) && at >= 0;
     return {
       list:
-        list && typeof list.id === 'string' && time(list.offset) && time(list.left) ? list : null,
+        list && typeof list.id === 'string' && time(list.offset)
+          ? { id: list.id, offset: list.offset }
+          : null,
       playback:
         playback &&
         typeof playback.subjectId === 'string' &&

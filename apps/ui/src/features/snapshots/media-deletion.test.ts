@@ -1,5 +1,5 @@
 import { expect, it } from 'vitest';
-import { DeletionObserver, deletionAffectsPlayback } from './media-deletion';
+import { DeletionObserver, deletionOverlaps } from './media-deletion';
 import type { MediaDeletionJob } from '@st-vault/api-schema';
 import type { MediaDeletePlan } from '@st-vault/api-schema';
 const plan = (fromMs: number, toMs: number): MediaDeletePlan => ({
@@ -111,26 +111,13 @@ it.each([
   [100, 110, false],
 ])('invalidates the complete archive dependency for [%s,%s)', (from, to, affected) => {
   expect(
-    deletionAffectsPlayback(
-      { subjectId: 'stripchat:1', plan: plan(from, to) },
-      { subjectId: 'stripchat:1', kind: 'archive', range: { fromMs: 0, toMs: 100 } },
-    ),
+    deletionOverlaps({ subjectId: 'stripchat:1', plan: plan(from, to) }, 'stripchat:1', {
+      fromMs: 0,
+      toMs: 100,
+    }),
   ).toBe(affected);
 });
-it('does not affect live consumers or another subject', () => {
+it('does not reselect another subject', () => {
   const event = { subjectId: 'stripchat:1', plan: plan(0, 100) };
-  expect(
-    deletionAffectsPlayback(event, {
-      subjectId: 'stripchat:1',
-      kind: 'live',
-      range: { fromMs: 0, toMs: 100 },
-    }),
-  ).toBe(false);
-  expect(
-    deletionAffectsPlayback(event, {
-      subjectId: 'stripchat:2',
-      kind: 'archive',
-      range: { fromMs: 0, toMs: 100 },
-    }),
-  ).toBe(false);
+  expect(deletionOverlaps(event, 'stripchat:2', { fromMs: 0, toMs: 100 })).toBe(false);
 });

@@ -33,7 +33,14 @@ try {
     hour: '2-digit',
     minute: '2-digit',
   });
-  for (const boundary of initial) assert.ok(['00:00', '12:00'].includes(clock.format(boundary)));
+  assert.deepEqual(
+    initial.map((boundary) => clock.format(boundary)),
+    ['00:00', '00:00'],
+  );
+  assert.equal(
+    await page.getByRole('button', { name: '后12小时', exact: true }).isDisabled(),
+    true,
+  );
   await page.getByRole('button', { name: '前12小时', exact: true }).click();
   const moved = await readView();
   assert.ok(moved[0] < initial[0]);

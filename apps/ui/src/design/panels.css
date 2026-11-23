@@ -32,7 +32,6 @@
   --menu-inset: 12px;
   --menu-gap: 10px;
   --menu-row-height: 30px;
-  --menu-control-height: 34px;
   --menu-compact-height: 26px;
   --menu-icon-size: 28px;
   container-type: inline-size;
@@ -46,9 +45,6 @@
   min-height: 0;
   max-height: calc(100dvh - 24px);
 }
-.toolbar-popover[data-size='narrow'] {
-  --menu-width: 304px;
-}
 .toolbar-popover[data-size='compact'] {
   --menu-width: 336px;
 }
@@ -61,7 +57,7 @@
   align-items: center;
   gap: 9px;
   flex: none;
-  min-height: 46px;
+  min-height: calc(var(--titlebar-height) + 2px);
   padding: 6px var(--menu-inset);
   border-bottom: 1px solid var(--line);
 }
@@ -177,7 +173,7 @@
 .panel-content textarea {
   width: 100%;
   min-width: 0;
-  min-height: var(--menu-control-height);
+  min-height: var(--navigation-height);
   padding: 6px 10px;
   font: inherit;
   border-radius: var(--radius-field);
@@ -194,7 +190,7 @@
 .panel-content .global-recording-settings,
 .panel-content .language-setting,
 .panel-content .language-toggle {
-  min-block-size: var(--menu-control-height);
+  min-block-size: var(--navigation-height);
 }
 .panel-content .runtime-settings,
 .panel-content .key-tools,
@@ -223,7 +219,9 @@
 }
 .panel-identity {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: auto minmax(0, 1fr);
+  grid-auto-flow: column;
+  grid-auto-columns: max-content;
   align-items: center;
   gap: 8px;
   padding: 8px;
@@ -234,11 +232,13 @@
 }
 .panel-identity-content {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   min-width: 0;
   gap: 2px;
   overflow-wrap: anywhere;
 }
-.panel-identity-content > span {
+.panel-identity-label {
+  min-width: 0;
   color: var(--muted);
   font-size: 11px;
 }
@@ -247,36 +247,17 @@
   font-weight: 600;
 }
 .panel-identity-content code {
-  font: inherit;
+  display: block;
   font-family: var(--mono);
-  font-weight: 500;
+  font-size: 12px;
+  white-space: nowrap;
+  overflow-x: auto;
+  scrollbar-width: thin;
 }
-/* Status text can grow without taking width from the identity value. */
-.panel-identity:has(> .panel-badge) {
-  grid-template-columns: auto minmax(0, 1fr) minmax(112px, max-content);
-  row-gap: 2px;
-}
-.panel-identity:has(> .panel-badge) > .panel-identity-icon {
-  grid-row: span 2;
-}
-.panel-identity:has(> .panel-badge) > .panel-identity-content {
-  display: contents;
-}
-.panel-identity:has(> .panel-badge) .panel-identity-content > span {
-  grid-column: 2;
-  grid-row: 1;
-  overflow-wrap: anywhere;
-}
-.panel-identity:has(> .panel-badge) .panel-identity-content > strong {
-  grid-column: 2 / -1;
-  grid-row: 2;
-  min-width: 0;
-  overflow-wrap: anywhere;
-}
-.panel-identity > .panel-badge {
-  grid-column: 3;
-  grid-row: 1;
-  justify-self: end;
+.panel-identity-content code:focus-visible {
+  outline: 2px solid var(--accent-hover);
+  outline-offset: -2px;
+  border-radius: var(--radius-small);
 }
 .panel-badge {
   display: inline-flex;
@@ -338,7 +319,7 @@
 .panel-content .primary,
 .panel-content .secondary,
 .panel-content .text-button {
-  min-height: var(--menu-control-height);
+  min-height: var(--navigation-height);
   padding: 6px 12px;
   font-size: 12px;
   line-height: 20px;
@@ -366,7 +347,7 @@
   font-size: 11px;
   white-space: nowrap;
 }
-.panel-content button:disabled {
+.panel-content button:disabled:where(:not([aria-busy='true'])) {
   opacity: 0.45;
   cursor: default;
 }
@@ -504,10 +485,8 @@ button.history-subject:hover strong {
   height: var(--history-older-height, 32px);
 }
 @media (pointer: coarse) {
-  .toolbar-popover {
-    --menu-control-height: 44px;
-    --menu-compact-height: 44px;
-    --menu-icon-size: 44px;
+  .panel-content :is(input, select, textarea) {
+    font-size: 16px;
   }
 }
 .overflow-text {

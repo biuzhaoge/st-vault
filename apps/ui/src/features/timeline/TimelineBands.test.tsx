@@ -76,6 +76,19 @@ it('retains the viewed prefix when a growing tail shares its display bucket', ()
   expect(html).toMatch(/data-seen="true"[^>]*width:12.5%/);
   expect(html).toMatch(/data-seen="false"[^>]*left:min\(87.5%[^>]*width:12.5%/);
 });
+it('paints favorite coverage above viewed and unread coverage without adding a status marker', () => {
+  const input = data([]);
+  Object.assign(input.coverage, {
+    favoriteSpans: [{ fromMs: 2600, toMs: 2900 }],
+    seenSpans: [{ fromMs: 2500, toMs: 2750 }],
+    unreadSpans: [{ fromMs: 2750, toMs: 3000 }],
+  });
+  const html = renderToStaticMarkup(<TimelineBands data={input} fromMs={1000} toMs={3000} />);
+  expect(html).toMatch(/data-favorite="true"[^>]*width:15%/);
+  expect(html).toMatch(/data-seen="true"[^>]*width:5%/);
+  expect(html).toMatch(/data-seen="false"[^>]*width:5%/);
+  expect(html).not.toContain('track-favorite-range');
+});
 it('does not infer viewed pixels between unread recording runs', () => {
   const input = data([]);
   input.coverage.seenSpans = [{ fromMs: 2500, toMs: 2550 }];

@@ -1,6 +1,6 @@
 import { tr } from '../../shared/lib/i18n';
 import { Icon } from '../../design/Icon';
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { flushSync } from 'react-dom';
 import type { MediaDeletionEvent } from './media-deletion';
 import type {
@@ -34,6 +34,7 @@ import { WheelPager } from './wheel-pager';
 import { SnapshotToolbar } from './SnapshotToolbar';
 import { SnapshotPageMotion } from './snapshot-page-motion';
 import { useSnapshotView } from './use-snapshot-view';
+import { useSnapshotSwipe } from './use-snapshot-swipe';
 import { useDeletionJobs } from './use-deletion-jobs';
 import {
   usePlaybackClock,
@@ -54,6 +55,7 @@ export function SnapshotGrid({
   onSeek,
   onSession,
   onDeletion,
+  reselecting = false,
   onJobs,
   jobSnapshot,
 }: {
@@ -70,6 +72,7 @@ export function SnapshotGrid({
   onSeek: (utc: number, window: MediaTimeRange, unitId: string) => void;
   onSession: (id: string, session: SnapshotSession | null, window: MediaTimeRange) => void;
   onDeletion: (event: MediaDeletionEvent) => void;
+  reselecting?: boolean;
   onJobs?: (jobs: MediaDeletionJob[]) => void;
   jobSnapshot?: MediaDeletionJob[] | null;
 }): JSX.Element {
@@ -86,11 +89,11 @@ export function SnapshotGrid({
     setPage,
     error,
     retryRead,
-    invalidatePresentation,
     current,
     shown,
     catalog,
     pagePending,
+    holdingPage,
     acceptPersonal,
     acceptUnitFavorite,
     navigate,
@@ -116,6 +119,7 @@ export function SnapshotGrid({
     playingUnitId,
     onSession,
     commands,
+    reselecting,
   });
   const [activity, setActivity] = useState<'favorite' | null>(null),
     [feedback, setFeedback] = useState('');
@@ -166,38 +170,38 @@ export function SnapshotGrid({
     read: (signal) => commands.jobs(signal),
     onJobs,
     onAccepted: (jobs) => {
-      invalidatePresentation();
       for (const job of jobs)
         deletedCallback.current({
           commandId: job.id,
           subjectId: job.subjectId,
           plan: { fromMs: job.fromMs, toMs: job.toMs },
+          failed: job.state === 'failed',
         });
     },
   });
   const wheel = useRef(new WheelPager());
-  const wheelState = useRef({ pageIndex, occupiedPages, setPage });
-  wheelState.current = { pageIndex, occupiedPages, setPage };
+  const paging = useRef({ pageIndex, occupiedPages, setPage });
+  paging.current = { pageIndex, occupiedPages, setPage };
+  const turnPage = useCallback((direction: -1 | 0 | 1): void => {
+    const current = paging.current;
+    if (!direction || current.pageIndex < 0) return;
+    const next = current.occupiedPages[current.pageIndex + direction];
+    if (next !== undefined) current.setPage(next);
+  }, []);
+  const swipe = useSnapshotSwipe(`${scope}:${page}`, turnPage);
   useEffect(() => {
     const node = section.current;
     if (!node) return;
     const turn = (event: WheelEvent): void => {
       if (event.ctrlKey || Math.abs(event.deltaX) >= Math.abs(event.deltaY)) return;
       event.preventDefault();
-      const current = wheelState.current;
-      if (current.pageIndex < 0) return;
-      const step = wheel.current.step(
-        event.deltaY,
-        event.deltaMode,
-        node.clientHeight,
-        performance.now(),
+      turnPage(
+        wheel.current.step(event.deltaY, event.deltaMode, node.clientHeight, performance.now()),
       );
-      const next = current.occupiedPages[current.pageIndex + step];
-      if (step && next !== undefined) current.setPage(next);
     };
     node.addEventListener('wheel', turn, { passive: false });
     return () => node.removeEventListener('wheel', turn);
-  }, []);
+  }, [turnPage]);
   const motionTo = followLive ? queryWindow.toMs : displayRange.toMs;
   const motionRevision = useMemo(
     () => ({ items, page, from: displayRange.fromMs, to: motionTo }),
@@ -270,7 +274,11 @@ export function SnapshotGrid({
       plan: { fromMs: draft.target.fromMs, toMs: draft.target.toMs },
       optimisticRanges: draft.ranges,
       knownEmpty:
-        favoritesReady && shown?.total === items.length && draft.ranges.length === items.length,
+        !followLive &&
+        !pagePending &&
+        favoritesReady &&
+        shown?.total === items.length &&
+        draft.ranges.length === items.length,
     });
     try {
       const job = await result;
@@ -295,6 +303,12 @@ export function SnapshotGrid({
         return;
       }
       failDeletionProjection(commandId, messageFor(cause));
+      deletedCallback.current({
+        commandId,
+        subjectId: subject.id,
+        plan: draft.target,
+        failed: true,
+      });
     } finally {
       changed();
     }
@@ -378,8 +392,8 @@ export function SnapshotGrid({
       connected={!!subject}
       busy={busy}
       status={feedback}
-      onPrevious={() => setPage(occupiedPages[pageIndex - 1])}
-      onNext={() => setPage(occupiedPages[pageIndex + 1])}
+      onPrevious={() => turnPage(-1)}
+      onNext={() => turnPage(1)}
       onUnlike={() => void clearFavorites()}
       onDelete={openDeletion}
     />
@@ -403,7 +417,7 @@ export function SnapshotGrid({
           onConfirm={() => void confirmDeletion()}
         />
       )}
-      {(error !== null || (!items.length && !pagePending)) && (
+      {!holdingPage && (error !== null || (!items.length && !pagePending)) && (
         <SnapshotNotice
           scope={subject?.id ?? 'snapshots'}
           notice={
@@ -434,7 +448,7 @@ export function SnapshotGrid({
           onRetry={retryRead}
         />
       )}
-      <div className="snapshot-viewport">
+      <div className="snapshot-viewport" {...swipe}>
         <div
           className="snapshot-grid"
           ref={grid}
@@ -523,7 +537,6 @@ export function SnapshotGrid({
                       toMs={item.slotToMs}
                     />
                   </div>
-                  <time>{formatDateTime(item.atMs).slice(-5)}</time>
                 </button>
                 <button
                   className="snapshot-favorite"

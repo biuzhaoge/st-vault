@@ -16,6 +16,7 @@ select {
 button {
   cursor: pointer;
   color: inherit;
+  touch-action: manipulation;
 }
 button:disabled {
   opacity: 0.45;
@@ -67,7 +68,6 @@ strong {
 }
 .primary,
 .secondary {
-  min-height: 34px;
   padding: 6px 12px;
   border: 0;
   font-size: 12px;
@@ -163,21 +163,7 @@ strong {
   );
   height: 100dvh;
   display: grid;
-  grid-template-columns:
-    min(
-      48vw,
-      max(
-        270px,
-        calc(
-          (
-              100dvh - 2 * var(--workspace-inset) - var(--titlebar-height) - var(--workspace-gap) -
-                var(--review-fixed-height)
-            ) *
-            80 / 99
-        )
-      )
-    )
-    var(--workspace-gap) minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows: var(--titlebar-height) minmax(0, 1fr);
   row-gap: var(--workspace-gap);
   padding: var(--workspace-inset);
@@ -337,8 +323,8 @@ strong {
   vertical-align: middle;
 }
 .record-button .operation-spinner {
-  width: 16px;
-  height: 16px;
+  width: 12px;
+  height: 12px;
 }
 .record-button.is-starting {
   color: var(--ink);
@@ -352,17 +338,31 @@ strong {
 .studio-workspace {
   position: relative;
   display: grid;
-  /* Reuse shell tracks: title/player share a column; the list spans both rows. */
-  grid-column: 1 / -1;
-  grid-row: 1 / -1;
-  grid-template-columns: subgrid;
-  grid-template-rows: subgrid;
+  grid-row: 2;
+  /* The workbench owns its columns below the title bar. WebKit mis-sizes the
+   * calculated tracks when a subgrid spans both axes of the shell. */
+  grid-template-columns:
+    min(
+      48%,
+      max(
+        270px,
+        calc(
+          (
+              100dvh - 2 * var(--workspace-inset) - var(--titlebar-height) - var(--workspace-gap) -
+                var(--review-fixed-height)
+            ) *
+            80 / 99
+        )
+      )
+    )
+    var(--workspace-gap) minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
   min-height: 0;
   min-width: 0;
 }
 .aligned-arrangement {
   grid-column: 3;
-  grid-row: 2;
+  grid-row: 1;
   display: flex;
   flex-direction: column;
   min-height: 0;
@@ -422,7 +422,6 @@ strong {
   opacity: 0.8;
 }
 .time-range-control {
-  --timeline-control-height: 34px;
   min-width: 0;
 }
 .time-control-strip {
@@ -430,7 +429,7 @@ strong {
   align-items: stretch;
   gap: 6px;
   min-width: 0;
-  height: calc(var(--timeline-control-height) + 5px);
+  height: calc(var(--navigation-height) + 5px);
   padding: 3px 5px 2px;
 }
 .time-control-row {
@@ -536,7 +535,7 @@ strong {
 .view-position-ridges {
   display: block;
   flex: 1 1 12px;
-  min-width: 12px;
+  min-width: 0;
   max-width: 56px;
   height: 12px;
   border-radius: 1px;
@@ -548,15 +547,7 @@ strong {
   position: relative;
   overflow: hidden;
 }
-.time-ruler-row > .timeline-ruler {
-  width: max(
-    100%,
-    calc(var(--track-content-width, var(--track-min-width)) - var(--subject-column-width))
-  );
-  transform: translateX(calc(-1 * var(--track-scroll-left, 0px)));
-}
 .aligned-track-board {
-  --track-min-width: 800px;
   --subject-cell-inset: 4px;
   --subject-cell-divider: 1px;
   --subject-preview-height: calc(
@@ -575,24 +566,28 @@ strong {
 }
 .track-header-viewport {
   flex: none;
-  container-type: inline-size;
+  container: track-header / inline-size;
   overflow: clip;
 }
 .track-table-scroll {
   flex: 1 1 0;
   min-height: 0;
-  overflow: auto;
+  overflow: hidden auto;
   overflow-anchor: none;
   scrollbar-gutter: stable;
+  overscroll-behavior-y: contain;
+  touch-action: pan-y pinch-zoom;
 }
 .track-table {
   position: relative;
   overflow: clip;
-  min-width: var(--track-min-width);
   min-height: 100%;
 }
 /* Native scroll can expose a virtual spacer before React commits its rows. */
 .track-spacer {
+  --spacer-status-end: calc(
+    (var(--subject-row-height) - var(--subject-cell-divider)) * var(--status-rail-share)
+  );
   background:
     linear-gradient(
         transparent var(--subject-cell-inset),
@@ -602,9 +597,11 @@ strong {
       left var(--subject-cell-inset) top / var(--subject-preview-width) var(--subject-row-height)
       repeat-y,
     linear-gradient(
-        #24262a 0 6px,
-        transparent 6px 10px,
-        #1e2023 10px calc(100% - 4px),
+        var(--glass-track-base) 0 var(--spacer-status-end),
+        transparent var(--spacer-status-end)
+          calc(var(--spacer-status-end) + var(--timeline-rail-gap)),
+        var(--glass-track-base) 0
+          calc(100% - var(--timeline-rail-gap) - var(--subject-cell-divider)),
         transparent 0
       )
       right top / calc(100% - var(--subject-column-width)) var(--subject-row-height) repeat-y,
@@ -681,7 +678,7 @@ strong {
   text-align: left;
 }
 .subject-preview {
-  touch-action: none;
+  touch-action: pan-y pinch-zoom;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -781,9 +778,6 @@ strong {
   padding-bottom: 16px;
   border-bottom: 1px solid var(--line);
 }
-.track-label:hover {
-  filter: brightness(1.08);
-}
 :is(.track-row, .track-row-motion-ghost).selected .track-label {
   box-shadow: inset 2px 0 var(--accent);
 }
@@ -866,7 +860,7 @@ strong {
   height: 100%;
   overflow: hidden;
   cursor: crosshair;
-  touch-action: none;
+  touch-action: pan-y pinch-zoom;
   user-select: none;
   background: transparent;
 }
@@ -892,7 +886,7 @@ strong {
   container-type: inline-size;
   display: grid;
   grid-column: 1;
-  grid-row: 2;
+  grid-row: 1;
   grid-template-rows: minmax(0, 1fr);
   gap: 4px;
   min-height: 0;
@@ -1288,12 +1282,6 @@ strong {
     inset 0 1px #e9434d40,
     inset 0 -1px #e9434d40;
 }
-:is(.track-row, .track-row-motion-ghost).selected .status-line {
-  background: #2c282d;
-}
-:is(.track-row, .track-row-motion-ghost).selected .recording-line {
-  background: #2c2224;
-}
 .timeline-ruler .ruler-date {
   gap: 3px;
   font:
@@ -1372,7 +1360,7 @@ strong {
   background: #e9434d18;
   border: 1.5px solid #f17c84;
   border-radius: 4px;
-  touch-action: none;
+  touch-action: pan-y pinch-zoom;
   user-select: none;
   pointer-events: none;
 }
@@ -1399,7 +1387,7 @@ strong {
   background: transparent;
   pointer-events: auto;
   cursor: ew-resize;
-  touch-action: none;
+  touch-action: pan-y pinch-zoom;
 }
 .selection-edge.from {
   left: 0;
@@ -1506,7 +1494,6 @@ strong {
   align-self: center;
   flex: none;
   user-select: none;
-  touch-action: pan-y;
   display: grid;
   grid-template-columns: repeat(var(--snapshot-columns), minmax(0, 1fr));
   grid-template-rows: repeat(var(--snapshot-rows), calc(var(--shot-width) * 9 / 16));
@@ -1515,6 +1502,10 @@ strong {
   height: calc(var(--shot-width) * 9 / 16 * var(--snapshot-rows) + var(--snapshot-y-gaps));
   min-height: 0;
   overflow: hidden;
+}
+.snapshot-viewport,
+.snapshot-grid {
+  touch-action: pan-x pinch-zoom;
 }
 .snapshot-viewport {
   display: block;
@@ -1624,25 +1615,10 @@ strong {
   height: 100%;
   object-fit: contain;
 }
-:is(.snapshot-grid, .snapshot-exits) time {
-  position: absolute;
-  bottom: 3px;
-  left: 4px;
-  padding: 1px 4px;
-  border-radius: 4px;
-  background: #0009;
-  font: 9px/13px var(--mono);
-  color: white;
-  pointer-events: none;
-}
 :is(.snapshot-grid, .snapshot-exits) button.selected > div {
   box-shadow:
     inset 0 0 0 2px var(--accent),
     0 0 8px #e9434d55;
-}
-:is(.snapshot-grid, .snapshot-exits) button.selected time {
-  color: var(--accent-hover);
-  font-weight: 600;
 }
 :is(.snapshot-grid, .snapshot-exits) button > div {
   transition: box-shadow 160ms ease;
@@ -1656,15 +1632,14 @@ strong {
   corner-shape: inherit;
   pointer-events: none;
 }
-:is(.snapshot-grid, .snapshot-exits) button:hover time {
-  color: var(--ink);
-}
 .connection-rail {
   grid-column: 2;
-  grid-row: 2;
+  grid-row: 1;
   position: relative;
   min-height: 0;
   background: #191a1d;
+  z-index: 1;
+  pointer-events: none;
 }
 .row-connection {
   position: absolute;
@@ -1876,13 +1851,14 @@ strong {
   aspect-ratio: 16 / 9;
 }
 :is(.snapshot-grid, .snapshot-exits) .snapshot-favorite {
+  --favorite-size: clamp(12px, calc(var(--shot-width, 72px) * 0.24), 22px);
   position: absolute;
-  top: 3px;
-  right: 3px;
+  top: 2px;
+  left: 2px;
   z-index: 2;
-  width: 24px;
-  height: 24px;
-  padding: 4px;
+  width: var(--favorite-size);
+  height: var(--favorite-size);
+  padding: 0;
   display: grid;
   place-items: center;
   border-radius: 50%;
@@ -1891,14 +1867,14 @@ strong {
   color: #fff;
 }
 .snapshot-favorite[aria-pressed='true'] {
-  color: var(--accent-hover);
+  color: var(--favorite);
 }
 .snapshot-favorite[aria-pressed='true'] svg {
   fill: currentColor;
 }
 .snapshot-favorite .ui-icon {
-  width: 15px;
-  height: 15px;
+  width: max(9px, 65%);
+  height: max(9px, 65%);
 }
 .minute-image {
   display: block;
@@ -1968,7 +1944,7 @@ strong {
   flex: none;
   gap: 3px;
   width: 54px;
-  min-height: 22px;
+  min-height: 24px;
   padding: 0 3px;
   line-height: 16px;
   font-size: inherit;
@@ -2079,7 +2055,7 @@ strong {
 .recording-mode.recording-icon {
   position: absolute;
   top: calc(var(--subject-cell-inset) + 3px);
-  right: calc(var(--subject-cell-inset) + var(--subject-cell-divider) + 3px);
+  left: calc(var(--subject-cell-inset) + 3px);
   width: auto;
   z-index: 5;
 }
@@ -2087,9 +2063,9 @@ strong {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 32px;
-  min-width: 32px;
-  height: 32px;
+  width: 24px;
+  min-width: 24px;
+  height: 24px;
   padding: 0;
   border: 1px solid #ffffff38;
   border-radius: var(--radius-pill);
@@ -2108,10 +2084,10 @@ strong {
   position: static;
   display: block;
   flex: 0 0 auto;
-  width: 15px;
-  height: 15px;
+  width: 11px;
+  height: 11px;
   margin: 0;
-  border: 2px solid currentColor;
+  border: 1.5px solid currentColor;
   border-radius: 50%;
   corner-shape: round;
   background: transparent;
@@ -2123,9 +2099,6 @@ strong {
   border-color: var(--accent);
   color: #ff818c;
 }
-.recording-toggle.record-button:hover:enabled {
-  filter: brightness(1.15);
-}
 .recording-toggle.record-button[aria-checked='true'] i {
   background: currentColor;
   box-shadow: 0 0 8px #df2c4166;
@@ -2134,30 +2107,6 @@ strong {
   position: relative;
 }
 
-.track-lane::before,
-.track-lane::after {
-  content: '';
-  position: absolute;
-  left: 0;
-  right: 0;
-  pointer-events: none;
-}
-.track-lane::before {
-  top: 10px;
-  bottom: 4px;
-  background: #1e2023;
-}
-.track-lane::after {
-  top: 0;
-  height: 6px;
-  background: #24262a;
-}
-:is(.track-row, .track-row-motion-ghost).selected .track-lane::before {
-  background: #2c2224;
-}
-:is(.track-row, .track-row-motion-ghost).selected .track-lane::after {
-  background: #2c282d;
-}
 .track-lane > .timeline-scene {
   z-index: 1;
 }
@@ -2191,15 +2140,6 @@ strong {
 }
 .live-now-line {
   box-shadow: 0 0 0 1px #dc333e1a;
-}
-
-@media (pointer: coarse) {
-  .studio-shell {
-    --snapshot-toolbar-height: 32px;
-  }
-  .snapshot-pages button {
-    min-height: 28px;
-  }
 }
 
 .snapshot-status {
@@ -2275,7 +2215,7 @@ strong {
 .viewport-notice {
   display: none;
 }
-@media not all and (min-width: 768px) and (min-height: 600px) and (min-aspect-ratio: 3/4) and (max-aspect-ratio: 21/9) {
+@media not all and (orientation: landscape) and (min-width: 744px) and (min-height: 600px) and (max-aspect-ratio: 21/9) {
   .viewport-workspace,
   body > .toolbar-popover,
   body > .timeline-hover-preview {

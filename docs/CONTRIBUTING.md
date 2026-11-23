@@ -57,6 +57,17 @@ docker compose -f compose.yml -f deploy/compose.build.yml up -d --build
 
 已有部署可保留只读根文件系统、可写 `/tmp` 和额外的权限约束。原先自定义的运行身份继续通过 `STV_RUNTIME_UID`、`STV_RUNTIME_GID` 配置。只有 PostgreSQL 报共享内存空间不足时，才需要按宿主机资源调整 `shm_size`。
 
+## PostgreSQL 存储
+
+数据库固定使用数据目录下的 `postgres/18`，默认容器路径为 `/data/postgres/18`。Linux 或 NAS 上的本机文件系统部署可保留原挂载来升级。Windows Docker Desktop 或 SMB 上的 `data` 需要把数据库放到本机 Linux 存储。可以从 WSL 的 Linux 文件系统运行 Compose，也可以将本地 Docker 命名卷挂载到 `/data/postgres`。已有数据时，切换挂载前先将原集群恢复到目标存储。空卷会遮住原目录。
+
+需要迁移不支持的挂载时，正常停止旧工作台，保留旧镜像、部署配置、`data` 和 `media`。用匹配的 PostgreSQL 版本在独立维护容器中启动旧集群，仅启用私有 Unix socket 供导出。Windows 共享盘上的旧集群导出期间可设置 `io_method=sync` 和 `default_transaction_read_only=on`。
+
+1. 使用 `pg_dump --format=custom --no-owner --no-acl --file=stvault.dump stvault` 导出完整数据库。保管好导出文件，它包含私有设置。保留 `data/private/postgres.json` 及其余私有文件。
+2. 在目标存储初始化空集群，沿用原部署的运行 UID/GID 和应用数据库凭据。用 `pg_restore --exit-on-error --no-owner --no-acl --dbname=stvault stvault.dump` 导入，核对业务和私有配置表的行数后再启动工作台。确认旧 PIN、账户和录像可用后，保留源集群和导出文件作为备份。
+
+启动拒绝 9p 和 SMB 上的 PostgreSQL 集群目录及 WAL。状态面板检查实际数据库目录的容量和写入权限。崩溃诊断可在 `data/logs/supervisor.jsonl` 及其轮转文件搜索 `postgres_child_terminated`，事件记录子进程 PID 和信号，PostgreSQL 主进程恢复后仍可查询。
+
 ## 验证与发布
 
 每次推送 `main` 或提交面向 `main` 的 PR 都只运行 CI。检查覆盖格式、类型、测试、构建、依赖审计和 Compose 配置。浏览器回归可按上文在本地运行。
@@ -89,7 +100,7 @@ docker compose -f compose.yml -f deploy/compose.build.yml up -d --build
 [运行时性能汇总](../scripts/diagnostics/runtime-performance.mjs) 从标准输入读取一段 JSONL。它输出采样时段、事件计数、各阶段观测值的最大值和按请求 ID 的关联数量，报告中只保留预先列明的诊断字段。用 `input.firstAt` 和 `input.lastAt` 确认实际覆盖范围。`highestWindowP95UpperMs` 是已收集窗口中最高的 P95 上界，跨窗口的 P95 需要原始分桶计数。
 
 ```sh
-docker logs --since 30m --tail 20000 st-vault-app-1 2>&1 | docker run --rm -i --network none --entrypoint node st-vault:qa scripts/diagnostics/runtime-performance.mjs
+docker compose logs --since 30m --tail 20000 --no-color --no-log-prefix app 2>&1 | docker run --rm -i --network none --entrypoint node st-vault:qa scripts/diagnostics/runtime-performance.mjs
 docker run --rm --network none st-vault:qa sh -ec 'npm run build && node scripts/benchmarks/recording-start.mjs && node scripts/benchmarks/capture-sweep.mjs'
 docker run --rm --network none --entrypoint sh st-vault:qa -ec 'npm run build && node scripts/benchmarks/workbench-cost.mjs'
 ```

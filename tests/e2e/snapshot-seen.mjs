@@ -120,7 +120,22 @@ try {
   await page.unroute('**/snapshot-pages?*');
   await page.waitForFunction(() => !document.querySelector('.snapshot-favorite')?.disabled);
   await page.locator('.snapshot-favorite').first().click();
-  await page.locator('.snapshot-favorite[aria-pressed=\"true\" ]').first().waitFor();
+  const heart = page.locator('.snapshot-favorite[aria-pressed="true"]').first();
+  await heart.waitFor();
+  const favoriteTrack = '.track-clip[data-favorite="true"]';
+  const favoriteFocus = page.locator(`.viewer-focus ${favoriteTrack}`);
+  await favoriteFocus.waitFor();
+  await row.locator(favoriteTrack).waitFor();
+  await page.waitForFunction(() => {
+    const button = document.querySelector('.snapshot-favorite[aria-pressed="true"]');
+    return button && getComputedStyle(button).color === 'rgb(245, 138, 199)';
+  });
+  assert.equal(
+    await favoriteFocus.evaluate((node) =>
+      getComputedStyle(node).getPropertyValue('--coverage-tint').trim(),
+    ),
+    '#f58ac7',
+  );
   assert.equal(await page.locator('.track-favorite-range').count(), 0);
   assert.equal(
     await page
@@ -131,6 +146,10 @@ try {
   assert.equal(await page.locator('.recording-line .track-favorite-range').count(), 0);
   await page.reload();
   await page.locator('.viewer-focus .track-clip[data-seen="true"]').waitFor();
+  await favoriteFocus.waitFor();
+  await heart.click();
+  await favoriteFocus.waitFor({ state: 'detached' });
+  await row.locator(favoriteTrack).waitFor({ state: 'detached' });
   assert.deepEqual(errors, []);
   console.log(
     JSON.stringify({
@@ -140,7 +159,7 @@ try {
       growthAndSealRemainUnread: true,
       boundedReporting: true,
       sharedTimelineStyles: true,
-      favoritesRemainInGrid: true,
+      favoritesColorCoverage: true,
       reloadPersists: true,
     }),
   );

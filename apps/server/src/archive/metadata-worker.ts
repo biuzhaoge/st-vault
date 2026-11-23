@@ -769,6 +769,7 @@ async function apply(record: JournalRecord, recovery = false): Promise<void> {
     if (record.revision !== previous + 1) throw new Error('JOURNAL_REVISION_GAP');
     if (!(await db.prepare('SELECT id FROM subjects WHERE id=?').get(record.subject.id)))
       await addSubject(record.subject);
+    let visibilityChanged = record.kind === 'commit';
     if (record.kind === 'commit') {
       const s = record.segment;
       const existing = await db
@@ -836,6 +837,7 @@ async function apply(record: JournalRecord, recovery = false): Promise<void> {
         const wasVisible = !!(await db
           .prepare('SELECT 1 FROM visible_segments WHERE id=? AND deleted=0')
           .get(id));
+        visibilityChanged ||= wasVisible || s.start === null;
         await db.prepare('UPDATE segments SET deleted=1 WHERE id=?').run(id);
         await units.deleted(id, wasVisible);
         await db.prepare('UPDATE objects SET deleted=1 WHERE id=?').run(s.media);
@@ -851,16 +853,20 @@ async function apply(record: JournalRecord, recovery = false): Promise<void> {
           await db.prepare('UPDATE subjects SET unlocated=unlocated-1 WHERE id=?').run(s.subject);
       }
       for (const minute of minutes) await rebuildMinute(record.subject.id, minute);
-      await db
-        .prepare('UPDATE subjects SET deletion_revision=? WHERE id=?')
-        .run((await currentRevision()) + 1, record.subject.id);
+      // A queued deletion is already hidden at admission. Its portable
+      // tombstones update the journal and minute index without another UI revision.
+      if (visibilityChanged)
+        await db
+          .prepare('UPDATE subjects SET deletion_revision=? WHERE id=?')
+          .run((await currentRevision()) + 1, record.subject.id);
     } else throw new Error('INVALID_JOURNAL_KIND');
     await db
       .prepare(
         'INSERT INTO journal_heads VALUES(?,?) ON CONFLICT(subject) DO UPDATE SET revision=excluded.revision',
       )
       .run(record.subject.id, record.revision);
-    await db.prepare('UPDATE counters SET revision=revision+1 WHERE id=1').run();
+    if (visibilityChanged)
+      await db.prepare('UPDATE counters SET revision=revision+1 WHERE id=1').run();
   });
 }
 async function sign(body: string): Promise<Buffer> {
@@ -1438,7 +1444,7 @@ const handlers: Record<string, (input: RequestInput) => unknown> = {
     (await units.ready())
       ? await transaction(async () => {
           const job = await deletionIntents.step(input?.commandId);
-          if (job && ['failed', 'queued', 'completed'].includes(job.state)) {
+          if (job?.state === 'failed') {
             await publishDeletionGeneration(
               job.subjectId,
               job.fromMs ?? 0,
@@ -1625,12 +1631,17 @@ const handlers: Record<string, (input: RequestInput) => unknown> = {
   },
   coverage: async ({ id, from, to, buckets, includeProtection }) => {
     const result = await coverage(id, from, to, buckets);
-    const viewing = result.buckets.some((bucket) => bucket.coveredMs > 0)
+    const hasCoverage = result.buckets.some((bucket) => bucket.coveredMs > 0);
+    const viewing = hasCoverage
       ? await personalStore.seenCoverage(id, from, to, buckets)
       : { seenSpans: [] };
+    const favorites = hasCoverage
+      ? await personalStore.favoriteCoverage(id, from, to, buckets)
+      : [];
     return {
       ...result,
       ...viewing,
+      ...(favorites.length ? { favoriteSpans: favorites } : {}),
       ...(includeProtection
         ? {
             protectedSpans: await personalStore.protectedCoverage(

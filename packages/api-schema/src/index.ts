@@ -1,5 +1,4 @@
 import { z } from 'zod';
-export { allowsCredentialUrl, allowsPlainHttp } from './access-transport.js';
 export { recordingLayout, recordingDisplayEnd } from './recording-layout.js';
 export { maxTimelineSubjectIds, syncTopics, type SyncChange, type SyncTopic } from './sync.js';
 
@@ -245,6 +244,8 @@ export interface CoverageResponse {
   seenSpans?: MediaTimeRange[];
   /** Bounded ranges of actual unread coverage when the window contains seen media. */
   unreadSpans?: MediaTimeRange[];
+  /** Bounded display ranges of visible favorite fragments; take precedence over seen/unread. */
+  favoriteSpans?: MediaTimeRange[];
 }
 export interface RecordingBoundsResponse {
   subjectId: string;

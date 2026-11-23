@@ -2,34 +2,37 @@ import { describe, expect, it, vi } from 'vitest';
 import { ResourceMonitor } from './resources.js';
 import { defaultRuntimeSettings } from './settings.js';
 describe('storage budgets and retention ownership', () => {
-  it('checks both independent volumes and blocks recording if only the index disk is full', async () => {
-    let dataFree = 0;
-    const writeProbe = vi.fn(() => Promise.resolve());
-    const monitor = new ResourceMonitor({
-      root: '/media',
-      dataRoot: '/data',
-      archive: { pruneBefore: () => Promise.resolve({ deletedSegments: 0, reclaimedBytes: 0 }) },
-      settings: () => defaultRuntimeSettings,
-      readDisk: (root) =>
-        Promise.resolve({
-          freeBytes: root === '/data' ? dataFree : 10 ** 12,
-          totalBytes: 2 * 10 ** 12,
-        }),
-      writeProbe,
-    });
-    try {
-      await monitor.checkDisk();
-      expect(monitor.canRecord()).toBe(false);
-      expect(monitor.get().error).toBe('data_disk_low_space');
-      expect(writeProbe).toHaveBeenCalledWith('/media');
-      expect(writeProbe).toHaveBeenCalledWith('/data');
-      dataFree = 10 ** 12;
-      await monitor.checkDisk();
-      expect(monitor.canRecord()).toBe(true);
-    } finally {
-      await monitor.close();
-    }
-  });
+  it.each(['dataRoot', 'databaseRoot'] as const)(
+    'blocks recording when the %s volume alone is full',
+    async (volume) => {
+      let dataFree = 0;
+      const writeProbe = vi.fn(() => Promise.resolve());
+      const monitor = new ResourceMonitor({
+        root: '/media',
+        [volume]: '/data',
+        archive: { pruneBefore: () => Promise.resolve({ deletedSegments: 0, reclaimedBytes: 0 }) },
+        settings: () => defaultRuntimeSettings,
+        readDisk: (root) =>
+          Promise.resolve({
+            freeBytes: root === '/data' ? dataFree : 10 ** 12,
+            totalBytes: 2 * 10 ** 12,
+          }),
+        writeProbe,
+      });
+      try {
+        await monitor.checkDisk();
+        expect(monitor.canRecord()).toBe(false);
+        expect(monitor.get().error).toBe('data_disk_low_space');
+        expect(writeProbe).toHaveBeenCalledWith('/media');
+        expect(writeProbe).toHaveBeenCalledWith('/data');
+        dataFree = 10 ** 12;
+        await monitor.checkDisk();
+        expect(monitor.canRecord()).toBe(true);
+      } finally {
+        await monitor.close();
+      }
+    },
+  );
   it('rechecks write access immediately after an operator fixes a read-only volume', async () => {
     let writable = false;
     const monitor = new ResourceMonitor({

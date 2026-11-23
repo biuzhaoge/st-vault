@@ -5,7 +5,7 @@ import type { SystemInfo } from './system';
 const system: SystemInfo = {
   version: 'test',
   capturedAtMs: 1000,
-  disk: { freeBytes: 5 * 1024 ** 3, totalBytes: 10 * 1024 ** 3, lowSpace: false },
+  disk: { freeBytes: 7 * 1024 ** 3, totalBytes: 10 * 1024 ** 3, lowSpace: false },
   capture: { pollMs: 5000, active: 3, starting: 1, retrying: 2 },
   backgroundTasks: [
     {
@@ -21,15 +21,43 @@ it('shows recording and media items in separate rows under their groups', () => 
   const html = renderToStaticMarkup(<SystemSummary system={system} autoRecordingCount={5} />);
   expect(html).toMatch(/data-status-row="recording-start"[^>]*>.*?启动中/);
   expect(html).toMatch(/data-status-row="recording-reconnect"[^>]*>.*?重连中/);
+  expect(html).toMatch(/data-status-row="recording"[^>]*>.*?class="panel-badge is-success"/);
   expect(html).toMatch(
     /aria-label="媒体处理"[^>]*>.*?data-status-row="archive-index"[^>]*>.*?录像整理/,
   );
-  expect(html).toContain('剩余 5.0 GiB');
   expect(html).toMatch(/aria-label="归档与存储"[^>]*>.*?归档服务.*?data-status-row="disk-check"/);
-  expect(html).toContain('width:50%');
+  expect(html).toMatch(
+    /data-status-row="disk-check"[^>]*>.*?class="panel-badge is-success"><span class="disk-capacity" role="meter"[^>]*aria-valuenow="30"[^>]*style="--disk-used:30%">剩余 7\.0 GiB<\/span>/,
+  );
+  expect(html).toContain('aria-valuetext="已用 30%，剩余 7.0 GiB"');
   expect(html).not.toContain('<details');
   expect(html).not.toContain('overflow-text');
   expect(html).not.toContain('index-batches');
+});
+
+it('gives every displayed status row a help button with current settings', () => {
+  const html = renderToStaticMarkup(
+    <SystemSummary
+      system={{
+        ...system,
+        settings: { pollMs: 7250, retentionDays: 21, minFreeBytes: 3 * 1024 ** 3 },
+        backgroundTasks: [
+          ...system.backgroundTasks!,
+          { id: 'account-list', group: 'sync', state: 'waiting' },
+          { id: 'retention', group: 'protection', state: 'waiting' },
+          { id: 'library-checkpoint', group: 'protection', state: 'error' },
+        ],
+      }}
+      autoRecordingCount={5}
+    />,
+  );
+  expect(html.match(/class="status-help-trigger"/g)).toHaveLength(
+    html.match(/class="panel-row panel-status-row"/g)!.length,
+  );
+  expect(html).toContain('统一同步间隔 7.25 秒');
+  expect(html).toContain('录像保留天数 21 天');
+  expect(html).toContain('最低剩余空间 3 GiB');
+  expect(html).toContain('检查点');
 });
 it('does not draw a fake disk progress bar before capacity is known', () => {
   const html = renderToStaticMarkup(
@@ -38,7 +66,39 @@ it('does not draw a fake disk progress bar before capacity is known', () => {
       autoRecordingCount={0}
     />,
   );
-  expect(html).not.toContain('磁盘剩余空间');
+  expect(html).not.toContain('role="meter"');
+});
+
+it('leaves the entire bar unfilled when the reported capacity is all free', () => {
+  const html = renderToStaticMarkup(
+    <SystemSummary
+      system={{ ...system, disk: { ...system.disk, freeBytes: system.disk.totalBytes } }}
+      autoRecordingCount={0}
+    />,
+  );
+  expect(html).toMatch(/role="meter"[^>]*aria-valuenow="0"[^>]*style="--disk-used:0%"/);
+});
+
+it('shows low capacity and a disk check in the same status position', () => {
+  const lowDisk = { ...system.disk, freeBytes: 0, lowSpace: true };
+  const low = renderToStaticMarkup(
+    <SystemSummary system={{ ...system, disk: lowDisk }} autoRecordingCount={0} />,
+  );
+  expect(low).toMatch(
+    /data-status-row="disk-check"[^>]*>.*?class="panel-badge is-warning"><span class="disk-capacity" role="meter"[^>]*aria-valuenow="100"[^>]*style="--disk-used:100%">剩余 0 B<\/span>/,
+  );
+  const checking = renderToStaticMarkup(
+    <SystemSummary
+      system={{
+        ...system,
+        disk: lowDisk,
+        backgroundTasks: [{ id: 'disk-check', group: 'protection', state: 'running' }],
+      }}
+      autoRecordingCount={0}
+    />,
+  );
+  expect(checking).toMatch(/data-status-row="disk-check"[^>]*>.*?panel-badge is-busy.*?检查中/);
+  expect(checking).not.toContain('role="meter"');
 });
 it('keeps retry feedback on its existing status row and omits it after healthy checks', () => {
   const onRefresh = () => Promise.resolve();
@@ -89,6 +149,8 @@ it('keeps the actual diagnostic visible after a retry while offering another att
   expect(html).toContain('数据目录只读');
   expect(html).toContain('archive-health is-ok');
   expect(html).toContain('aria-label="存储空间：重试"');
+  expect(html).toMatch(/data-status-row="disk-check"[^>]*>.*?panel-badge is-error">异常/);
+  expect(html).not.toContain('role="meter"');
   expect(html).not.toContain('aria-label="归档服务：重试"');
   expect(html).toContain('重试已执行，恢复情况见当前状态。');
 });

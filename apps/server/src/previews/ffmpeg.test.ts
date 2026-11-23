@@ -167,6 +167,17 @@ describe('owned bounded snapshot child process', () => {
       launch: launch("process.stdin.resume();process.stdin.on('end',()=>process.exit(2));"),
     });
     await expect(failed(input)).rejects.toMatchObject({ code: 'failed' });
+    const malformed = createFfmpegDecoder({
+      launch: launch(
+        "process.stdin.resume();process.stdin.on('end',()=>{process.stderr.write('pipe:0: Invalid data');setImmediate(()=>{process.stderr.write(' found when processing input\\n');process.exitCode=1;});});",
+      ),
+    });
+    await expect(malformed(input)).rejects.toMatchObject({ code: 'invalid_media' });
+    await expect(malformed({ ...input, paths: ['synthetic-missing-media'] })).rejects.toMatchObject(
+      {
+        code: 'failed',
+      },
+    );
     await expect(empty({ ...input, paths: ['synthetic-missing-media'] })).rejects.toMatchObject({
       code: 'failed',
     });

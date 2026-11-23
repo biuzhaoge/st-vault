@@ -120,6 +120,7 @@ export function createPreviews(options: PreviewOptions): PreviewsPort {
     }),
   );
   const decode = options.decoder ?? createFfmpegDecoder({ ffmpegPath: options.ffmpegPath });
+  const screenshotDiagnostics = new DerivativeDiagnostics(now);
   const cache = new Map<string, CacheEntry>(),
     tasks = new Set<Task>();
   let used = 0,
@@ -149,6 +150,11 @@ export function createPreviews(options: PreviewOptions): PreviewsPort {
     ? new LibraryImages(options.mediaRoot, 'cover', options.publishConcurrency)
     : options.cacheRoot
       ? new PreviewDiskCache(path.join(options.cacheRoot, 'covers'), 128 * 1024 ** 2, 2048)
+      : null;
+  const defaultCoverDisk = options.mediaRoot
+    ? new LibraryImages(options.mediaRoot, 'default-cover', options.publishConcurrency)
+    : options.cacheRoot
+      ? new PreviewDiskCache(path.join(options.cacheRoot, 'default-covers'), 128 * 1024 ** 2, 2048)
       : null;
   const cached = (key: string): Uint8Array | null => {
     const entry = cache.get(key);
@@ -307,6 +313,45 @@ export function createPreviews(options: PreviewOptions): PreviewsPort {
       missing: coverMissing(error),
     });
   };
+  const defaultDownloads = new Map<string, Promise<Uint8Array>>();
+  const loadDefaultCover = (
+    providerId: number,
+    source: string,
+    abort: AbortSignal,
+  ): Promise<Uint8Array> => {
+    if (!defaultCoverDisk || !options.archive.getSetting || !options.archive.setSetting)
+      return readCoverImage(source, abort);
+    const disk = defaultCoverDisk,
+      key = `cover:${providerId}`,
+      setting = `preview.default-cover-source.${providerId}`;
+    const pending = defaultDownloads.get(key);
+    // Serialize versions of a default so the stored image and its source stay paired.
+    const load = async (): Promise<Uint8Array> => {
+      const stored = await disk.get(key);
+      if (
+        stored &&
+        previewImageType(stored) &&
+        (await options.archive.getSetting!(setting)) === source
+      )
+        return stored;
+      const previous = await coverDisk?.get(key);
+      const bytes =
+        previous &&
+        previewImageType(previous) &&
+        (await options.archive.getSetting!(`preview.cover-source.${providerId}`)) === source
+          ? previous
+          : await readCoverImage(source, abort);
+      if (abort.aborted) throw new PreviewError('preview_cancelled');
+      if (!(await disk.put(key, bytes))) throw Error('COVER_CACHE_WRITE_FAILED');
+      await options.archive.setSetting!(setting, source);
+      return bytes;
+    };
+    const work = (pending ? pending.then(load, load) : load()).finally(() => {
+      if (defaultDownloads.get(key) === work) defaultDownloads.delete(key);
+    });
+    defaultDownloads.set(key, work);
+    return work;
+  };
   const fetchCover = async (id: string, abort: AbortSignal, force = false): Promise<Uint8Array> => {
     const broadcaster = await options.archive.getSubject(id, { activity: false });
     if (!broadcaster) {
@@ -361,7 +406,10 @@ export function createPreviews(options: PreviewOptions): PreviewsPort {
       }
       let bytes: Uint8Array;
       try {
-        bytes = await readCoverImage(source, abort);
+        bytes =
+          source === storedSource
+            ? await loadDefaultCover(providerId, source, abort)
+            : await readCoverImage(source, abort);
       } catch (error) {
         if (abort.aborted || previous || !storedSource || storedSource === source) throw error;
         // The first live snapshot can be unavailable while the CDN is catching up.
@@ -370,7 +418,7 @@ export function createPreviews(options: PreviewOptions): PreviewsPort {
         reportCoverFailure(error, source);
         primaryFailed = true;
         source = storedSource;
-        bytes = await readCoverImage(source, abort);
+        bytes = await loadDefaultCover(providerId, source, abort);
       }
       if (!previewImageType(bytes)) throw new PreviewError('preview_failed');
       if (coverDisk) {
@@ -391,8 +439,31 @@ export function createPreviews(options: PreviewOptions): PreviewsPort {
       throw new PreviewError('preview_not_found');
     }
   };
-  const downloadCover = (id: string, signal?: AbortSignal): Promise<Uint8Array> =>
-    run(networkLane, signal, (abort) => fetchCover(id, abort, true));
+  const downloadCover = (job: string): Promise<void> =>
+    run(networkLane, undefined, async (abort) => {
+      if (!job.startsWith('default:')) {
+        await fetchCover(job, abort, true);
+        return;
+      }
+      const id = job.slice('default:'.length);
+      const providerId = await subject(id);
+      const source = coverSource(await options.archive.subjectPreview?.(id));
+      if (source) {
+        const failure = coverFailures.get(job);
+        if (failure?.source === source && now() < failure.retryAt) return;
+        try {
+          await loadDefaultCover(providerId, source, abort);
+        } catch (error) {
+          if (abort.aborted) throw new PreviewError('preview_cancelled');
+          failCover(job, source, error);
+          reportCoverFailure(error, source);
+          return;
+        }
+      }
+      coverFailures.delete(job);
+      if (!observedSources.get(id) && (!source || versions.get(id) !== source))
+        await fetchCover(id, abort, true);
+    });
   const renderSnapshot = (
     id: string,
     at: number,
@@ -429,7 +500,10 @@ export function createPreviews(options: PreviewOptions): PreviewsPort {
         return hit;
       }
       const limit = toMs ?? Math.min(at + 500, initial.wallEndMs!);
-      let cursor = at;
+      let cursor = at,
+        prerollFrom = 0,
+        isolate = false,
+        malformed: SnapshotDecodeError | undefined;
       while (cursor < limit) {
         const selected =
           unitId && options.archive.unitSource
@@ -447,6 +521,7 @@ export function createPreviews(options: PreviewOptions): PreviewsPort {
           last = selected;
         // Keep preroll inside the same continuous epoch; bound it by time and actual bytes below.
         while (
+          !isolate &&
           segments.length < 599 &&
           !first.discontinuity &&
           first.wallStartMs !== null &&
@@ -460,6 +535,7 @@ export function createPreviews(options: PreviewOptions): PreviewsPort {
             previous.sourceEpoch !== first.sourceEpoch ||
             previous.initObjectId !== first.initObjectId ||
             previous.wallStartMs === null ||
+            previous.wallStartMs < prerollFrom ||
             previous.wallEndMs !== first.wallStartMs ||
             target - previous.wallStartMs > 15000
           )
@@ -471,6 +547,7 @@ export function createPreviews(options: PreviewOptions): PreviewsPort {
         // the entire minute before asking for its first image; an empty attempt
         // advances to the next island below, retaining complete minute coverage.
         while (
+          !isolate &&
           last.id === selected.id &&
           segments.length < 599 &&
           last.wallEndMs !== null &&
@@ -536,16 +613,27 @@ export function createPreviews(options: PreviewOptions): PreviewsPort {
               });
             } catch (error) {
               if (abort.aborted) throw error;
-              if (!(error instanceof SnapshotDecodeError) || error.code !== 'no_frame') {
-                const code = error instanceof SnapshotDecodeError ? error.code : 'failed';
-                console.warn(`Snapshot decoder error: ${code}`);
+              if (error instanceof SnapshotDecodeError && error.code === 'invalid_media') {
+                // Separate a malformed fragment from its neighbors before giving up its frame.
+                if (segments.length > 1) {
+                  isolate = true;
+                  continue;
+                }
+                malformed = error;
+                prerollFrom = selected.wallStartMs + 1;
+              } else if (error instanceof SnapshotDecodeError && error.code === 'no_frame') {
+                while (emptyWindows.size >= 96)
+                  emptyWindows.delete(emptyWindows.keys().next().value!);
+                emptyWindows.set(emptyKey, now() + 30000);
+              } else {
+                const failure =
+                  error instanceof SnapshotDecodeError ? error : new SnapshotDecodeError('failed');
+                screenshotDiagnostics.record('screenshot_decode_failed', failure);
                 throw new PreviewError(
-                  code === 'unavailable' ? 'preview_unavailable' : 'preview_failed',
+                  failure.code === 'unavailable' ? 'preview_unavailable' : 'preview_failed',
+                  { cause: failure },
                 );
               }
-              while (emptyWindows.size >= 96)
-                emptyWindows.delete(emptyWindows.keys().next().value!);
-              emptyWindows.set(emptyKey, now() + 30000);
             }
           }
           if (bytes) {
@@ -560,6 +648,11 @@ export function createPreviews(options: PreviewOptions): PreviewsPort {
           }
         }
         cursor = Math.max(target + 1, last.wallEndMs!);
+        isolate = false;
+      }
+      if (malformed) {
+        screenshotDiagnostics.record('screenshot_decode_failed', malformed);
+        throw new PreviewError('preview_failed', { cause: malformed });
       }
       throw new PreviewError('preview_not_found');
     });
@@ -584,12 +677,12 @@ export function createPreviews(options: PreviewOptions): PreviewsPort {
             ? 'running'
             : failed
               ? 'retrying'
-              : pendingCovers.size
+              : pendingCoverCount()
                 ? 'waiting'
                 : options.cacheRoot
                   ? 'idle'
                   : 'disabled',
-          pending: pendingCovers.size,
+          pending: pendingCoverCount(),
           failed,
           lastRunAtMs: coverStartedAt,
           lastSuccessAtMs: coverSucceededAt,
@@ -655,7 +748,9 @@ export function createPreviews(options: PreviewOptions): PreviewsPort {
             const fresh = await coverDisk?.get(key, 15000);
             if (fresh && previewImageType(fresh)) local = { bytes: fresh, stale: false };
             else {
-              const stale = await coverDisk?.get(key);
+              const current = await coverDisk?.get(key);
+              const stale =
+                current && previewImageType(current) ? current : await defaultCoverDisk?.get(key);
               local = stale && previewImageType(stale) ? { bytes: stale, stale: true } : null;
             }
           }
@@ -746,6 +841,10 @@ export function createPreviews(options: PreviewOptions): PreviewsPort {
       pendingCovers.add(id);
       schedule();
     },
+    warmSubjectImages: async (ids) => {
+      if (closed || !coverDisk) return;
+      await Promise.all([queueCovers(ids.map((id) => `default:${id}`)), avatars?.warm(ids)]);
+    },
     warmCovers: async (subjects) => {
       if (closed || !coverDisk) return;
       let ids = subjects;
@@ -758,20 +857,7 @@ export function createPreviews(options: PreviewOptions): PreviewsPort {
           if (!bytes || !previewImageType(bytes)) ids.push(row.id);
         }
       }
-      if (closed) return;
-      const done = Promise.all(
-        [...new Set(ids)].slice(0, 2048).map((id) => {
-          pendingCovers.add(id);
-          return new Promise<void>((resolve) => {
-            const waiters = warmWaiters.get(id) ?? new Set<() => void>();
-            waiters.add(resolve);
-            warmWaiters.set(id, waiters);
-          });
-        }),
-      ).then(() => undefined);
-      backgroundTimer?.ref();
-      schedule();
-      return done;
+      return queueCovers(ids);
     },
     close: () => {
       if (closing) return closing;
@@ -781,6 +867,7 @@ export function createPreviews(options: PreviewOptions): PreviewsPort {
       detachCoverRetry?.();
       clearTimeout(backgroundTimer);
       pendingCovers.clear();
+      pendingDefaults.clear();
       for (const waiters of warmWaiters.values()) for (const resolve of waiters) resolve();
       warmWaiters.clear();
       observedSources.clear();
@@ -799,28 +886,52 @@ export function createPreviews(options: PreviewOptions): PreviewsPort {
       ).then(async () => {
         try {
           await coverDisk?.close();
+          await defaultCoverDisk?.close();
           await avatars?.close();
         } finally {
           coverFailures.clear();
           coverDiagnostics.close();
+          screenshotDiagnostics.close();
         }
       });
       return closing;
     },
   };
-  const pendingCovers = new Set<string>();
+  const pendingCovers = new Set<string>(),
+    pendingDefaults = new Set<string>(),
+    pendingCoverCount = () => pendingCovers.size + pendingDefaults.size;
+  const coverQueue = (job: string): Set<string> =>
+    job.startsWith('default:') ? pendingDefaults : pendingCovers;
+  let preferDefaults = false;
   const warmWaiters = new Map<string, Set<() => void>>();
   let backgroundTimer: ReturnType<typeof setTimeout> | undefined,
     backgroundWork: Promise<void> | undefined;
+  const queueCovers = (ids: readonly string[]): Promise<void> => {
+    if (closed) return Promise.resolve();
+    const done = Promise.all(
+      [...new Set(ids)].map((id) => {
+        coverQueue(id).add(id);
+        return new Promise<void>((resolve) => {
+          const waiters = warmWaiters.get(id) ?? new Set<() => void>();
+          waiters.add(resolve);
+          warmWaiters.set(id, waiters);
+        });
+      }),
+    ).then(() => undefined);
+    backgroundTimer?.ref();
+    schedule();
+    return done;
+  };
   function queueCoverRetries(manual = false): string[] {
     const queued: string[] = [];
     if (closed) return queued;
     const time = now();
     let budget = options.networkConcurrency ?? 2;
     for (const [id, failure] of coverFailures) {
-      if (failure.missing || pendingCovers.has(id) || (!manual && failure.retryAt > time)) continue;
+      const queue = coverQueue(id);
+      if (failure.missing || queue.has(id) || (!manual && failure.retryAt > time)) continue;
       if (manual) failure.retryAt = time;
-      pendingCovers.add(id);
+      queue.add(id);
       queued.push(id);
       if (--budget === 0) break;
     }
@@ -832,16 +943,25 @@ export function createPreviews(options: PreviewOptions): PreviewsPort {
   });
   const schedule = (): void => {
     if (closed || backgroundTimer || backgroundWork) return;
-    if (!pendingCovers.size) {
-      return;
-    }
+    if (!pendingCoverCount()) return;
     backgroundTimer = setTimeout(() => {
       backgroundTimer = undefined;
-      const ids = [...pendingCovers].slice(0, options.networkConcurrency ?? 2);
-      coverStartedAt = now();
-      for (const id of ids) {
-        pendingCovers.delete(id);
+      const ids: string[] = [];
+      // Roster batches can be large; interleave them with live cover observations.
+      while (ids.length < (options.networkConcurrency ?? 2) && pendingCoverCount()) {
+        const useDefaults = pendingDefaults.size > 0 && (preferDefaults || !pendingCovers.size);
+        const queue = useDefaults ? pendingDefaults : pendingCovers;
+        const id = queue.values().next().value!;
+        queue.delete(id);
+        ids.push(id);
+        preferDefaults = !useDefaults;
       }
+      coverStartedAt = now();
+      const batchWaiters = ids.map((id) => {
+        const waiters = warmWaiters.get(id);
+        warmWaiters.delete(id);
+        return waiters;
+      });
       const download = () => Promise.allSettled(ids.map((id) => downloadCover(id)));
       backgroundWork = Promise.resolve()
         .then(() => options.archive.withBackgroundReads?.(download) ?? download())
@@ -872,10 +992,7 @@ export function createPreviews(options: PreviewOptions): PreviewsPort {
           coverDiagnostics.record('cover_background_failed', error);
         })
         .finally(() => {
-          for (const id of ids) {
-            for (const resolve of warmWaiters.get(id) ?? []) resolve();
-            warmWaiters.delete(id);
-          }
+          for (const waiters of batchWaiters) for (const resolve of waiters ?? []) resolve();
           backgroundWork = undefined;
           schedule();
         });

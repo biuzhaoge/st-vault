@@ -1,6 +1,7 @@
 import { expect, it } from 'vitest';
 import {
   aggregateWindow,
+  calendarEnd,
   calendarWindow,
   DAY_MS,
   DEFAULT_RANGE_MS,
@@ -17,26 +18,26 @@ import {
 const today = Date.UTC(2026, 10, 4, 16),
   now = today + 12 * 3600000,
   first = today - 30 * DAY_MS;
-it('bounds morning navigation and resizing at noon and afternoon navigation at midnight', () => {
-  const half = DAY_MS / 2;
-  for (const clock of [today, today + half - 1]) {
+it('uses the same current day end for navigation and resizing before and after noon', () => {
+  for (const clock of [today, now - 1, now, today + DAY_MS - 1]) {
     const latest = calendarWindow(today + 10 * DAY_MS, DAY_MS, first, clock);
-    expect(latest).toEqual({ fromMs: today - half, toMs: today + half });
+    expect(calendarEnd(clock)).toBe(today + DAY_MS);
+    expect(latest).toEqual({ fromMs: today, toMs: today + DAY_MS });
     expect(moveWindow(latest, 1, first, clock)).toEqual(latest);
-    expect(resizeCalendarWindow(latest, 'to', 100, first, clock).toMs).toBe(today + half);
+    expect(resizeCalendarWindow(latest, 'to', 100, first, clock).toMs).toBe(today + DAY_MS);
   }
-  for (const clock of [today + half, today + DAY_MS - 1])
-    expect(calendarWindow(today + 10 * DAY_MS, DAY_MS, first, clock)).toEqual({
-      fromMs: today,
-      toMs: today + DAY_MS,
-    });
+  expect(calendarEnd(today + DAY_MS)).toBe(today + 2 * DAY_MS);
 });
-it('limits a fresh morning installation to its initialization day without inventing yesterday', () => {
+it('makes the full initialization day available even in the morning', () => {
   for (const duration of RANGE_STOPS)
     expect(restoreViewWindow(null, duration, today + 3600000, today + 1000)).toEqual({
       fromMs: today,
-      toMs: today + DAY_MS / 2,
+      toMs: today + Math.min(duration, DAY_MS),
     });
+  expect(moveWindow({ fromMs: today, toMs: now }, 1, today, today + 3600000)).toEqual({
+    fromMs: now,
+    toMs: today + DAY_MS,
+  });
 });
 it('supports a twelve-hour minimum and moves and resizes in half-day steps', () => {
   const half = DAY_MS / 2;

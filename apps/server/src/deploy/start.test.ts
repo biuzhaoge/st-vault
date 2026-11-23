@@ -30,7 +30,10 @@ vi.mock('node:fs/promises', () => ({
   lstat: vi.fn().mockResolvedValue({ isSymbolicLink: () => false }),
   chown: vi.fn(),
 }));
-vi.mock('../runtime/runtime-logs.js', () => ({ installRuntimeLogs: vi.fn() }));
+vi.mock('../runtime/runtime-logs.js', () => ({
+  installRuntimeLogs: vi.fn(),
+  closeRuntimeLogs: vi.fn(() => Promise.resolve()),
+}));
 vi.mock('../index.js', () => ({}));
 const argv = process.argv;
 const exitCode = process.exitCode;
@@ -41,6 +44,7 @@ beforeEach(() => {
   vi.stubEnv('STV_RUNTIME_GID', '1002');
   vi.stubEnv('STV_DATA_DIR', '/fixture/state');
   vi.stubEnv('STV_MEDIA_DIR', '/fixture/media');
+  vi.stubEnv('STV_POSTGRES_BIN', '/fixture/bin');
   vi.stubEnv('STV_POSTGRES_NSS_WRAPPER', undefined);
   vi.stubEnv('STV_DATABASE_SOCKET', '');
   vi.stubEnv('STV_DATABASE_PASSWORD', '');
@@ -68,9 +72,11 @@ describe('single-service startup', () => {
     expect(vi.mocked(initializeState).mock.invocationCallOrder[0]).toBeLessThan(
       vi.mocked(dropRuntimePrivileges).mock.invocationCallOrder[0],
     );
-    expect(EmbeddedPostgres.open).toHaveBeenCalledExactlyOnceWith(
-      expect.objectContaining({ nssWrapper: '/usr/local/lib/libnss_wrapper.so' }),
-    );
+    expect(EmbeddedPostgres.open).toHaveBeenCalledExactlyOnceWith({
+      root: path.resolve('/fixture/state'),
+      binaries: '/fixture/bin',
+      nssWrapper: '/usr/local/lib/libnss_wrapper.so',
+    });
     expect(vi.mocked(dropRuntimePrivileges).mock.invocationCallOrder[0]).toBeLessThan(
       vi.mocked(EmbeddedPostgres.open).mock.invocationCallOrder[0],
     );

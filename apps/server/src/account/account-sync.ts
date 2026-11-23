@@ -135,37 +135,29 @@ export async function createAccountSync(options: AccountSyncOptions): Promise<Ac
     active: Job | undefined,
     closing: Promise<void> | undefined;
   const jobs = new Set<Job>();
-  const pendingCovers = new Set<string>();
   const listeners = new Set<() => void>();
   const notify = (): void => {
     for (const listener of listeners) listener();
   };
-  let warming: Promise<void> | undefined;
+  const warming = new Set<Promise<void>>();
   let stage: AccountSyncStatus['stage'];
-  const warmCovers = (ids: string[]): void => {
+  const warmImages = (ids: string[]): void => {
     if (!options.onImported || closed) return;
-    for (const id of ids) pendingCovers.add(id);
-    if (warming) return;
-    warming = Promise.resolve()
-      .then(async () => {
-        while (!closed && pendingCovers.size) {
-          const batch = [...pendingCovers];
-          pendingCovers.clear();
-          try {
-            await options.onImported!(batch);
-          } catch (error) {
-            console.warn(
-              'Imported cover warming failed',
-              error instanceof Error ? error.name : 'unknown',
-            );
-          }
-        }
+    const work = Promise.resolve()
+      .then(() => {
+        if (!closed) return options.onImported!(ids);
+      })
+      .catch((error: unknown) => {
+        console.warn(
+          'Imported image warming failed',
+          error instanceof Error ? error.name : 'unknown',
+        );
       })
       .finally(() => {
-        warming = undefined;
-        notify();
-        if (pendingCovers.size && !closed) warmCovers([]);
+        warming.delete(work);
+        if (!warming.size) notify();
       });
+    warming.add(work);
     notify();
   };
   const avatarHttp = createHttp({
@@ -244,7 +236,7 @@ export async function createAccountSync(options: AccountSyncOptions): Promise<Ac
     origin: connection.active?.origin ?? defaultOrigin,
     ...state,
     ...(stage ? { stage } : {}),
-    ...(warming ? { warmingCovers: true } : {}),
+    ...(warming.size ? { warmingCovers: true } : {}),
     profile: connection.active?.profile
       ? {
           username: connection.active.profile.username,
@@ -506,8 +498,7 @@ export async function createAccountSync(options: AccountSyncOptions): Promise<Ac
         JSON.stringify({ event: 'account_sync_recovered', origin, previousError: priorError }),
       );
     runBackground(options.supervisor.reconcile(), 'account_reconcile_failed');
-    // Cover I/O has separate ownership from a successfully persisted account.
-    warmCovers(subjects.map((subject) => subject.id));
+    warmImages(subjects.map((subject) => subject.id));
     return subjects.length;
   };
   function refresh(signal?: AbortSignal): Promise<AccountSyncResult> {
@@ -656,12 +647,9 @@ export async function createAccountSync(options: AccountSyncOptions): Promise<Ac
       detachClock?.();
       invalidate();
       clearAvatar();
-      pendingCovers.clear();
-      closing = Promise.allSettled([
-        tail,
-        warming,
-        ...[...avatarTasks].map((task) => task.done),
-      ]).then(() => undefined);
+      closing = Promise.allSettled([tail, ...[...avatarTasks].map((task) => task.done)]).then(
+        () => undefined,
+      );
       return closing;
     },
   };

@@ -4,19 +4,19 @@
 
 这些接口服务于同仓库工作台，尚未承诺独立公共 API 的版本兼容。请求约束以 [api-schema](../packages/api-schema/src/index.ts) 和对应 HTTP 模块中的 Zod schema 为准。时间均为 UTC epoch 毫秒，ID 使用 `stripchat:<providerId>`；界面按 `/api/session` 返回的 `timeZone`（部署 `TZ`）显示；日历查询允许最多 8 个 UTC 日以覆盖夏令时回拨后的 7 个当地日。
 
-除健康、静态资源和本地登录/初始化入口外，业务接口要求管理员会话。常规状态响应不返回地址密钥。管理员可通过 HTTPS 或受信任的本地连接使用 `GET /api/keys/current` 查看当前密钥，使用 `PUT /api/keys/current` 提交 `{name, value}` 以添加或更换。该接口响应禁用缓存。修改请求校验 Origin，敏感接口禁用缓存。
+除健康、静态资源和本地登录/初始化入口外，业务接口要求管理员会话。管理员可使用 `GET /api/keys/current` 查看当前密钥，使用 `PUT /api/keys/current` 提交 `{name, value}` 添加或更换。修改请求校验 Origin，敏感接口禁用缓存。HTTP 的部署边界见[安全与数据保护](SECURITY.md)。
 
 ## 会话与账户
 
-| 方法和路径                             | 行为                                                                                                                          |
-| -------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `GET /api/session`                     | 读取管理员认证与初始化阶段                                                                                                    |
-| `POST /api/setup/session`              | 获取受限初始化许可；旧部署需验证原密码                                                                                        |
-| `POST /api/setup`                      | 提交 `{pin}` 完成初始化，不要求账户连接                                                                                       |
-| `POST /api/login` / `POST /api/logout` | PIN 解锁、撤销当前会话                                                                                                        |
-| `GET /api/account-sync`                | 账户资料和同步状态，无凭据                                                                                                    |
-| `PUT /api/account-sync`                | 导入 `{cookiesText, origin}`                                                                                                  |
-| `DELETE /api/account-sync`             | 断开并返回 `{status, draft}`；draft 为原 `{cookiesText, origin}` 或 null，供浏览器保存站点绑定草稿；要求 HTTPS/回环且禁止缓存 |
+| 方法和路径                             | 行为                                                                                                             |
+| -------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `GET /api/session`                     | 读取管理员认证与初始化阶段                                                                                       |
+| `POST /api/setup/session`              | 获取受限初始化许可；旧部署需验证原密码                                                                           |
+| `POST /api/setup`                      | 提交 `{pin}` 完成初始化，不要求账户连接                                                                          |
+| `POST /api/login` / `POST /api/logout` | PIN 解锁、撤销当前会话                                                                                           |
+| `GET /api/account-sync`                | 账户资料和同步状态，无凭据                                                                                       |
+| `PUT /api/account-sync`                | 导入 `{cookiesText, origin}`                                                                                     |
+| `DELETE /api/account-sync`             | 断开并返回 `{status, draft}`；draft 为原 `{cookiesText, origin}` 或 null，供浏览器保存站点绑定草稿。响应禁止缓存 |
 
 初始化许可只用于完成 PIN，不可访问账户、录像或设置。没有原站账号密码登录、验证码任务或直接清单导入接口；账户仅通过粘贴 Cookies 接入。实现见 [http/app.ts](../apps/server/src/http/app.ts)。
 
@@ -54,6 +54,10 @@
 `recording-bounds` 把拖动选区向外吸附到首尾相交完整单元。直播当前时刻、实际播放游标和已落盘末端分离；开放单元回放的 `openUnitId` 用于继续等待同一单元的新成员，不把之后无关录像自动纳入已选范围。
 
 覆盖桶在有媒体时附带 `mediaFromMs` / `mediaToMs`，表示桶内实际有画面的最早、最晚时间；空桶不带这两个字段。它们复用分钟覆盖索引与逻辑删除投影，供覆盖绘制和滑选即时反馈共用，不增加持久格式。桶内可能仍有碎片空隙，选区最终通过 `recording-bounds` 精确核验，不能用桶的首尾推断其内部全部连续。
+
+删除任务接纳时一次发布录像可见性的变更。后台分批整理与清除已经隐藏的分片只更新任务进度。删除影响当前区间时，工作台通过同一个 `recording-bounds` 接口重新吸附原区间。剩余录像继续在该区间内播放，空区间使播放器和截图区恢复初始状态。
+
+有收藏画面时，覆盖响应还包含 `favoriteSpans`。它根据已接纳的收藏和单元内仍可播放的分片生成。跨大范围时按显示桶限制数量。工作台和播放器优先用粉色绘制这部分覆盖，已读进度仍独立保存，取消收藏后恢复已读或未读颜色。
 
 悬浮预览使用 GET /api/subjects/:id/snapshot-point?at=<毫秒>，只返回一个单元或null；旧的全范围snapshots列表接口已移除。回放创建可带unitId，在相同PDT的多个单元中精确定位；显式单元不存在时拒绝，不退回猜测时间归属。普通录像覆盖读取不计算或返回 protectedSpans。只有未发布删除可见性版本的非喜欢删除任务，才通过工作台 protection 主播 ID 参数按需请求有界保护摘要；与 seenSpans 在同一读取快照返回，可复用按媒体版本与收藏版本区分的缓存。点击删除立即复用截图区已加载的收藏范围，无需等待该查询；任务发布版本或失败、结束后停止请求。服务端删除仍独立核验完整收藏关系，前端摘要不决定删除许可。不绘制独立喜欢标记，也不作为编辑边界。
 

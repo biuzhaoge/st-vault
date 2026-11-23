@@ -268,6 +268,7 @@ export interface PreviewsPort {
     unitId?: string,
   ): Promise<Uint8Array>;
   warmCovers?(subjectIds?: string[]): Promise<void>;
+  warmSubjectImages?(subjectIds: string[]): Promise<void>;
   observeCover?(subjectId: string, source: string | null): void;
   close(): Promise<void>;
 }

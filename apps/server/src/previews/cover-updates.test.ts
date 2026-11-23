@@ -52,6 +52,44 @@ it('accepts the actual offline preview host without accepting arbitrary origins'
   ).not.toBeNull();
   expect(accountAvatarSource('https://static-cdn.strpst.com.attacker.invalid/a')).toBeNull();
 });
+it('prefetches both roster images without a browser and keeps the default cover during live updates', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'stv-roster-images-'));
+  const f = fixture();
+  const id = 'stripchat:42';
+  const avatar = 'https://static-cdn.strpst.com/avatars/first';
+  const nextAvatar = 'https://static-cdn.strpst.com/avatars/updated';
+  const original = 'https://static-cdn.strpst.com/previews/fixture-first-thumb-big';
+  const updated = 'https://static-cdn.strpst.com/previews/updated-thumb-big';
+  const live = 'https://img.doppiocdn.net/snapshot/42/123';
+  const liveImage = Buffer.from([255, 216, 255, 224, 255, 217]);
+  const downloads = () => f.fetch.mock.calls.map(([url]) => addressOf(url));
+  await f.archive.setSetting(`preview.avatar-source.${id}`, avatar);
+  f.fetch.mockImplementation((url) =>
+    Promise.resolve(new Response(addressOf(url) === live ? liveImage : image)),
+  );
+  const previews = createPreviews({ ...f, cacheRoot: root, mediaRoot: root, decoder: vi.fn() });
+  try {
+    previews.observeCover?.(id, live);
+    await previews.warmSubjectImages!([id]);
+    await previews.warmCovers?.([id]);
+    expect(downloads()).toEqual(expect.arrayContaining([avatar, original, live]));
+    expect(await previews.avatar!(id)).toEqual(image);
+    expect([...(await previews.cover(id, undefined, true))]).toEqual([...liveImage]);
+    await previews.warmSubjectImages!([id]);
+    expect(downloads()).toHaveLength(3);
+    f.source(updated);
+    await f.archive.setSetting(`preview.avatar-source.${id}`, nextAvatar);
+    await previews.warmSubjectImages!([id]);
+    expect(downloads().slice(3).sort()).toEqual([nextAvatar, updated].sort());
+    previews.observeCover?.(id, null);
+    await previews.warmCovers?.([id]);
+    expect([...(await previews.cover(id, undefined, true))]).toEqual([...image]);
+    expect(downloads()).toHaveLength(5);
+  } finally {
+    await previews.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
 it('recovers a failed static CDN through the image mirror and skips the cached version on the next sync', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'stv-cover-mirror-'));
   const f = fixture();

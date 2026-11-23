@@ -106,12 +106,14 @@ it('creates a PIN with two accessible inputs and preserves leading zeroes', () =
   expect(html.match(/class="pin-cell/g)).toHaveLength(12);
   expect(html).not.toContain('>0<');
 });
-it('blocks transmitting both migration passwords and PINs over insecure remote HTTP', () => {
-  vi.stubGlobal('window', { location: { href: 'http://public.example/' } });
+it.each(['nas.test', '192.0.2.3'])('enables the local login form at http://%s', (host) => {
+  vi.stubGlobal('window', { location: { href: `http://${host}/` } });
   for (const credential of ['password', 'pin'] as const) {
     const html = render({ authenticated: false, setupRequired: false, credential });
-    expect(html).toContain('发送登录凭据必须使用 HTTPS');
-    expect(html).toContain('disabled=""');
+    const field = /<input[^>]*name="(?:password|pin)"[^>]*>/.exec(html)?.[0];
+    expect(field).toBeDefined();
+    expect(field).not.toContain('disabled=""');
+    expect(html).not.toContain('发送登录凭据必须使用 HTTPS');
   }
 });
 it('allows PIN entry on private LAN HTTP', () => {

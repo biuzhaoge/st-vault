@@ -1,4 +1,5 @@
 export interface RowAnchor {
+  subjectId: string;
   y: number;
   offscreen: 'above' | 'below' | 'filtered' | null;
 }
@@ -13,7 +14,12 @@ export class RowAnchorStore {
     return () => this.listeners.delete(listener);
   };
   readonly set = (value: RowAnchor | null): void => {
-    if (this.value?.y === value?.y && this.value?.offscreen === value?.offscreen) return;
+    if (
+      this.value?.subjectId === value?.subjectId &&
+      this.value?.y === value?.y &&
+      this.value?.offscreen === value?.offscreen
+    )
+      return;
     this.value = value;
     for (const listener of this.listeners) listener();
   };

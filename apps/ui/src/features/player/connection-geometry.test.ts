@@ -21,3 +21,13 @@ it('routes stacked views around the outer edge instead of through the video', ()
   expect(value.bendX).toBe(362);
   expect(value.endY).toBe(130);
 });
+it('extends the rail to the recording button on the cover', () => {
+  const value = connectionGeometry(
+    { left: 430, top: 60, width: 28, height: 830 },
+    { right: 418, top: 72, height: 0 },
+    180,
+    465,
+  );
+  expect(value.endX).toBe(35);
+  expect(value.route).toBe('M -12 12 H 14 V 120 H 35');
+});

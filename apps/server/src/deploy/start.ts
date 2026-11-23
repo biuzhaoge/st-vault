@@ -2,7 +2,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawn } from 'node:child_process';
 import { mkdir, lstat, chown } from 'node:fs/promises';
-import { installRuntimeLogs } from '../runtime/runtime-logs.js';
+import { closeRuntimeLogs, installRuntimeLogs } from '../runtime/runtime-logs.js';
 import { dropRuntimePrivileges, initializeState, validateRuntimeUser } from './init.js';
 import { EmbeddedPostgres } from '../database/embedded.js';
 import { migrateDeployment } from '../database/migrate-deployment.js';
@@ -94,5 +94,9 @@ try {
   process.off('SIGTERM', interrupt);
   process.off('SIGINT', interrupt);
   clearTimeout(shutdownTimer);
-  if (database && !handedOff) await database.close();
+  try {
+    if (database && !handedOff) await database.close();
+  } finally {
+    await closeRuntimeLogs();
+  }
 }

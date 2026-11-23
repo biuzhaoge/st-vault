@@ -1,25 +1,23 @@
-.status-line {
+.status-line,
+.recording-line,
+.track-loading,
+:is(.track-lane, .focus-lane)::before,
+:is(.track-lane, .focus-lane)::after {
   position: absolute;
-  left: 0;
-  right: 0;
-  top: 0;
-  height: calc(100% / 6);
+  inset-inline: 0;
   overflow: hidden;
   border-radius: var(--radius-small);
-  background: #24262a;
+}
+.status-line,
+:is(.track-lane, .focus-lane)::before {
+  top: 0;
+  height: calc(100% * var(--status-rail-share));
 }
 .recording-line,
-.track-loading {
-  position: absolute;
-  left: 0;
-  right: 0;
-  top: calc(100% / 6 + 4px);
-  bottom: 4px;
-  overflow: hidden;
-  border-radius: var(--radius-small);
-}
-.recording-line {
-  background: #1e2023;
+.track-loading,
+:is(.track-lane, .focus-lane)::after {
+  top: calc(100% * var(--status-rail-share) + var(--timeline-rail-gap));
+  bottom: var(--timeline-rail-gap);
 }
 .track-loading {
   display: none;
@@ -52,10 +50,7 @@
   display: none;
   transition: none;
 }
-.track-table-scroll[data-scrolling='false']
-  .track-row
-  .track-lane[data-track-state='ready']
-  .timeline-content {
+.track-row .track-lane[data-track-state='ready'] .timeline-content {
   animation: track-data-reveal var(--motion-fast) var(--motion-ease) var(--track-reveal-delay, 0ms)
     backwards;
 }

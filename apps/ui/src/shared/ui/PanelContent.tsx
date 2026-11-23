@@ -41,12 +41,12 @@ export function PanelIdentity({
   icon,
   label,
   value,
-  status,
+  accessory,
 }: {
   icon: ReactNode;
   label: ReactNode;
   value: ReactNode;
-  status?: ReactNode;
+  accessory?: ReactNode;
 }): JSX.Element {
   return (
     <div className="panel-identity">
@@ -54,10 +54,10 @@ export function PanelIdentity({
         {icon}
       </span>
       <div className="panel-identity-content">
-        <span>{label}</span>
+        <span className="panel-identity-label">{label}</span>
         <strong>{value}</strong>
       </div>
-      {status}
+      {accessory}
     </div>
   );
 }
@@ -103,7 +103,7 @@ export function PanelStatus({
   rowId,
   live = true,
 }: {
-  label: string;
+  label: ReactNode;
   value: ReactNode;
   kind: 'ok' | 'checking' | 'error' | 'neutral' | 'warning' | 'busy';
   accessory?: ReactNode;

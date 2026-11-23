@@ -24,8 +24,9 @@ try {
   await page.goto('http://127.0.0.1:10085');
   for (const [width, height] of [
     [390, 844],
+    [844, 390],
     [1024, 599],
-    [1024, 1440],
+    [768, 1024],
     [1800, 600],
   ]) {
     await page.setViewportSize({ width, height });
@@ -35,17 +36,16 @@ try {
       'none',
     );
   }
-  await page.setViewportSize({ width: 768, height: 1024 });
-  await page.getByLabel('6 位 PIN', { exact: true }).waitFor();
   await page.setViewportSize({ width: 1280, height: 720 });
   await page.getByLabel('6 位 PIN', { exact: true }).fill('012345');
   await page.locator('.track-row').first().waitFor();
+  const syntheticName = 'synthetic-layout-fixture';
   const syntheticKey = '0123456789abcdef'.repeat(4);
   await page.route('**/api/keys/current', (route) =>
     route.fulfill({
       json: {
-        key: { name: 'synthetic-layout-fixture', value: syntheticKey },
-        status: 'pending',
+        key: { name: syntheticName, value: syntheticKey },
+        status: 'usable',
         checking: false,
         keyCount: 1,
       },
@@ -133,6 +133,7 @@ try {
       starting: tasksRunning ? 3 : 0,
       retrying: tasksRunning ? 2 : 0,
     };
+    data.disk = { freeBytes: 7 * 1024 ** 3, totalBytes: 10 * 1024 ** 3, lowSpace: false };
     await route.fulfill({ response, json: data });
   });
   for (const language of ['zh-CN', 'en']) {
@@ -289,11 +290,142 @@ try {
         else menuChrome = chrome;
         if (name === 'account')
           await page.locator('.routing-item').filter({ hasText: 'primetime-cams.live' }).click();
-        if (name === 'keys') await page.getByText(syntheticKey, { exact: true }).waitFor();
+        if (name === 'keys') {
+          const identity = page.locator('.key-tools .panel-identity');
+          const value = identity.locator('code');
+          await value.waitFor();
+          assert.equal(await value.textContent(), syntheticKey);
+          assert.equal(
+            await identity.locator('.panel-identity-label').textContent(),
+            syntheticName,
+          );
+          const display = await value.evaluate((field) => {
+            const card = field.closest('.panel-identity');
+            const label = card.querySelector('.panel-identity-label');
+            const icon = card.querySelector('.panel-identity-icon svg');
+            const status = card.querySelector('.panel-badge');
+            const input = card.parentElement.querySelector('form input').getBoundingClientRect();
+            const button = card.parentElement.querySelector('form button').getBoundingClientRect();
+            const range = document.createRange();
+            range.selectNodeContents(field);
+            const lines = new Set([...range.getClientRects()].map((rect) => rect.top)).size;
+            const overflow = field.scrollWidth - field.clientWidth;
+            const valueBox = field.getBoundingClientRect();
+            const labelBox = label.getBoundingClientRect();
+            const statusBox = status.getBoundingClientRect();
+            const cardBox = card.getBoundingClientRect();
+            field.scrollLeft = field.scrollWidth;
+            const reachesEnd = Math.abs(field.scrollLeft - overflow) <= 1;
+            field.scrollLeft = 0;
+            return {
+              lines,
+              overflow,
+              reachesEnd,
+              focusable: field.tabIndex === 0,
+              icon: Boolean(icon),
+              stacked:
+                labelBox.bottom <= valueBox.top && Math.abs(labelBox.left - valueBox.left) <= 1,
+              centeredStatus:
+                Math.abs((statusBox.top + statusBox.bottom - cardBox.top - cardBox.bottom) / 2) <=
+                  1 &&
+                statusBox.left >= valueBox.right - 1 &&
+                statusBox.right <= cardBox.right,
+              hierarchy: getComputedStyle(label).color !== getComputedStyle(field).color,
+              formAligned:
+                Math.abs(input.top - button.top) <= 1 &&
+                Math.abs(input.height - button.height) <= 1,
+            };
+          });
+          assert.ok(
+            display.icon &&
+              display.stacked &&
+              display.centeredStatus &&
+              display.hierarchy &&
+              display.formAligned,
+            JSON.stringify(display),
+          );
+          assert.equal(display.lines, 1, `${language} key value stays on one line`);
+          assert.ok(
+            display.overflow > 0 && display.reachesEnd && display.focusable,
+            `${language} long key value remains readable by scrolling: ${JSON.stringify(display)}`,
+          );
+        }
         if (name === 'status') {
           const running = page.locator('[data-status-row="capture-status"].is-busy');
           await running.waitFor();
           assert.equal(await page.locator('.system-summary details').count(), 0);
+          const summary = page.locator('.system-summary');
+          assert.equal(
+            await summary.locator('.status-help-trigger').count(),
+            await summary.locator('.panel-status-row').count(),
+            'Every visible status row offers an explanation',
+          );
+          const help = running.locator('.status-help-trigger');
+          const tooltip = summary.locator('[role="tooltip"]:visible');
+          await help.hover();
+          await tooltip.waitFor();
+          const glyph = await help.evaluate((button) => {
+            const style = getComputedStyle(button);
+            const labelStyle = getComputedStyle(button.parentElement.parentElement);
+            return {
+              inline: button.getBoundingClientRect().width <= parseFloat(labelStyle.fontSize) + 1,
+              textColor: style.color === labelStyle.color,
+              background: style.backgroundColor,
+              border: style.borderTopWidth,
+            };
+          });
+          assert.deepEqual(glyph, {
+            inline: true,
+            textColor: true,
+            background: 'rgba(0, 0, 0, 0)',
+            border: '0px',
+          });
+          assert.equal(
+            await help.getAttribute('aria-describedby'),
+            await tooltip.getAttribute('id'),
+          );
+          assert.match(
+            await tooltip.textContent(),
+            language === 'en' ? /Sync interval/ : /统一同步间隔/,
+          );
+          await tooltip.hover();
+          await page.keyboard.press('Escape');
+          await tooltip.waitFor({ state: 'hidden' });
+          await page.locator('.toolbar-popover[data-state="open"]').waitFor();
+          await help.focus();
+          await tooltip.waitFor();
+          await page.keyboard.press('Escape');
+          await tooltip.waitFor({ state: 'hidden' });
+          await page.locator('.toolbar-popover[data-state="open"]').waitFor();
+          const tones = await page
+            .locator('.system-summary')
+            .evaluate((panel) =>
+              ['recording', 'capture-status', 'recording-reconnect', 'deletion'].map(
+                (id) =>
+                  getComputedStyle(panel.querySelector(`[data-status-row="${id}"] .panel-badge`))
+                    .color,
+              ),
+            );
+          assert.equal(new Set(tones).size, tones.length, 'Status tones are visibly distinct');
+          const capacity = page.locator(
+            '[data-status-row="disk-check"] .panel-badge [role="meter"]',
+          );
+          assert.equal(await capacity.getAttribute('aria-valuenow'), '30');
+          assert.equal(
+            await capacity.textContent(),
+            language === 'en' ? 'Free 7.0 GiB' : '剩余 7.0 GiB',
+          );
+          const bar = await capacity.evaluate((node) => ({
+            fill: getComputedStyle(node).backgroundImage,
+            track: getComputedStyle(node.parentElement).backgroundColor,
+            outline: getComputedStyle(node).outlineStyle,
+          }));
+          assert.match(
+            bar.fill,
+            /^linear-gradient\(90deg,.* 30%, (?:transparent|rgba\(0, 0, 0, 0\)) 30%\)$/,
+          );
+          assert.equal(bar.track, 'rgba(0, 0, 0, 0)');
+          assert.equal(bar.outline, 'solid');
           const rows = () =>
             page.locator('.system-row:visible').evaluateAll((nodes) =>
               nodes.map((node) => {
@@ -385,7 +517,7 @@ try {
             if (body.scrollHeight <= body.clientHeight + 1 && body.clientHeight > occupied + 2)
               issues.push(`panel reserves unused vertical space ${body.clientHeight}/${occupied}`);
             for (const node of panel.querySelectorAll(
-              '.routing-toolbar button, .panel-inline-form button, .panel-content label > span, .panel-section h3, .language-toggle > span, .panel-row-label, .panel-row-value > span:not(.operation-spinner), .panel-badge, .panel-identity-content > strong',
+              '.routing-toolbar button, .panel-inline-form button, .panel-content label > span, .panel-section h3, .language-toggle > span, .panel-row-label, .panel-row-value > span:not(.operation-spinner), .panel-badge, .panel-identity-content > strong:not(:has(> code))',
             )) {
               const style = getComputedStyle(node),
                 bounds = node.getBoundingClientRect();
@@ -470,10 +602,9 @@ try {
         await page.locator('.toolbar-popover').waitFor({ state: 'detached' });
       }
       assert(
-        menuWidths.keys < menuWidths.status &&
-          Object.entries(menuWidths).every(
-            ([name, size]) => name === 'account' || size < menuWidths.account,
-          ),
+        ['settings', 'status', 'history', 'cdn', 'keys'].every(
+          (name) => menuWidths[name] < menuWidths.account,
+        ),
         `Panels size to their contents at ${width}px in ${language}: ${JSON.stringify(menuWidths)}`,
       );
       const noticeIssue = await page.evaluate(

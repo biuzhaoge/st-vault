@@ -6,7 +6,7 @@ ST-Vault supports one administrator across multiple clients. A React/Vite workbe
 
 ## Data flow and module boundaries
 
-Storage, HLS alignment and media directory dates remain UTC. The server validates deployment `TZ` and exposes it through the session API, giving every client the same display timezone independently of language. Calendar navigation uses local midnight/noon slots (`@date-fns/tz` handles DST); media duration remains actual UTC elapsed time. A natural day is not necessarily 24 hours.
+Storage, HLS alignment and media directory dates remain UTC. The server validates deployment `TZ` and exposes it through the session API, giving every client the same display timezone independently of language. The timeline extends to the end of the current local day. Navigation uses local midnight and noon slots, with `@date-fns/tz` handling DST. Media duration uses actual UTC elapsed time.
 
 ```text
 Site cookies → Account information / complete following list
@@ -55,11 +55,15 @@ After scrolling settles, a span changes, the view pages sideways, or the filter 
 
 The browser cover cache keeps image bytes. Each mounted image creates its own display URL and releases it on unmount, so a returning row can still display the cached bytes.
 
-Each coverage row uses one SVG with at most 15 density paths, preserving gaps and subpixel markers. Wide views favor whole-minute buckets aggregated in PostgreSQL. Fully covered minutes use their minute boundaries, and partial minutes use the original endpoints. Empty coverage returns an empty seen projection. Pending deletions read visible media precisely. Rendering aggregation preserves the original data used by screenshots, selection snapping, favorites, and deletion.
+After account connection commits the roster, background workers immediately queue avatars and default covers for all followed broadcasters. Scheduled roster refreshes check for new broadcasters and changed image URLs. An unchanged source with a valid local file reuses that file. Default covers are cached separately from live previews and can be shown when a broadcast ends. Failed downloads retain existing images and retry on the shared business clock.
+
+The broadcaster list and screenshot area use the same stationary neutral glass rails. Loading and horizontal paging animate the data layer. Status and recording colors follow their respective time intervals, and gaps in recordings show the base rail. Each coverage color uses one SVG with at most 15 density paths, preserving gaps and subpixel markers. Wide views favor whole-minute buckets aggregated in PostgreSQL. Fully covered minutes use their minute boundaries, and partial minutes use the original endpoints. Empty coverage returns an empty seen projection. Pending deletions read visible media precisely. Rendering aggregation preserves the original data used by screenshots, selection snapping, favorites, and deletion.
 
 Sorting, filtering and membership changes share viewport-only transitions. Final ordering and the browsing anchor are committed first; Web Animations then translates visible rows. Distant destinations stop at the viewport edge. Exit DOM is capped at about one screen for 360ms, without mounting distant rows or loading their images; neighbors fill the gaps. Interrupted updates continue from current visual positions, while scrolling, selection gestures and view changes take priority. Covers and timelines move together, with the selection and player connection following. Timing and easing reuse existing motion tokens; no animation dependency is added.
 
-The account avatar and username stack above the covers. Filters and navigation share one row and the same control styling. The viewport slider keeps its pill shape during dragging, and both ends of its track stay visible. Each date is centered on the ruler itself. Nearby hour numbers yield to date labels while division lines stay at their original times. The cover column derives its width from the shared row height and the 16:9 aspect ratio. The ruler aligns with the start of each timeline. Virtual scrolling, the selection and the player connection use the same row height.
+The account avatar and username stack above the covers. Filters and navigation share one row and the same control styling. The viewport slider keeps its pill shape during dragging, and both ends of its track stay visible. Each date is centered on the ruler itself. Nearby hour numbers yield to date labels while division lines stay at their original times. The cover column derives its width from the shared row height and the 16:9 aspect ratio. The ruler aligns with the start of each timeline. The player cable ends at the recording button in the cover's top-left corner, at the cover edge for archived broadcasters, or at the list edge when the row scrolls out of view.
+
+The workbench appears in landscape viewports that meet the size requirements. The top controls share one responsive height. The player and screenshots fit their own containers, and the ruler and row tracks share the actual available width. Touch expands the recording and favorite hit areas while keeping their visual size tied to their container. The browser handles vertical scrolling in the list, horizontal drags select a timeline range, and vertical screenshot swipes use the same paging state and motion as other inputs. Menus position against the visual viewport so they can fit above a software keyboard.
 
 The account, key, CDN, settings, status and history panels share a header, spacing, form controls and status styles. Each panel uses a width suited to its contents and keeps that width across languages. Its height follows the content, and one region handles vertical scrolling when needed.
 
@@ -105,20 +109,20 @@ The [recording rotation](../apps/server/src/capture/rotation.ts) chooses the nex
 
 ## Storage and recovery
 
-`data` contains deployment-private configuration and PostgreSQL hot indexes; `media` is the portable library. Separate SSD/HDD mounts are supported. Database storage must be local, and only one instance may write a library.
+`data` contains deployment credentials, logs, and the PostgreSQL cluster. PostgreSQL stores hot indexes and private settings. `media` is the portable library. The database directory uses a local filesystem. Only one instance may write a media library.
 
 ```text
 data/
-  postgres/18/                    PostgreSQL cluster
   private/                        Configuration master key and database credentials
   logs/                           Rotated logs
   backups/                        Frozen copies when upgrading legacy databases
+  postgres/18/                    PostgreSQL cluster
 media/
   library.json                    Library identity and checkpoint references
   catalog/                        Current and previous NDJSON checkpoints
   postgres-journal/               Ordered commit logs
   subjects/stripchat-<ID>/
-    images/                       Cover and avatar
+    images/                       Default cover, current cover and avatar
     recordings/YYYY-MM-DD/HH/     Original fragments, bucketed by UTC date/hour
     recordings/unlocated/         Media without reliable wall-clock location
     recordings/.staging/          Unpublished writes

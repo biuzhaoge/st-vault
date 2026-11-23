@@ -10,7 +10,7 @@ import { createPreviewImageReader, missingImageResponse, previewImageType } from
 import type { BackgroundTask } from '@st-vault/api-schema';
 import { DerivativeDiagnostics } from './derivative-diagnostics.js';
 
-/** Requested portraits share the process heartbeat; reads never start upstream work. */
+/** Roster imports wake the portrait workers; browser reads only request a heartbeat check. */
 export function createSubjectAvatars(options: {
   root: string;
   mediaRoot?: string;
@@ -35,6 +35,7 @@ export function createSubjectAvatars(options: {
     ? new LibraryImages(options.mediaRoot, 'avatar', options.publishConcurrency)
     : new PreviewDiskCache(path.join(options.root, 'avatars'), 64 * 1024 ** 2, 2048);
   const pending = new Set<string>();
+  const roster = new Set<string>();
   const failures = new Map<string, { attempts: number; retryAt: number; missing: boolean }>();
   const diagnostics = new DerivativeDiagnostics();
   const controller = new AbortController();
@@ -52,19 +53,22 @@ export function createSubjectAvatars(options: {
   const refresh = (manual = true): Promise<void> => {
     if (work) return work;
     if (controller.signal.aborted) return Promise.resolve();
-    const now = Date.now();
-    const ids = [...pending].filter((id) => {
-      const failure = failures.get(id);
-      return !failure || failure.retryAt <= now || (manual && !failure.missing);
-    });
+    const batch = (retryNow = false) => {
+      const now = Date.now();
+      return [...new Set([...roster, ...pending, ...failures.keys()])].filter((id) => {
+        const failure = failures.get(id);
+        return !failure || failure.retryAt <= now || (retryNow && !failure.missing);
+      });
+    };
+    let ids = batch(manual);
     if (!ids.length) return Promise.resolve();
-    let index = 0;
-    const run = async () => {
+    const process = async (ids: string[]) => {
       lastRunAtMs = Date.now();
       const subjects = new Map(
         (await options.archive.listSubjects({ activity: false })).map((row) => [row.id, row]),
       );
       failed = false;
+      let index = 0;
       const worker = async () => {
         while (!controller.signal.aborted) {
           const id = ids[index++];
@@ -123,7 +127,6 @@ export function createSubjectAvatars(options: {
                 retryAt: Date.now() + Math.min(300000, 5000 * 2 ** (attempts - 1)),
                 missing: missingImageResponse(error),
               });
-              pending.add(id);
               if (!missingImageResponse(error))
                 diagnostics.record(
                   'avatar_refresh_failed',
@@ -137,6 +140,15 @@ export function createSubjectAvatars(options: {
       };
       await Promise.all(Array.from({ length: options.concurrency ?? 2 }, () => worker()));
       if (!hasFailed() && !controller.signal.aborted) lastSuccessAtMs = Date.now();
+    };
+    const run = async () => {
+      while (ids.length && !controller.signal.aborted) {
+        for (const id of ids) roster.delete(id);
+        await process(ids);
+        if (!roster.size) return;
+        const remaining = new Set(roster);
+        ids = batch().filter((id) => remaining.has(id));
+      }
     };
     work = (options.archive.withBackgroundReads?.(run) ?? run())
       .catch((error: unknown) => {
@@ -161,10 +173,10 @@ export function createSubjectAvatars(options: {
           ? 'running'
           : failed || outstanding.length
             ? 'retrying'
-            : pending.size
+            : roster.size || pending.size
               ? 'waiting'
               : 'idle',
-        pending: pending.size,
+        pending: new Set([...roster, ...pending, ...failures.keys()]).size,
         failed: outstanding.length + Number(failed),
         lastRunAtMs,
         lastSuccessAtMs,
@@ -180,10 +192,14 @@ export function createSubjectAvatars(options: {
       if (pending.size > 2048) {
         const oldest = pending.values().next().value!;
         pending.delete(oldest);
-        failures.delete(oldest);
       }
       const bytes = await disk.get(`avatar:${id}`);
       return bytes && previewImageType(bytes) ? bytes : null;
+    },
+    warm: (ids: readonly string[]): Promise<void> => {
+      if (controller.signal.aborted) return Promise.resolve();
+      for (const id of ids) roster.add(id);
+      return work ? work.then(() => refresh(false)) : refresh(false);
     },
     refresh,
     close: async () => {
@@ -194,6 +210,7 @@ export function createSubjectAvatars(options: {
         await work;
       } finally {
         pending.clear();
+        roster.clear();
         failures.clear();
         diagnostics.close();
         await disk.close();

@@ -128,6 +128,61 @@ export class PersonalStore {
     }
     return { seenSpans, unreadSpans };
   }
+  async favoriteCoverage(
+    subjectId: string,
+    from: number,
+    to: number,
+    buckets: number,
+  ): Promise<MediaTimeRange[]> {
+    // Start with favorite candidates. The effective fact also accounts for
+    // accepted unlikes whose removal has not reached the physical table.
+    return this.db
+      .prepare(
+        `WITH candidates AS (
+          SELECT f.unit FROM unit_favorites f JOIN recording_units u ON u.id=f.unit
+          WHERE u.subject=? AND u.start>? AND u.start<? AND u."end">? AND u.deleted=0
+          UNION
+          SELECT x.unit FROM favorite_commands c JOIN selection_units x ON x.selection=c.selection
+          JOIN recording_units u ON u.id=x.unit
+          WHERE c.subject=? AND c.state='pending' AND c.liked=1
+          AND u.start>? AND u.start<? AND u."end">? AND u.deleted=0
+        ), liked AS MATERIALIZED (
+          SELECT unit FROM candidates c WHERE
+          (SELECT 1 FROM unit_favorite_facts f WHERE f.unit=c.unit LIMIT 1) IS NOT NULL
+        ), merged AS (
+          SELECT unnest(range_agg(numrange(GREATEST(s.start,?::float8)::numeric,
+            LEAST(s."end",?::float8)::numeric,'[)'))) AS span
+          FROM liked l JOIN unit_segments m ON m.unit=l.unit
+          JOIN visible_segments s ON s.id=m.segment
+          WHERE s.deleted=0 AND s.start<? AND s."end">? AND s."end">s.start
+        ), ranked AS (
+          SELECT span,row_number() OVER(ORDER BY span) AS ordinal,count(*) OVER() AS total FROM merged
+        )
+        SELECT MIN(lower(span))::float8 AS "fromMs",MAX(upper(span))::float8 AS "toMs"
+        FROM ranked
+        GROUP BY CASE WHEN total<=?::integer THEN ordinal
+          ELSE FLOOR((lower(span)-?::numeric)*?::integer/?::numeric) END
+        ORDER BY "fromMs"`,
+      )
+      .all<MediaTimeRange>(
+        subjectId,
+        Math.max(-1, from - 86400000),
+        to,
+        from,
+        subjectId,
+        Math.max(-1, from - 86400000),
+        to,
+        from,
+        from,
+        to,
+        to,
+        from,
+        buckets,
+        from,
+        buckets,
+        to - from,
+      );
+  }
   async read(subjectId: string, fromMs: number, toMs: number): Promise<PersonalTimeline> {
     // effective_unit_favorites already applies canonical unit visibility. The
     // base-table join only supplies metadata; rejoining the view repeats its probes.

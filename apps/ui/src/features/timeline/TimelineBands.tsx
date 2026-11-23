@@ -3,12 +3,7 @@ import type { PublicStatus } from '@st-vault/api-schema';
 import { statusBands } from './status-bands';
 import type { TrackData } from './track-data';
 export type { TrackData } from './track-data';
-import {
-  coverageBands,
-  coverageGeometry,
-  coverageSurface,
-  splitSeenCoverage,
-} from './coverage-bands';
+import { coverageBands, coverageGeometry, coverageSurface, coverageTones } from './coverage-bands';
 import { formatDateTime } from './timeline';
 import './timeline.css';
 import { memo, useId, useMemo, useRef, type ReactNode, type Ref } from 'react';
@@ -110,13 +105,24 @@ export const TimelineBands = memo(function TimelineBands({
     });
   const surfaces = useMemo(
     () =>
-      splitSeenCoverage(clips, data?.coverage.seenSpans ?? [], data?.coverage.unreadSpans).map(
-        ({ seen, bands }) => ({
-          seen,
-          surface: coverageSurface(bands, fromMs, toMs, widthPx || 600),
-        }),
-      ),
-    [clips, fromMs, toMs, widthPx, data?.coverage.seenSpans, data?.coverage.unreadSpans],
+      coverageTones(
+        clips,
+        data?.coverage.seenSpans ?? [],
+        data?.coverage.unreadSpans,
+        data?.coverage.favoriteSpans,
+      ).map(({ tone, bands }) => ({
+        tone,
+        surface: coverageSurface(bands, fromMs, toMs, widthPx || 600),
+      })),
+    [
+      clips,
+      fromMs,
+      toMs,
+      widthPx,
+      data?.coverage.seenSpans,
+      data?.coverage.unreadSpans,
+      data?.coverage.favoriteSpans,
+    ],
   );
   // Geometry owns motion: a new response/revision with identical pixels must not
   // cancel and recapture every coverage element during a background refresh.
@@ -127,11 +133,12 @@ export const TimelineBands = memo(function TimelineBands({
     clips.map(({ fromMs, toMs, level }) => [fromMs, toMs, level]),
     bands?.map(({ fromMs, toMs, status }) => [fromMs, toMs, status]),
   ]);
-  // A red or white surface can represent a different set of UTC intervals after
-  // evidence changes. Reset its placement instead of moving old colors in time.
+  // A color can represent different UTC intervals after its classification changes.
+  // Reset its placement instead of moving old colors in time.
   const colorScope = JSON.stringify({
     unread: data?.coverage.unreadSpans,
     seen: data?.coverage.seenSpans,
+    favorites: data?.coverage.favoriteSpans,
   });
   useLayoutMotion(
     root,
@@ -161,24 +168,27 @@ export const TimelineBands = memo(function TimelineBands({
         />
       ))}
       recording={surfaces.map(
-        ({ seen, surface }) =>
+        ({ tone, surface }) =>
           surface && (
             <svg
-              key={String(seen)}
+              key={tone}
               className="track-clip"
-              data-seen={seen}
-              data-motion-key={`coverage:${seen}`}
+              data-seen={tone === 'favorite' ? undefined : tone === 'seen'}
+              data-favorite={tone === 'favorite' ? true : undefined}
+              data-motion-key={`coverage:${tone}`}
               viewBox="0 0 1000 100"
               preserveAspectRatio="none"
               role="img"
-              aria-label={tr('{{v0}} · 录像 {{v1}} 秒', {
-                v0: formatDateTime(surface.extent.fromMs),
-                v1: Math.round(surface.extent.coveredMs) / 1000,
-              })}
+              aria-label={
+                tr('{{v0}} · 录像 {{v1}} 秒', {
+                  v0: formatDateTime(surface.extent.fromMs),
+                  v1: Math.round(surface.extent.coveredMs) / 1000,
+                }) + (tone === 'favorite' ? ` · ${tr('喜欢')}` : '')
+              }
               style={coverageGeometry(surface.extent, fromMs, toMs)}
             >
               <defs>
-                <linearGradient id={`${sheenId}:${seen}`} x1="0" y1="0" x2="0" y2="1">
+                <linearGradient id={`${sheenId}:${tone}`} x1="0" y1="0" x2="0" y2="1">
                   <stop offset="0" className="coverage-edge" />
                   <stop offset=".12" className="coverage-light" />
                   <stop offset=".42" className="coverage-base" />
@@ -191,7 +201,7 @@ export const TimelineBands = memo(function TimelineBands({
                 <path
                   key={level}
                   d={d}
-                  fill={`url(#${sheenId}:${seen})`}
+                  fill={`url(#${sheenId}:${tone})`}
                   opacity={0.35 + (0.65 * level) / 15}
                 />
               ))}

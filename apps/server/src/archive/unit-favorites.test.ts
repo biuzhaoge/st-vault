@@ -71,6 +71,8 @@ async function fixture(count: number) {
     db,
     personal,
     units,
+    // The archive worker commits each rebuilt batch together with its checkpoint.
+    buildUnits: (index: RecordingUnits, limit?: number) => db.transaction(() => index.build(limit)),
     favorite,
     ids: Array.from({ length: count }, (_, index) => `unit-${index}`),
   };
@@ -106,6 +108,32 @@ it('rolls back unit protection if revision persistence fails', async () => {
 
     expect((await personal.readUnits('stripchat:1', ids)).favorites).toHaveLength(2);
     expect(await personal.revision()).toBe(1);
+  } finally {
+    await db.close();
+  }
+});
+it('projects only the visible fragments of favorites, including accepted commands', async () => {
+  const { db, personal, favorite, ids } = await fixture(2);
+  try {
+    const subject = 'stripchat:1';
+    await db.exec(`
+      UPDATE recording_units SET "end"=62000 WHERE id='unit-0';
+      INSERT INTO segments(id,subject,start,"end",deleted,created_revision) VALUES
+        ('second-part','stripchat:1',4000,6000,0,3),
+        ('removed-part','stripchat:1',8000,10000,1,4);
+      INSERT INTO unit_segments VALUES ('second-part','unit-0'),('removed-part','unit-0');
+    `);
+    await favorite(subject, [ids[0]], true, 0);
+    expect(await personal.favoriteCoverage(subject, 1000, 63000, 120)).toEqual([
+      { fromMs: 1000, toMs: 2000 },
+      { fromMs: 4000, toMs: 6000 },
+    ]);
+    await personal.markSeen(subject, [{ unitId: ids[0], toMs: 6000 }]);
+    expect(await personal.favoriteCoverage(subject, 0, 63000, 1)).toEqual([
+      { fromMs: 0, toMs: 6000 },
+    ]);
+    await favorite(subject, [ids[0]], false, 1);
+    expect(await personal.favoriteCoverage(subject, 0, 63000, 120)).toEqual([]);
   } finally {
     await db.close();
   }
@@ -153,18 +181,18 @@ it('rejects protection for an unknown recording unit without leaving partial fav
   }
 });
 it('checkpoints historical membership in bounded batches and resumes without regrouping completed units', async () => {
-  const { db, units } = await fixture(385);
+  const { db, units, buildUnits } = await fixture(385);
   try {
     await db.exec(
       "DELETE FROM unit_segments;DELETE FROM recording_units;UPDATE unit_index SET revision=-1,segment='',ready=0",
     );
-    expect(await units.build()).toBe(true);
+    expect(await buildUnits(units)).toBe(true);
     expect((await db.prepare('SELECT count(*) n FROM unit_segments').get())!.n).toBe(128);
     const resumed = new RecordingUnits(db);
     await resumed.initialize();
-    expect(await resumed.build()).toBe(true);
-    expect(await resumed.build()).toBe(true);
-    expect(await resumed.build()).toBe(false);
+    expect(await buildUnits(resumed)).toBe(true);
+    expect(await buildUnits(resumed)).toBe(true);
+    expect(await buildUnits(resumed)).toBe(false);
     expect(await resumed.ready()).toBe(true);
     expect((await db.prepare('SELECT count(*) n FROM unit_segments').get())!.n).toBe(385);
     expect(
@@ -334,15 +362,15 @@ it('resolves a week of large history with two indexed limit-one queries', async 
   }
 });
 it('admits a smaller index batch while preserving the durable source checkpoint', async () => {
-  const { db, units } = await fixture(257);
+  const { db, units, buildUnits } = await fixture(257);
   try {
     await db.exec(
       "DELETE FROM unit_segments;DELETE FROM recording_units;UPDATE unit_index SET revision=-1,segment='',ready=0",
     );
-    expect(await units.build(32)).toBe(true);
+    expect(await buildUnits(units, 32)).toBe(true);
     expect((await db.prepare('SELECT count(*) n FROM unit_segments').get())!.n).toBe(32);
     expect(await db.prepare('SELECT revision FROM unit_index').get()).toEqual({ revision: 32 });
-    while (await units.build(32)) {
+    while (await buildUnits(units, 32)) {
       /* Smaller batches yield between durable checkpoints. */
     }
     expect((await db.prepare('SELECT count(*) n FROM unit_segments').get())!.n).toBe(257);

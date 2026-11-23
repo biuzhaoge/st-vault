@@ -292,6 +292,12 @@ describe('persistent account synchronization', () => {
       expect(service.status().running).toBe(false);
       expect(service.status()).toMatchObject({ connected: true, warmingCovers: true });
       expect((await work).status.running).toBe(false);
+      f.provider.importList.mockResolvedValueOnce([
+        { id: 'stripchat:42', providerId: 42, handle: 'Synthetic' },
+        { id: 'stripchat:84', providerId: 84, handle: 'New' },
+      ]);
+      await service.refresh();
+      expect(onImported).toHaveBeenNthCalledWith(2, ['stripchat:42', 'stripchat:84']);
       complete();
       expect((await work).status.running).toBe(false);
     } finally {

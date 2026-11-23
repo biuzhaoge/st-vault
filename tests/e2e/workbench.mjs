@@ -123,30 +123,6 @@ try {
       from: Number(element.dataset.from),
       to: Number(element.dataset.to),
     }));
-  const revealInterval = async (range) => {
-    const domain = await view();
-    await page.locator('.track-table-scroll').evaluate(
-      (node, fraction) => {
-        const plot = node.querySelector('.track-lane'),
-          label = node.querySelector('.track-label');
-        node.scrollLeft =
-          fraction * plot.getBoundingClientRect().width -
-          (node.clientWidth - label.getBoundingClientRect().width) / 2;
-        node.dispatchEvent(new Event('scroll'));
-      },
-      ((range.fromMs + range.toMs) / 2 - domain.from) / (domain.to - domain.from),
-    );
-    await page.waitForFunction(
-      () =>
-        Math.abs(
-          parseFloat(
-            document
-              .querySelector('.track-header-viewport')
-              ?.style.getPropertyValue('--track-scroll-left') || '0',
-          ) - document.querySelector('.track-table-scroll')?.scrollLeft,
-        ) < 0.5,
-    );
-  };
   const active = () => page.locator('video[data-media-slot="active"]');
   const wakeSnapshots = async () => {
     if (await page.evaluate(() => !!document.fullscreenElement)) {
@@ -219,7 +195,7 @@ try {
           closeBox.left > titleBox.right,
       };
     });
-    assert.equal(result.titleSize, 16);
+    assert.equal(result.titleSize, 15);
     assert(
       result.sectionsBelowTitle &&
         result.fits &&
@@ -230,7 +206,7 @@ try {
   };
   const day = 86400000,
     dayStart = (at) => Math.floor((at + 8 * 3600000) / day) * day - 8 * 3600000;
-  const currentHalfDayEnd = (at) => dayStart(at) + (at - dayStart(at) < day / 2 ? day / 2 : day);
+  const currentDayEnd = (at) => dayStart(at) + day;
   await page.goto(origin);
   await page.locator('.auth-card').waitFor();
   assert.equal(await page.locator('.auth-card select, .auth-card .language-setting').count(), 0);
@@ -316,7 +292,7 @@ try {
     /点击主播/,
   );
   let current = await view();
-  assert.equal(current.from, currentHalfDayEnd(Date.now()) - day);
+  assert.equal(current.from, dayStart(Date.now()));
   assert.equal(current.to - current.from, day);
   const initial = current;
   await page.waitForTimeout(1100);
@@ -594,7 +570,7 @@ try {
       .locator('.history-event-line')
       .first()
       .evaluate((node) => getComputedStyle(node).columnGap),
-    '4px',
+    '6px',
   );
   await verifyPanel();
   await page.keyboard.press('Escape');
@@ -671,7 +647,13 @@ try {
               node.scrollTop > 24 * node.querySelector('.track-row').getBoundingClientRect().height,
           ),
       );
-    assert((await page.locator('.track-row').count()) < 16);
+    const allocation = await page.locator('.track-table-scroll').evaluate((node) => {
+      const mounted = node.querySelectorAll('.track-row');
+      const visible = Math.ceil(node.clientHeight / mounted[0].getBoundingClientRect().height);
+      const overscan = 7 + (node.dataset.scrolling === 'true' ? 4 : 0);
+      return { mounted: mounted.length, limit: visible + overscan };
+    });
+    assert(allocation.mounted <= allocation.limit, JSON.stringify(allocation));
     assert.equal(await page.locator('video').count(), 0);
     assert.equal(
       await page.getByRole('button', { name: '历史', exact: true }).getAttribute('aria-expanded'),
@@ -911,14 +893,14 @@ try {
     const green = getComputedStyle(probe).color;
     probe.remove();
     return {
-      labeled: label.textContent === '归档服务' && value.textContent === '可用',
-      quiet: getComputedStyle(value).color !== green,
+      labeled: label.innerText.trim() === '归档服务' && value.innerText.trim() === '可用',
+      colored: getComputedStyle(value).color === green,
       green: getComputedStyle(value, '::before').backgroundColor === green,
       aligned: value.getBoundingClientRect().left > label.getBoundingClientRect().left,
     };
   });
   assert(
-    healthStyle.labeled && healthStyle.quiet && healthStyle.green && healthStyle.aligned,
+    healthStyle.labeled && healthStyle.colored && healthStyle.green && healthStyle.aligned,
     JSON.stringify(healthStyle),
   );
   assert.equal(
@@ -962,7 +944,7 @@ try {
   report.checks.statusPanel = {
     independent: true,
     recordingCounters: true,
-    quietLabeledHealth: true,
+    labeledHealthWithStatusColor: true,
     healthRecovery: true,
   };
   await page.keyboard.press('Escape');
@@ -1458,7 +1440,7 @@ try {
   ) {
     assert(remaining > 0);
     await page.getByRole('button', { name: '后12小时', exact: true }).click();
-    assert((await view()).to <= currentHalfDayEnd(Date.now()));
+    assert((await view()).to <= currentDayEnd(Date.now()));
   }
   assert(await page.getByRole('button', { name: '后12小时', exact: true }).isDisabled());
   report.checks.futureNavigationBlocked = true;
@@ -1888,7 +1870,6 @@ try {
     );
     current = await view();
   }
-  await revealInterval({ fromMs: info.archiveStart, toMs: info.archiveEnd });
   const box = await lane().boundingBox(),
     x = (at) => box.x + ((at - current.from) / (current.to - current.from)) * box.width;
   // Start on the larger blank margin. Just after midnight the left margin is
@@ -2221,7 +2202,6 @@ try {
   // Exercise real unit pagination with 90 recording units, reusing a decoded JPEG.
   const historyWindow = await fixture.seedSnapshotHistory();
   if (historyWindow.fromMs < (await view()).from) await setDays(2);
-  await revealInterval(historyWindow);
   const historyView = await view(),
     historyBox = await lane().boundingBox();
   const historyX = (at) =>
@@ -2611,7 +2591,7 @@ try {
   assert.equal(mobile.viewport, mobile.width);
   report.checks.mobile = mobile;
   await page.screenshot({ path: path.join(outputRoot, 'mobile.png') });
-  await page.setViewportSize({ width: 768, height: 1024 });
+  await page.setViewportSize({ width: 1024, height: 768 });
   for (const [index, name] of ['账户', '密钥', '设置', '历史'].entries()) {
     if (name === '密钥') await wakeChrome();
     await page.getByRole('button', { name, exact: true }).click();
@@ -2625,7 +2605,7 @@ try {
     sharedHierarchy: true,
     delayedCookieFeedback: true,
     english: true,
-    tabletPortrait: true,
+    tabletLandscape: true,
     titleAndCloseAligned: true,
   };
   // Batch management uses only the synthetic archive. Destructive checks run last.
@@ -2664,7 +2644,7 @@ try {
     { width: 1280, height: 720 },
     { width: 1920, height: 1080 },
     { width: 1366, height: 768 },
-    { width: 768, height: 1024 },
+    { width: 1024, height: 768 },
   ]) {
     await page.setViewportSize(size);
     await page.waitForFunction(() => {
@@ -2790,7 +2770,7 @@ try {
     reducedTransparency: transparencySupported,
   };
   const touchContext = await browser.newContext({
-    viewport: { width: 768, height: 1024 },
+    viewport: { width: 1024, height: 768 },
     hasTouch: true,
     isMobile: true,
     storageState: await context.storageState(),
@@ -2817,7 +2797,7 @@ try {
         }),
       );
     assert(
-      touchTargets.every((box) => box.width >= 44 && box.height >= 44),
+      touchTargets.every((box) => box.width >= 24 && box.height >= 24),
       JSON.stringify(touchTargets),
     );
     await settingsButton.tap();
@@ -2826,7 +2806,7 @@ try {
       await Promise.all(node.getAnimations().map((animation) => animation.finished));
     });
     await touchPage.screenshot({ path: path.join(outputRoot, 'glass-touch.png') });
-    report.checks.glassTouch = { targets44px: true, touchOpen: true };
+    report.checks.glassTouch = { targetsAtLeast24px: true, touchOpen: true };
   } finally {
     await touchContext.close();
   }

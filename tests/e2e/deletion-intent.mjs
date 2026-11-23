@@ -81,6 +81,9 @@ try {
     return heart?.getAttribute('aria-pressed') === 'true' && !heart.disabled;
   });
   const favoriteId = await page.locator('.snapshot-cell').first().getAttribute('data-key');
+  const selected = await page
+    .locator('.viewer-focus')
+    .evaluate((lane) => [Number(lane.dataset.from), Number(lane.dataset.to)]);
   const remove = page
     .locator('.snapshot-actions')
     .getByRole('button', { name: '删除所有非喜欢', exact: true });
@@ -145,10 +148,26 @@ try {
       ? route.abort()
       : route.continue(),
   );
+  const reselections = [];
+  page.on('request', (request) => {
+    const url = new URL(request.url());
+    if (url.pathname.endsWith('/recording-bounds'))
+      reselections.push([Number(url.searchParams.get('from')), Number(url.searchParams.get('to'))]);
+  });
+  const snapped = page.waitForResponse(
+    (response) => new URL(response.url()).pathname.endsWith('/recording-bounds'),
+    { timeout: 8000 },
+  );
   await dialog.getByRole('button', { name: '确认删除', exact: true }).click();
   await dialog.waitFor({ state: 'hidden' });
   const receipt = await accepted;
   assert.equal(receipt.status(), 202);
+  const surviving = await (await snapped).json();
+  await page.waitForFunction(({ fromMs, toMs }) => {
+    const lane = document.querySelector('.viewer-focus');
+    return lane && Number(lane.dataset.from) === fromMs && Number(lane.dataset.to) === toMs;
+  }, surviving);
+  assert(surviving.toMs < selected[1]);
   assert(
     ['range', 'selection'].includes(receipt.request().postDataJSON().target.kind),
     'whole-range commands do not collapse to the visible page',
@@ -157,6 +176,7 @@ try {
     const cells = [...document.querySelectorAll('.snapshot-grid .snapshot-cell')];
     return cells.length === 1 && cells[0].dataset.key === id;
   }, favoriteId);
+  assert.deepEqual(reselections, [selected]);
   assert.deepEqual(errors, []);
   console.log(
     JSON.stringify({

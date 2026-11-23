@@ -3,12 +3,9 @@ services:
   app:
     image: biuzhaoge/st-vault:latest
     ports:
-      - '127.0.0.1:10002:10002'
+      - '10002:10002'
     volumes:
       - ./data:/data
       - ./media:/media
-    mem_limit: 2g
-    init: true
     restart: unless-stopped
     stop_grace_period: 180s
-    logging: { driver: local }

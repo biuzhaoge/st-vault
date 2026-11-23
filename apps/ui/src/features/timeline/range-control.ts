@@ -40,11 +40,14 @@ export function isValidViewPosition(atMs: unknown): atMs is number {
     atMs <= MAX_VIEW_POSITION_MS
   );
 }
-/** Calendar slots stay at local midnight/noon even on 23/25-hour DST days. */
-export function calendarEnd(nowMs: number): number {
-  return slotTime(calendarSlot(nowMs) + 1);
+function calendarEndSlot(nowMs: number): number {
+  return (Math.floor(calendarSlot(nowMs) / 2) + 1) * 2;
 }
-/** Half-day slots, bounded by initialization day and the current half-day. */
+/** The next local midnight, including on short or long DST days. */
+export function calendarEnd(nowMs: number): number {
+  return slotTime(calendarEndSlot(nowMs));
+}
+/** Half-day slots, bounded by initialization day and the end of today. */
 export function calendarWindow(
   fromMs: number,
   durationMs: number,
@@ -52,11 +55,8 @@ export function calendarWindow(
   nowMs = Date.now(),
 ): ViewWindow {
   const safeFrom = isValidViewPosition(fromMs) ? fromMs : nowMs;
-  const end = calendarSlot(nowMs) + 1;
-  const first = Math.min(
-    Math.floor(calendarSlot(timelineStartMs) / 2) * 2,
-    Math.floor(calendarSlot(nowMs) / 2) * 2,
-  );
+  const end = calendarEndSlot(nowMs);
+  const first = Math.min(Math.floor(calendarSlot(timelineStartMs) / 2) * 2, end - 2);
   const slots = Math.min(snapSpan(durationMs) / VIEW_STEP_MS, end - first);
   const start = Math.max(first, Math.min(calendarSlot(safeFrom), end - slots));
   return { fromMs: slotTime(start), toMs: slotTime(start + slots) };
@@ -104,7 +104,7 @@ export function resizeCalendarWindow(
   if (!Number.isFinite(deltaDays)) return window;
   const delta = Math.round(deltaDays * 2);
   const first = calendarSlot(dayStart(timelineStartMs)),
-    last = calendarSlot(nowMs) + 1;
+    last = calendarEndSlot(nowMs);
   const from = calendarSlot(window.fromMs),
     to = calendarSlot(window.toMs);
   return edge === 'from'

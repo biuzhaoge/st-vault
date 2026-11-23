@@ -75,8 +75,8 @@ button:disabled {
   letter-spacing: -0.3px;
 }
 .brand img {
-  width: 30px;
-  height: 30px;
+  width: calc(var(--navigation-height) - 4px);
+  height: calc(var(--navigation-height) - 4px);
 }
 .header-tools {
   gap: 4px;
@@ -86,8 +86,8 @@ button:disabled {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  min-height: 32px;
-  padding: 6px 12px;
+  min-height: var(--navigation-height);
+  padding: 4px 10px;
   border-radius: var(--radius-pill);
   corner-shape: round;
 }
@@ -326,6 +326,9 @@ svg.track-clip {
 svg.track-clip[data-seen='true'] {
   --coverage-tint: #c4c6cc;
 }
+svg.track-clip[data-favorite='true'] {
+  --coverage-tint: var(--favorite);
+}
 .coverage-edge {
   stop-color: color-mix(in srgb, var(--coverage-tint, var(--accent)) 66%, white);
 }
@@ -390,31 +393,15 @@ svg.track-clip[data-seen='true'] {
     repeating-linear-gradient(135deg, #ffffff0d 0 2px, transparent 2px 5px),
     var(--glass-track-sheen), color-mix(in srgb, var(--track-tint) 72%, transparent);
 }
-.status-line,
-:is(.track-row, .track-row-motion-ghost).selected .status-line {
-  isolation: isolate;
-  background: linear-gradient(180deg, #ffffff0c, #00000080 45%, #ffffff06), #17171780;
-  box-shadow:
-    inset 0 1px #ffffff2e,
-    inset 0 -1px #00000088;
-}
-.recording-line,
-:is(.track-row, .track-row-motion-ghost).selected .recording-line {
-  background: transparent;
-  box-shadow: none;
-}
-/* Keep shared reflection on status only; coverage sheen belongs to actual clips. */
-.status-line::after {
+/* Keep the two glass rails in place while the colored time data reveals or pans. */
+:is(.track-lane, .focus-lane)::before,
+:is(.track-lane, .focus-lane)::after {
   content: '';
-  position: absolute;
-  inset: 0;
-  z-index: 1;
-  border-radius: inherit;
-  corner-shape: inherit;
-  background: var(--glass-track-reflection);
-  box-shadow:
-    inset 0 1px #ffffff26,
-    inset 0 -1px #ffffff10;
+  z-index: 0;
+  background:
+    var(--glass-track-reflection), linear-gradient(180deg, #ffffff0c, #00000080 45%, #ffffff06),
+    var(--glass-track-base);
+  box-shadow: var(--glass-track-edge);
   pointer-events: none;
 }
 .range-selection {
@@ -445,10 +432,6 @@ svg.track-clip[data-seen='true'] {
   overflow: hidden;
   background: #090909;
   box-shadow: inset 0 0 0 1px #e3e3e31c;
-}
-.player-actions .player-control {
-  width: 32px;
-  height: 32px;
 }
 .player-actions .player-control--primary,
 .primary {
@@ -486,10 +469,9 @@ svg.track-clip[data-seen='true'] {
   border-radius: max(0px, calc(var(--radius-surface) - var(--review-inset, 6px)));
 }
 .focus-lane > .timeline-content {
+  z-index: 1;
   border-radius: inherit;
   corner-shape: inherit;
-}
-.focus-lane > .timeline-content {
   overflow: hidden;
 }
 .playback-status {
@@ -597,7 +579,7 @@ select option {
 .media-delete-actions button {
   border-radius: var(--radius-pill);
   corner-shape: round;
-  min-height: 36px;
+  min-height: var(--navigation-height);
 }
 .secondary {
   background: #dadada16;
@@ -643,8 +625,16 @@ select option {
 .minute-image {
   transition: filter var(--motion-fast);
 }
-.snapshot-section .snapshot-cell:hover .minute-image {
-  filter: brightness(1.12);
+@media (hover: hover) {
+  .track-label:hover {
+    filter: brightness(1.08);
+  }
+  .snapshot-section .snapshot-cell:hover .minute-image {
+    filter: brightness(1.12);
+  }
+  .recording-toggle.record-button:hover:enabled {
+    filter: brightness(1.15);
+  }
 }
 .snapshot-favorite[aria-pressed='true'] .ui-icon {
   transform: scale(1.1);
@@ -671,13 +661,6 @@ select option {
 }
 
 @media (pointer: coarse) {
-  :root {
-    --titlebar-height: 54px;
-  }
-  .player-actions .player-control {
-    width: 44px;
-    height: 44px;
-  }
   .recording-mode:not(.recording-icon) {
     width: 44px;
   }
@@ -705,22 +688,6 @@ select option {
     top: 14px;
     left: 7px;
   }
-  .recording-toggle.record-button {
-    width: 44px;
-    min-width: 44px;
-    min-height: 44px;
-  }
-  .snapshot-grid .snapshot-favorite {
-    width: 32px;
-    height: 32px;
-  }
-  .topbar {
-    height: var(--titlebar-height);
-    min-height: var(--titlebar-height);
-  }
-  .time-range-control {
-    --timeline-control-height: 48px;
-  }
   .language-icon {
     width: 44px;
     height: 44px;
@@ -728,11 +695,6 @@ select option {
   .language-toggle {
     height: 44px;
   }
-  .day-step {
-    flex-basis: 44px;
-  }
-  .header-tools > button,
-  .header-tool > button,
   .primary,
   .secondary,
   .media-delete-actions button {
@@ -740,7 +702,38 @@ select option {
     min-height: 44px;
   }
 }
-@container (max-width: 510px) {
+@media (any-pointer: coarse) {
+  .recording-toggle.record-button::after {
+    content: '';
+    position: absolute;
+    /* Grow inward over the cover without enlarging the visible connector. */
+    inset: -3px auto auto -3px;
+    width: 44px;
+    height: 44px;
+  }
+  .snapshot-cell > .snapshot-favorite::after {
+    --favorite-hit-size: clamp(24px, calc(var(--shot-width) * 0.39), 36px);
+    content: '';
+    position: absolute;
+    inset: -2px auto auto -2px;
+    /* Keep the center of the image available for seeking, even on small cells. */
+    inline-size: min(var(--favorite-hit-size), calc(var(--shot-width) / 2 - 2px));
+    block-size: min(var(--favorite-hit-size), calc(var(--shot-width) * 9 / 16));
+  }
+  .view-position-handle {
+    width: clamp(14px, 28%, 24px);
+  }
+  .view-position-handle.from {
+    left: -3px;
+  }
+  .view-position-handle.to {
+    right: -3px;
+  }
+  .selection-edge {
+    width: 20px;
+  }
+}
+@container track-header (max-width: 510px) {
   .subject-filters {
     flex-basis: 144px;
   }
@@ -763,7 +756,7 @@ select option {
     padding-inline: 2px;
   }
   .day-step {
-    flex-basis: 22px;
+    flex-basis: 24px;
   }
   .view-position {
     margin-inline: 3px;

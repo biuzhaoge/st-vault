@@ -3,6 +3,7 @@ export interface MediaDeletionEvent {
   commandId?: string;
   optimisticRanges?: MediaTimeRange[];
   knownEmpty?: boolean;
+  failed?: boolean;
   subjectId: string;
   plan: Pick<MediaDeletePlan, 'fromMs' | 'toMs'>;
 }
@@ -72,18 +73,17 @@ export class DeletionObserver {
     return { jobs, accepted, settled };
   }
 }
-/** Playback owns an interval, including fragments not decoded yet. Mutating any
- * part invalidates that source and its continuation, rather than patching clocks. */
-export function deletionAffectsPlayback(
+/** A deletion changes the displayed selection in either playback mode. */
+export function deletionOverlaps(
   event: Pick<MediaDeletionEvent, 'subjectId' | 'plan'>,
-  playback: { subjectId: string | null; kind: 'live' | 'archive'; range: MediaTimeRange },
+  subjectId: string | null,
+  range: MediaTimeRange,
 ): boolean {
   return (
-    event.subjectId === playback.subjectId &&
-    playback.kind === 'archive' &&
+    event.subjectId === subjectId &&
     event.plan.fromMs !== null &&
     event.plan.toMs !== null &&
-    event.plan.fromMs < playback.range.toMs &&
-    event.plan.toMs > playback.range.fromMs
+    event.plan.fromMs < range.toMs &&
+    event.plan.toMs > range.fromMs
   );
 }

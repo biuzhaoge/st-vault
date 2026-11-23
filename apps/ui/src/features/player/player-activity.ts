@@ -6,10 +6,10 @@ export class PlayerActivity {
     private readonly onVisible: (visible: boolean) => void,
     private readonly delayMs = 1000,
   ) {}
-  wake(): void {
+  wake(delayMs = this.delayMs): void {
     clearTimeout(this.timer);
     this.onVisible(true);
-    if (!this.interactive) this.timer = setTimeout(() => this.onVisible(false), this.delayMs);
+    if (!this.interactive) this.timer = setTimeout(() => this.onVisible(false), delayMs);
   }
   setInteractive(inside: boolean): void {
     if (inside === this.interactive) return;

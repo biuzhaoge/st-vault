@@ -44,6 +44,7 @@ export function useSnapshotView({
   playingUnitId,
   onSession,
   commands,
+  reselecting,
 }: {
   subject: Subject | null;
   referenceMs: number;
@@ -55,6 +56,7 @@ export function useSnapshotView({
   atMs: number | null;
   playingUnitId?: string;
   commands: SnapshotCommands;
+  reselecting: boolean;
   onSession: (id: string, session: SnapshotSession | null, window: MediaTimeRange) => void;
 }) {
   const mounted = useRef(true);
@@ -110,11 +112,6 @@ export function useSnapshotView({
 
   const sessionCallback = useRef(onSession);
   sessionCallback.current = onSession;
-
-  const invalidatePresentation = (): void => {
-    viewController.invalidate();
-    setRetry((value) => value + 1);
-  };
 
   const current = useMemo(
     () =>
@@ -172,6 +169,17 @@ export function useSnapshotView({
   const displayMarkers =
     pagePersonal && pagePersonal.value.subjectId === subject?.id ? pagePersonal.value : null;
   const deletions = useDeletionProjections();
+  // Keep decoded survivors from the existing packet until the reselected
+  // window is ready. Reads during admission could rebound into the old layout.
+  const holdingPage =
+    reselecting ||
+    deletions.some(
+      ({ job, target }) =>
+        job.subjectId === subject?.id &&
+        job.state === 'preparing' &&
+        job.deletionRevision === undefined &&
+        overlappingWindows(target, range),
+    );
   const packetItems = useMemo(
     () =>
       (shown?.items ?? []).filter(
@@ -249,11 +257,11 @@ export function useSnapshotView({
         data?.value.pageAnchors,
       );
   useEffect(() => {
-    if (browsing || followTail) return;
+    if (holdingPage || browsing || followTail) return;
     // Only a new playback intent releases manual browsing. Partition changes
     // and background progress are observations, never navigation commands.
     if (playbackPage !== null && page !== playbackPage) setPage(playbackPage, false);
-  }, [playbackPage, page, browsing, followTail]);
+  }, [playbackPage, page, browsing, followTail, holdingPage]);
   const slots = useMemo(
     () =>
       snapshotGridSlots(
@@ -345,7 +353,7 @@ export function useSnapshotView({
         return syncReadFailure(cause, signal);
       }
     },
-    !!subject,
+    !!subject && !holdingPage,
     `${scope}:${queryWindow.fromMs}:${queryWindow.toMs}:${page}:${retry}:${playingUnitId ?? ''}`,
     { timelineSubjectId: subject?.id },
   );
@@ -389,7 +397,8 @@ export function useSnapshotView({
   };
   const retryRead = (): void => {
     setFailure(null);
-    invalidatePresentation();
+    viewController.invalidate();
+    setRetry((value) => value + 1);
   };
   return {
     scope,
@@ -398,7 +407,6 @@ export function useSnapshotView({
     setPage,
     error,
     retryRead,
-    invalidatePresentation,
     current:
       current && shown && packetItems.length < shown.items.length
         ? {
@@ -415,6 +423,7 @@ export function useSnapshotView({
           }
         : catalog,
     pagePending,
+    holdingPage,
     acceptPersonal,
     acceptUnitFavorite,
     navigate,

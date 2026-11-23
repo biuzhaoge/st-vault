@@ -83,6 +83,12 @@ const paths = {
       <path d="M12 7v6m0 4h.01" />
     </>
   ),
+  info: (
+    <>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M12 11v6m0-10h.01" />
+    </>
+  ),
   stop: (
     <>
       <circle cx="12" cy="12" r="9" />

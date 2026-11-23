@@ -13,10 +13,11 @@ export interface DecodeInput {
 }
 export type SnapshotDecoder = (input: DecodeInput) => Promise<Uint8Array>;
 export class SnapshotDecodeError extends Error {
-  constructor(readonly code: 'no_frame' | 'unavailable' | 'failed') {
+  constructor(readonly code: 'no_frame' | 'invalid_media' | 'unavailable' | 'failed') {
     super('SNAPSHOT_DECODE_FAILED');
   }
 }
+const invalidInput = 'Invalid data found when processing input';
 let priorityWarningLogged = false;
 export function jpeg(bytes: Uint8Array): boolean {
   return (
@@ -117,24 +118,27 @@ export function createFfmpegDecoder(
       child.stdin.destroy();
       if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
     };
-    const finished = new Promise<void>((resolve, reject) => {
+    const finished = new Promise<number | null>((resolve) => {
       child.once('error', () => {
         failed = true;
         spawnFailed = true;
       });
-      child.once('close', (code) =>
-        code === 0 && !failed && !inputFailed
-          ? resolve()
-          : reject(new SnapshotDecodeError(spawnFailed ? 'unavailable' : 'failed')),
-      );
+      child.once('close', resolve);
     });
-    void finished.catch(() => undefined);
     child.stdout.on('data', (chunk: Buffer) => {
       size += chunk.length;
       if (size > 512 * 1024) stop();
       else parts.push(chunk);
     });
-    child.stderr.resume(); // Drain diagnostics, never retain paths or media messages.
+    let invalidMedia = false,
+      diagnosticTail = '';
+    // Classify FFmpeg's invalid-data diagnostic without retaining or logging stderr.
+    child.stderr.on('data', (chunk: Buffer) => {
+      if (invalidMedia) return;
+      const combined = diagnosticTail + chunk.toString();
+      invalidMedia = combined.includes(invalidInput);
+      diagnosticTail = invalidMedia ? '' : combined.slice(1 - invalidInput.length);
+    });
     input.signal.addEventListener('abort', stop, { once: true });
     async function* media(): AsyncGenerator<Buffer> {
       let total = 0;
@@ -173,9 +177,12 @@ export function createFfmpegDecoder(
       },
     );
     try {
-      await finished;
+      const exit = await finished;
       await writing;
-      if (inputFailed || input.signal.aborted) throw new SnapshotDecodeError('failed');
+      if (spawnFailed) throw new SnapshotDecodeError('unavailable');
+      if (failed || inputFailed || input.signal.aborted || exit === null)
+        throw new SnapshotDecodeError('failed');
+      if (exit !== 0) throw new SnapshotDecodeError(invalidMedia ? 'invalid_media' : 'failed');
       const bytes = Buffer.concat(parts);
       if (!bytes.length) throw new SnapshotDecodeError('no_frame');
       if (!jpeg(bytes)) throw new SnapshotDecodeError('failed');

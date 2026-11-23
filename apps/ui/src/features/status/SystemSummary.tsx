@@ -1,15 +1,19 @@
 import type { MediaDeletionJob, Subject } from '@st-vault/api-schema';
 import { systemRetryTargets } from '@st-vault/api-schema';
-import type { ReactNode } from 'react';
+import { useState, type CSSProperties, type ReactNode } from 'react';
 import { tr } from '../../shared/lib/i18n';
 import { PanelStatus } from '../../shared/ui/PanelContent';
 import { ArchiveHealth } from './ArchiveHealth';
 import { statusGroups, type StatusLine, type StatusValue } from './background-status';
 import { deletionStatus } from './deletion-status';
-import { diskUnobserved, systemHealthStatus } from './display';
+import { systemHealthStatus } from './display';
 import { StatusRetry } from './StatusRetry';
+import { StatusHelp } from './StatusHelp';
+import { statusHelpFor, type StatusHelpId } from './status-help';
 import type { SystemInfo } from './system';
 import './system-summary.css';
+
+type RowValue = Omit<StatusValue, 'text'> & { text: ReactNode };
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -23,6 +27,43 @@ function formatBytes(bytes: number): string {
   return `${value.toFixed(value >= 10 ? 0 : 1)} ${units[unit]}`;
 }
 
+function storageValue(disk: SystemInfo['disk'] | undefined, checking: boolean): RowValue {
+  if (!disk) return { text: '—' };
+
+  const health = systemHealthStatus({ lowSpace: disk.lowSpace, diskError: disk.error });
+  const note = health.messages[0];
+  if (checking) return { text: tr('检查中'), tone: 'busy', note };
+  if (health.kind === 'unavailable') return { text: tr('异常'), tone: 'error', note };
+  const lowSpace = health.kind === 'low-space';
+  if (disk.error || disk.totalBytes <= 0)
+    return lowSpace ? { text: health.title, tone: 'warning', note } : { text: tr('容量待确认') };
+
+  const usedPercent = Math.min(
+    100,
+    Math.max(0, ((disk.totalBytes - disk.freeBytes) / disk.totalBytes) * 100),
+  );
+  const used = Math.round(usedPercent);
+  const remaining = formatBytes(disk.freeBytes);
+  return {
+    text: (
+      <span
+        className="disk-capacity"
+        role="meter"
+        aria-label={tr('存储空间')}
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={used}
+        aria-valuetext={tr('已用 {{v0}}%，剩余 {{v1}}', { v0: used, v1: remaining })}
+        style={{ '--disk-used': `${usedPercent}%` } as CSSProperties}
+      >
+        {tr('剩余 {{v0}}', { v0: remaining })}
+      </span>
+    ),
+    tone: lowSpace ? 'warning' : 'ok',
+    note,
+  };
+}
+
 function StatusRow({
   name,
   label,
@@ -30,8 +71,8 @@ function StatusRow({
   accessory,
 }: {
   name: string;
-  label: string;
-  value: StatusValue;
+  label: ReactNode;
+  value: RowValue;
   accessory?: ReactNode;
 }): JSX.Element {
   const { text, tone, note } = value;
@@ -63,12 +104,10 @@ export function SystemSummary({
   autoRecordingCount: number;
   onRefresh?: () => Promise<unknown>;
 }): JSX.Element {
+  const [helpOpen, setHelpOpen] = useState<StatusHelpId | null>(null);
   const tasks = system?.backgroundTasks ?? [];
   const disk = system?.disk;
   const recording = system?.capture;
-  const diskRatio = disk?.totalBytes
-    ? Math.min(1, Math.max(0, disk.freeBytes / disk.totalBytes))
-    : 0;
   const empty = { text: '—' };
   const groups = statusGroups(
     tasks,
@@ -99,53 +138,64 @@ export function SystemSummary({
         restarting: archive.recovery === 'restart-requested',
       })
     : null;
-  const diskHealth = disk && systemHealthStatus({ lowSpace: disk.lowSpace, diskError: disk.error });
   const diskChecking = tasks.some((task) => task.id === 'disk-check' && task.state === 'running');
+  const describe = statusHelpFor(system);
+  const help = (id: StatusHelpId, label: string) => (
+    <StatusHelp
+      label={label}
+      {...describe(id)}
+      open={helpOpen === id}
+      onOpenChange={(open) => setHelpOpen((active) => (open ? id : active === id ? null : active))}
+    />
+  );
+  const statusRow = (id: StatusHelpId, label: string, value: RowValue) => (
+    <StatusRow
+      key={id}
+      name={id}
+      label={
+        <>
+          {label}
+          {help(id, label)}
+        </>
+      }
+      value={value}
+      accessory={retryButton(id, label)}
+    />
+  );
   const statusRows = (rows: StatusLine[]) =>
-    rows.map(({ id, label, value }) => (
-      <StatusRow
-        key={id}
-        name={id}
-        label={label}
-        value={value}
-        accessory={retryButton(id, label)}
-      />
-    ));
+    rows.map(({ id, label, value }) => statusRow(id, label, value));
   return (
     <section className="system-summary" aria-label={tr('系统状态')}>
       <section className="system-group" aria-label={tr('录制')}>
         <h3>{tr('录制')}</h3>
-        <StatusRow
-          name="recording"
-          label={tr('录制中')}
-          value={recording ? { text: String(recording.active) } : empty}
-        />
-        <StatusRow
-          name="auto-recording"
-          label={tr('自动录制')}
-          value={{ text: String(autoRecordingCount) }}
-        />
-        <StatusRow
-          name="recording-start"
-          label={tr('启动中')}
-          value={
-            recording
-              ? { text: String(recording.starting), tone: recording.starting ? 'busy' : undefined }
-              : empty
-          }
-        />
-        <StatusRow
-          name="recording-reconnect"
-          label={tr('重连中')}
-          value={
-            recording
-              ? {
-                  text: String(recording.retrying),
-                  tone: recording.retrying ? 'warning' : undefined,
-                }
-              : empty
-          }
-        />
+        {statusRow(
+          'recording',
+          tr('录制中'),
+          recording
+            ? { text: String(recording.active), tone: recording.active ? 'ok' : undefined }
+            : empty,
+        )}
+        {statusRow('auto-recording', tr('自动录制'), { text: String(autoRecordingCount) })}
+        {statusRow(
+          'recording-start',
+          tr('启动中'),
+          recording
+            ? {
+                text: String(recording.starting),
+                tone: recording.starting ? 'busy' : undefined,
+              }
+            : empty,
+        )}
+        {statusRow(
+          'recording-reconnect',
+          tr('重连中'),
+          recording
+            ? {
+                text: String(recording.retrying),
+                tone: recording.retrying ? 'warning' : undefined,
+              }
+            : empty,
+        )}
       </section>
       {!!groups.sync.length && (
         <section className="system-group" aria-label={tr('数据同步')}>
@@ -164,49 +214,9 @@ export function SystemSummary({
         <ArchiveHealth
           health={archiveHealth}
           accessory={retryButton('archive-health', tr('归档服务'))}
+          help={help('archive-health', tr('归档服务'))}
         />
-        <StatusRow
-          name="disk-check"
-          label={tr('存储空间')}
-          value={
-            disk
-              ? {
-                  text: diskChecking
-                    ? tr('检查中')
-                    : disk.totalBytes
-                      ? tr('剩余 {{v0}}', { v0: formatBytes(disk.freeBytes) })
-                      : tr('容量待确认'),
-                  tone: diskChecking
-                    ? 'busy'
-                    : diskUnobserved(disk.error)
-                      ? undefined
-                      : disk.error
-                        ? 'error'
-                        : disk.lowSpace
-                          ? 'warning'
-                          : undefined,
-                  note: diskHealth?.messages[0],
-                }
-              : empty
-          }
-          accessory={
-            <>
-              {disk && !disk.error && disk.totalBytes > 0 && (
-                <div
-                  className="disk-track"
-                  role="progressbar"
-                  aria-label={tr('磁盘剩余空间')}
-                  aria-valuemin={0}
-                  aria-valuemax={100}
-                  aria-valuenow={Math.round(diskRatio * 100)}
-                >
-                  <span style={{ width: `${diskRatio * 100}%` }} />
-                </div>
-              )}
-              {retryButton('disk-check', tr('存储空间'))}
-            </>
-          }
-        />
+        {statusRow('disk-check', tr('存储空间'), storageValue(disk, diskChecking))}
         {statusRows(groups.storage)}
       </section>
     </section>

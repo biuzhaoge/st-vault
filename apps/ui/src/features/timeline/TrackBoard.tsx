@@ -23,6 +23,7 @@ import {
   type ViewWindow,
 } from './range-control';
 import { useTrackData } from './use-track-data';
+import { useTrackPresentation } from './use-track-presentation';
 import {
   SUBJECT_ROW_HEIGHT,
   virtualRows,
@@ -204,19 +205,14 @@ const SelectionOverlay = forwardRef<
     </div>
   );
 });
-interface TrackPresentation {
-  view: string;
-  arrival: number;
-}
 const TrackRow = memo(function TrackRow({
   subject,
   data,
-  scrolling,
-  failed,
+  trackState,
   selected,
   selecting,
   coverRevision,
-  presentation,
+  presentationView,
   revealDelayMs,
   priority,
   widthPx,
@@ -227,12 +223,11 @@ const TrackRow = memo(function TrackRow({
 }: {
   subject: Subject;
   data: TrackData | undefined;
-  scrolling: boolean;
-  failed: boolean;
+  trackState: 'ready' | 'idle' | 'failed' | 'loading';
   selected: boolean;
   selecting: boolean;
   coverRevision: number;
-  presentation: TrackPresentation;
+  presentationView: string;
   revealDelayMs: number;
   priority: 'visible' | 'prefetch';
   widthPx: number;
@@ -242,28 +237,6 @@ const TrackRow = memo(function TrackRow({
   onRecordingChange: (subject: Subject, record: boolean) => Promise<void>;
 }) {
   useTranslation();
-  const visible = priority === 'visible';
-  const painted = useRef<{ data: TrackData; presentation: TrackPresentation } | null>(null);
-  const retained =
-    painted.current?.presentation.view === presentation.view ? painted.current : null;
-  // Cache hits can be as expensive to mount as network responses. Keep painted
-  // rows intact through the gesture and hydrate newly exposed rows after it.
-  const timeline = scrolling
-    ? retained?.data
-    : visible
-      ? (data ??
-        (retained?.presentation.arrival === presentation.arrival ? retained.data : undefined))
-      : undefined;
-  const trackState = timeline
-    ? 'ready'
-    : !visible || scrolling
-      ? 'idle'
-      : failed
-        ? 'failed'
-        : 'loading';
-  useLayoutEffect(() => {
-    if (!scrolling) painted.current = timeline ? { data: timeline, presentation } : null;
-  }, [scrolling, timeline, presentation]);
   return (
     <div
       className={`track-row${selected ? ' selected' : ''}${selecting ? ' is-selecting' : ''}`}
@@ -305,11 +278,11 @@ const TrackRow = memo(function TrackRow({
         )}
       </div>
       <div
-        aria-busy={visible && !timeline && trackState !== 'failed'}
+        aria-busy={priority === 'visible' && (trackState === 'idle' || trackState === 'loading')}
         className="track-lane"
         data-track-state={trackState}
         style={
-          timeline ? ({ '--track-reveal-delay': `${revealDelayMs}ms` } as CSSProperties) : undefined
+          data ? ({ '--track-reveal-delay': `${revealDelayMs}ms` } as CSSProperties) : undefined
         }
         role="group"
         tabIndex={0}
@@ -319,12 +292,12 @@ const TrackRow = memo(function TrackRow({
       >
         <div className="timeline-scene">
           {/* Only the opacity layer restarts on view changes. The scene keeps its pan clock. */}
-          {timeline ? (
+          {data ? (
             <TimelineBands
-              key={presentation.view}
+              key={presentationView}
               widthPx={widthPx}
               overscanMs={DAY_MS}
-              data={timeline}
+              data={data}
               fromMs={fromMs}
               toMs={toMs}
             />
@@ -385,12 +358,10 @@ export function TrackBoard({
 }): JSX.Element {
   const [viewport, setViewport] = useState({ top: 0, height: 500 });
   const [scrolling, setScrolling] = useState(false);
-  const [scrollArrival, setScrollArrival] = useState(0);
   const scrollPace = useRef({ active: false, settle: undefined as number | undefined });
   const mountedRows = useRef({ start: 0, end: 0 });
   // Native scrolling owns pixels; React only needs changes to the visible row set.
   const nativeViewport = useRef(viewport);
-  const horizontalScroll = useRef(0);
   const [rulerWidth, setRulerWidth] = useState(600);
   const [drag, setDrag] = useState<TrackGesture | null>(null);
   const gesture = useRef<TrackGestureSession | null>(null);
@@ -472,10 +443,7 @@ export function TrackBoard({
       setViewport((current) => ({ ...current, top: rowTop }));
       if (scroller.current) scroller.current.scrollTop = rowTop;
     }
-    if (restoringPosition && scroller.current) {
-      scroller.current.scrollLeft = restorePosition.left;
-      restoredPosition.current = true;
-    }
+    if (restoringPosition) restoredPosition.current = true;
     // The compositor can already have scrolled ahead of the latest scroll event.
     // Only explicit restoration/reordering may write a pixel offset back to it.
     const nativeTop = scroller.current?.scrollTop ?? rowTop;
@@ -484,7 +452,6 @@ export function TrackBoard({
       onPosition?.({
         id: topSubject.id,
         offset: Math.round(nativeTop % SUBJECT_ROW_HEIGHT),
-        left: Math.round(scroller.current?.scrollLeft ?? 0),
       });
     if (revealViewport !== null && reveal) {
       handledReveal.current = reveal.token;
@@ -509,9 +476,6 @@ export function TrackBoard({
         '--track-scrollbar-width',
         `${element.offsetWidth - element.clientWidth}px`,
       );
-      header.style.setProperty('--track-content-width', `${element.scrollWidth}px`);
-      header.style.setProperty('--track-scroll-left', `${element.scrollLeft}px`);
-      horizontalScroll.current = element.scrollLeft;
       nativeViewport.current = { top: element.scrollTop, height };
       setViewport((previous) => (previous.height === height ? previous : { ...previous, height }));
       const width = header.querySelector('.timeline-ruler')?.clientWidth ?? 600;
@@ -559,21 +523,16 @@ export function TrackBoard({
   // clipping only the right edge to now can invert an upcoming half-day window.
   const { fromMs: queryFrom, toMs: queryTo } = aggregateWindow({ fromMs, toMs }, 5000);
   const buckets = directoryBucketCount({ fromMs: queryFrom, toMs: queryTo }, rulerWidth);
-  const trackData = useTrackData({
+  const trackPlan = {
     visible: visibleIds,
     fromMs: queryFrom,
     toMs: queryTo,
     buckets,
     paused: scrolling,
-  });
-  const visibleTracks = scrolling
-    ? undefined
-    : trackData.getVisible(visibleIds, queryFrom, queryTo, buckets);
-  const presentation = useMemo<TrackPresentation>(
-    () => ({ view: `${filterKey}:${fromMs}:${toMs}`, arrival: scrollArrival }),
-    [filterKey, fromMs, toMs, scrollArrival],
-  );
-  const revealStepMs = Math.min(24, 240 / Math.max(1, visibleIds.length - 1));
+  };
+  const trackData = useTrackData(trackPlan);
+  const presentationView = `${filterKey}:${fromMs}:${toMs}`;
+  const presentation = useTrackPresentation(trackData, presentationView, trackPlan);
   useSyncClock(() => {
     if (!scrollPace.current.active) setCoverRevision((n) => n + 1);
   });
@@ -589,15 +548,17 @@ export function TrackBoard({
     window.cancelAnimationFrame(selectionFrame.current ?? 0);
     selectionFrame.current = undefined;
     pendingUpdate.current = null;
+    const selecting = gesture.current?.selecting;
     gesture.current?.cancel();
     gesture.current = null;
     setDrag(null);
-    if (!keepDraft) setDraft(null);
+    if (selecting && !keepDraft) setDraft(null);
   };
   useLayoutEffect(() => {
-    cancelGesture();
+    cancelGesture(true);
     commitRequest.current?.abort();
     commitRequest.current = null;
+    setDraft(null);
   }, [selectedId]);
   useEffect(
     () => () => {
@@ -615,6 +576,7 @@ export function TrackBoard({
       index = subjects.findIndex((subject) => subject.id === selectedId);
     const y = box.top + index * SUBJECT_ROW_HEIGHT + SUBJECT_ROW_HEIGHT / 2 - top;
     onAnchor({
+      subjectId: selectedId,
       y: Math.max(box.top + 7, Math.min(box.top + root.clientHeight - 7, y)),
       offscreen:
         index < 0
@@ -695,10 +657,11 @@ export function TrackBoard({
             '.time-range-control .timeline-ruler',
           );
           if (!id || !ruler) return;
-          commitRequest.current?.abort();
-          setDraft(null);
-          event.preventDefault();
-          event.currentTarget.focus({ preventScroll: true });
+          const nativeScroll = event.pointerType === 'touch' || event.pointerType === 'pen';
+          if (!nativeScroll) {
+            event.preventDefault();
+            event.currentTarget.focus({ preventScroll: true });
+          }
           const edge = target.closest<HTMLElement>('[data-edge]')?.dataset.edge ?? null;
           const at =
             edge === 'from'
@@ -715,6 +678,7 @@ export function TrackBoard({
             at,
             width: ruler.getBoundingClientRect().width,
             scrollTop: event.currentTarget.scrollTop,
+            nativeScroll,
             window: currentWindow,
             selection,
             edge,
@@ -725,6 +689,7 @@ export function TrackBoard({
         onPointerMove={(event) => {
           const current = gesture.current;
           if (!current) {
+            if (event.pointerType === 'touch') return;
             const target = event.target as Element;
             const id =
               target.closest<HTMLElement>('.track-row')?.dataset.subjectId ??
@@ -759,7 +724,6 @@ export function TrackBoard({
               bounds &&
               event.clientY >= bounds.top &&
               event.clientY < bounds.bottom &&
-              event.pointerType !== 'touch' &&
               coverage
                 ? hoverMediaTime(
                     coverage.buckets,
@@ -783,19 +747,18 @@ export function TrackBoard({
           if (!current || !event.currentTarget.hasPointerCapture(event.pointerId)) return;
           const previousMode = current.mode;
           const motion = current.move(event.clientX, event.clientY, Date.now());
-          if (!current.mode) return;
-          if (!previousMode) setDrag(current.mode);
+          if (motion.kind === 'idle') return;
+          if (!previousMode) setDrag(motion.kind);
           if (motion.kind === 'scroll') {
             event.currentTarget.scrollTop = motion.top;
             return;
           }
-          if (motion.kind === 'selection') {
-            // Track the pointer throughout the drag; snap or discard only on release.
-            pendingUpdate.current = () => {
-              const range = motion.range;
-              setDraft(range ? { id: current.id, range } : null);
-            };
-          } else return;
+          if (!previousMode) commitRequest.current?.abort();
+          // Track the pointer throughout the drag; snap or discard only on release.
+          pendingUpdate.current = () => {
+            const range = motion.range;
+            setDraft(range ? { id: current.id, range } : null);
+          };
           selectionFrame.current ??= window.requestAnimationFrame(() => {
             selectionFrame.current = undefined;
             pendingUpdate.current?.();
@@ -810,7 +773,11 @@ export function TrackBoard({
           const select = result.kind === 'selection' && !!subject;
           cancelGesture(!!select);
           if (result.kind === 'selection' && subject) commitRange(subject, result.range);
-          else if (result.kind === 'choose' && subject) onChoose(subject);
+          else if (result.kind === 'choose' && subject) {
+            commitRequest.current?.abort();
+            setDraft(null);
+            onChoose(subject);
+          }
           event.currentTarget.releasePointerCapture(event.pointerId);
         }}
         onPointerCancel={() => cancelGesture()}
@@ -822,21 +789,12 @@ export function TrackBoard({
         onKeyDown={(event) => {
           if (event.key === 'Escape') {
             commitRequest.current?.abort();
-            cancelGesture();
+            cancelGesture(true);
+            setDraft(null);
           }
         }}
         onScroll={(event) => {
           hoverPreview.current?.show(null);
-          if (
-            headerViewport.current &&
-            horizontalScroll.current !== event.currentTarget.scrollLeft
-          ) {
-            headerViewport.current.style.setProperty(
-              '--track-scroll-left',
-              `${event.currentTarget.scrollLeft}px`,
-            );
-            horizontalScroll.current = event.currentTarget.scrollLeft;
-          }
           const previousViewport = nativeViewport.current;
           const next = {
             top: event.currentTarget.scrollTop,
@@ -859,7 +817,6 @@ export function TrackBoard({
             window.clearTimeout(pace.settle);
             pace.settle = window.setTimeout(() => {
               pace.active = false;
-              setScrollArrival((arrival) => arrival + 1);
               setScrolling(false);
             }, SCROLL_SETTLE_MS);
           }
@@ -869,7 +826,6 @@ export function TrackBoard({
             onPosition?.({
               id: topSubject.id,
               offset: Math.round(event.currentTarget.scrollTop % SUBJECT_ROW_HEIGHT),
-              left: Math.round(event.currentTarget.scrollLeft),
             });
           nativeViewport.current = next;
           updateAnchor(event.currentTarget, next.top);
@@ -915,21 +871,26 @@ export function TrackBoard({
           />
           {rows.map((subject, index) => {
             const visible = start + index >= visibleStart && start + index < visibleEnd;
-            const track = visibleTracks?.get(subject.id);
+            const track = presentation.rows.get(subject.id);
             return (
               <TrackRow
                 key={subject.id}
                 subject={subject}
                 data={track?.data}
-                scrolling={scrolling}
-                failed={track?.failed ?? false}
+                trackState={
+                  track
+                    ? 'ready'
+                    : !visible || scrolling
+                      ? 'idle'
+                      : presentation.failures.has(subject.id)
+                        ? 'failed'
+                        : 'loading'
+                }
                 selected={subject.id === selectedId}
                 selecting={subject.id === selectingId}
                 coverRevision={coverRevision}
-                presentation={presentation}
-                revealDelayMs={
-                  visible && !scrolling ? (start + index - visibleStart) * revealStepMs : 0
-                }
+                presentationView={presentationView}
+                revealDelayMs={track?.delayMs ?? 0}
                 widthPx={rulerWidth}
                 priority={visible ? 'visible' : 'prefetch'}
                 fromMs={fromMs}

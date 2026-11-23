@@ -543,6 +543,42 @@ describe('bounded anonymous covers and recorded unit snapshots', () => {
       '/synthetic/second',
     ]);
   });
+  it('recovers a screenshot from the next fragment after a malformed MP4 header', async () => {
+    const f = fixture([
+      segment('damaged', 1000, 3000),
+      segment('valid', 3000, 5000),
+      segment('later', 5000, 7000),
+    ]);
+    f.decoder.mockImplementation(async ({ paths }) => {
+      if (paths.includes('/synthetic/damaged')) throw new SnapshotDecodeError('invalid_media');
+      return image;
+    });
+    await expect(f.open().snapshot('stripchat:42', 1000, undefined, 7000)).resolves.toEqual(image);
+    expect(f.decoder.mock.calls.map(([input]) => input.paths.slice(1))).toEqual([
+      ['/synthetic/damaged', '/synthetic/valid'],
+      ['/synthetic/damaged'],
+      ['/synthetic/valid', '/synthetic/later'],
+    ]);
+    expect(f.decoder.mock.lastCall![0].offsetSeconds).toBe(0);
+  });
+  it('keeps the earliest frame when only a neighboring fragment breaks the decode window', async () => {
+    const f = fixture([segment('valid', 1000, 3000), segment('damaged-next', 3000, 5000)]);
+    f.decoder.mockRejectedValueOnce(new SnapshotDecodeError('invalid_media'));
+    await expect(f.open().snapshot('stripchat:42', 1000, undefined, 5000)).resolves.toEqual(image);
+    expect(f.decoder.mock.calls.map(([input]) => input.paths.slice(1))).toEqual([
+      ['/synthetic/valid', '/synthetic/damaged-next'],
+      ['/synthetic/valid'],
+    ]);
+  });
+  it('preserves a decode failure when the selected range contains no usable frame', async () => {
+    const f = fixture([segment('damaged', 1000, 3000), segment('out-of-range', 4000, 6000)]);
+    f.decoder.mockRejectedValueOnce(new SnapshotDecodeError('invalid_media'));
+    await expect(f.open().snapshot('stripchat:42', 1000, undefined, 4000)).rejects.toMatchObject({
+      code: 'preview_failed',
+      cause: { code: 'invalid_media' },
+    });
+    expect(f.decoder).toHaveBeenCalledOnce();
+  });
   it('briefly caches confirmed empty windows but retries when their media changes', async () => {
     let now = 1000;
     const segments = [segment('first', 1000, 2000)],

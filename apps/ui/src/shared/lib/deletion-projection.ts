@@ -67,10 +67,14 @@ export function beginDeletionProjection(
 }
 export function adoptDeletionProjection(job: MediaDeletionJob): void {
   const previous = entries.find((entry) => entry.job.id === job.id);
+  // Job counters belong to the status inventory. The optimistic view only
+  // changes when visibility is published, withdrawn, or admission is uncertain.
+  const lifecycle = (state: MediaDeletionJob['state']) =>
+    ['completed', 'failed', 'retry'].includes(state) ? state : 'active';
   if (
     !previous ||
-    (previous.job.updatedAtMs === job.updatedAtMs &&
-      previous.job.state === job.state &&
+    (lifecycle(previous.job.state) === lifecycle(job.state) &&
+      previous.job.error === job.error &&
       previous.job.deletionRevision === job.deletionRevision)
   )
     return;

@@ -6,11 +6,11 @@ import { clockLabel, dayKey } from '../../shared/lib/date-label';
 
 export interface StatusValue {
   text: string;
-  tone?: 'busy' | 'warning' | 'error';
+  tone?: 'ok' | 'busy' | 'warning' | 'error';
   note?: string;
 }
 export interface StatusLine {
-  id: string;
+  id: (typeof groups)[keyof typeof groups][number][0];
   label: string;
   value: StatusValue;
 }
@@ -116,7 +116,7 @@ function scheduledValue(task: BackgroundTask, now: number): StatusValue {
     return { text: tr(task.id === 'account-list' ? '未连接账户' : '已关闭') };
   if (task.state === 'paused') return { text: tr('已暂停'), tone: 'warning' };
   if (task.id === 'site-access' && task.state === 'idle')
-    return { text: task.target ?? tr('可用') };
+    return { text: task.target ?? tr('可用'), tone: 'ok' };
   if (task.pending) return { text: tr('待处理 {{v0}}', { v0: task.pending.toLocaleString() }) };
   const next = task.nextRunAtMs;
   if (task.state === 'waiting' && task.group === 'sync' && typeof next === 'number' && next > now) {

@@ -50,7 +50,6 @@ import { registerNetworkRouting } from './network-routing.js';
 import { registerSystem } from './system.js';
 import { deploymentTimeZone } from '../runtime/time-zone.js';
 import { acceptsRequestOrigin } from './request-origin.js';
-import { credentialTransport } from './access-transport.js';
 
 interface AppOptions {
   clock?: SyncClock;
@@ -59,7 +58,6 @@ interface AppOptions {
   supervisor: SupervisorPort;
   vault: KeyVault;
   now?: () => number;
-  secureCookie?: boolean;
   uiRoot?: string;
   allowedOrigins?: string[];
   settings?: SettingsStore;
@@ -273,10 +271,6 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     if (code === 'INVALID_MEDIA_SELECTION')
       return reply.code(400).send({ error: 'invalid_request' });
     if (code === 'INVALID_CURSOR') return reply.code(400).send({ error: 'invalid_cursor' });
-    if (code === 'ACCOUNT_SYNC_HTTPS_REQUIRED')
-      return reply.code(412).send({ error: 'account_sync_https_required' });
-    if (code === 'KEYS_HTTPS_REQUIRED')
-      return reply.code(412).send({ error: 'keys_https_required' });
     if (error instanceof AccountSyncError) {
       const status =
         error.code === 'cookies_invalid' || error.code === 'account_sync_disconnected'
@@ -414,17 +408,17 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       until: previous?.until ?? now() + 60000,
     });
   };
+  const secureCookie = (request: FastifyRequest): boolean =>
+    request.protocol === 'https' || request.headers.origin === `https://${request.headers.host}`;
   app.post('/api/setup/session', { bodyLimit: 1024 }, async (request, reply) => {
-    if (!safeAccountTransport(request)) throw new Error('ACCOUNT_SYNC_HTTPS_REQUIRED');
     const { password } = setupSessionSchema.parse(request.body);
     limitAuth(request);
     const token = await auth.beginSetup(password, setupToken(request.headers.cookie));
     loginAttempts.delete(request.ip);
-    reply.header('set-cookie', auth.setupCookie(token, transport(request).secureCookie));
+    reply.header('set-cookie', auth.setupCookie(token, secureCookie(request)));
     return { ok: true };
   });
   app.post('/api/setup', { bodyLimit: 1024 }, async (request, reply) => {
-    if (!safeAccountTransport(request)) throw new Error('ACCOUNT_SYNC_HTTPS_REQUIRED');
     const { pin } = pinSchema.parse(request.body);
     const owner = setupToken(request.headers.cookie);
     if (!owner || !auth.setupAuthorized(owner)) throw new LocalAuthError('setup_expired');
@@ -432,23 +426,20 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     setupCompleting = true;
     try {
       const token = await auth.completeSetup(pin, owner);
-      reply.header('set-cookie', [
-        auth.cookie(token, transport(request).secureCookie),
-        auth.clearSetupCookie(transport(request).secureCookie),
-      ]);
+      const secure = secureCookie(request);
+      reply.header('set-cookie', [auth.cookie(token, secure), auth.clearSetupCookie(secure)]);
       return { ok: true };
     } finally {
       setupCompleting = false;
     }
   });
   app.post('/api/login', { bodyLimit: 1024 }, async (request, reply) => {
-    if (!safeAccountTransport(request)) throw new Error('ACCOUNT_SYNC_HTTPS_REQUIRED');
     const { pin } = pinSchema.parse(request.body);
     limitAuth(request);
     const token = await auth.login(pin);
     if (!token) return reply.code(401).send({ error: 'invalid_pin' });
     loginAttempts.delete(request.ip);
-    reply.header('set-cookie', auth.cookie(token, transport(request).secureCookie));
+    reply.header('set-cookie', auth.cookie(token, secureCookie(request)));
     return { ok: true };
   });
   app.post('/api/logout', async (request, reply) => {
@@ -462,15 +453,10 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     if (token) sync.closeOwner(token);
     if (token) await live.destroyOwner(token);
     if (token) playback.closeOwner(token);
-    reply.header('set-cookie', [
-      auth.clearCookie(transport(request).secureCookie),
-      auth.clearSetupCookie(transport(request).secureCookie),
-    ]);
+    const secure = secureCookie(request);
+    reply.header('set-cookie', [auth.clearCookie(secure), auth.clearSetupCookie(secure)]);
     return { ok: true };
   });
-  const transport = (request: FastifyRequest) =>
-    credentialTransport(request.headers, request.protocol, options.secureCookie);
-  const safeAccountTransport = (request: FastifyRequest): boolean => transport(request).allowed;
   const accountOperation = async <T>(
     request: FastifyRequest,
     reply: FastifyReply,
@@ -517,12 +503,10 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   if (options.network) registerNetworkRouting(app, options.network, accountSync, archive);
   registerPersonal(app, archive);
   app.put('/api/account-sync', async (request, reply) => {
-    if (!safeAccountTransport(request)) throw new Error('ACCOUNT_SYNC_HTTPS_REQUIRED');
     const config = accountSyncConfigSchema.parse(request.body);
     return accountOperation(request, reply, (signal) => accountSync.configure(config, signal));
   });
-  app.delete('/api/account-sync', async (request, reply) => {
-    if (!safeAccountTransport(request)) throw new Error('ACCOUNT_SYNC_HTTPS_REQUIRED');
+  app.delete('/api/account-sync', async (_request, reply) => {
     const draft = await accountSync.disconnect();
     reply.header('cache-control', 'no-store, private');
     return { draft, status: accountSync.status() };
@@ -533,7 +517,6 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     url: '/api/keys/current',
     async handler(request, reply) {
       reply.header('cache-control', 'no-store, private');
-      if (!safeAccountTransport(request)) throw new Error('KEYS_HTTPS_REQUIRED');
       if (request.method === 'PUT') {
         await vault.replace(keySchema.parse(request.body));
         keyValidation.start(true);

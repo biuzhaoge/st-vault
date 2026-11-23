@@ -1,5 +1,5 @@
 .player-picture {
-  container-type: inline-size;
+  container: player-picture / inline-size;
 }
 .player-chrome {
   position: absolute;
@@ -121,7 +121,7 @@
 .player-bottom .selection-bridge {
   gap: 3px;
 }
-@container (max-width: 620px) {
+@container player-picture (max-width: 620px) {
   .player-bottom .selection-date {
     display: none;
   }
@@ -132,7 +132,7 @@
   padding: 18px 10px 6px;
 }
 .player-bottom .player-actions {
-  min-height: 36px;
+  min-height: var(--player-control-size);
   padding: 0;
 }
 .player-picture .playback-status--compact {
@@ -140,12 +140,7 @@
   max-height: calc(100% - 52px);
   overflow-y: auto;
 }
-@media (pointer: coarse) {
-  .player-bottom .player-actions {
-    min-height: 44px;
-  }
-}
-@container (max-width: 420px) {
+@container player-picture (max-width: 420px) {
   .player-picture .playback-status--compact .playback-status-content {
     grid-template-columns: 18px minmax(0, 1fr);
   }
@@ -243,14 +238,6 @@
 .player-avatar-link:focus-visible {
   outline: 2px solid var(--ink);
   outline-offset: 2px;
-}
-/* Keep the one-line controls usable on narrow media without pushing clocks off screen. */
-@media (pointer: coarse) {
-  @container (max-width: 420px) {
-    .player-actions .player-control {
-      width: 32px;
-    }
-  }
 }
 .player-picture[data-heading='hidden'] > .player-heading {
   transition: none;

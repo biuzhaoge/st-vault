@@ -51,6 +51,36 @@ try {
   };
 
   await connect();
+  const wireAtRecordingButton = () =>
+    page.waitForFunction(() => {
+      const track = document.querySelector('.track-row.selected');
+      const button = track?.querySelector('.record-button');
+      const cover = track?.querySelector('.track-cover-wrap');
+      const wire = document.querySelector(
+        '.row-connection[data-offscreen="visible"] .connection-bus',
+      );
+      const matrix = wire?.getScreenCTM();
+      if (!button || !cover || !matrix) return false;
+      const end = wire.getPointAtLength(wire.getTotalLength()).matrixTransform(matrix);
+      const control = button.getBoundingClientRect();
+      const picture = cover.getBoundingClientRect();
+      const center = { x: control.left + control.width / 2, y: control.top + control.height / 2 };
+      return (
+        control.width <= 24 &&
+        Math.abs(control.left - picture.left - 3) < 1 &&
+        Math.abs(control.top - picture.top - 3) < 1 &&
+        Math.abs(end.x - control.left) < 1 &&
+        Math.abs(end.y - center.y) < 1 &&
+        button.contains(document.elementFromPoint(center.x, center.y))
+      );
+    });
+  await wireAtRecordingButton();
+  const list = page.locator('.track-table-scroll');
+  const initialTop = await list.evaluate((node) => node.scrollTop);
+  await list.evaluate((node) => node.scrollTo(0, node.scrollHeight));
+  await page.locator('.row-connection[data-offscreen="above"] .connection-arrow').waitFor();
+  await list.evaluate((node, top) => node.scrollTo(0, top), initialTop);
+  await wireAtRecordingButton();
   // A native event in the close click's turn must not resurrect the old cursor.
   await page.evaluate(() => {
     const video = document.querySelector('video[data-media-slot="active"]');

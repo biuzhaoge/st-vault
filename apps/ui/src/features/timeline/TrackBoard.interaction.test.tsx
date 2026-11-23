@@ -399,6 +399,23 @@ it('retains vertical row dragging and opens a clicked broadcaster directly', () 
   preview.fire('onPointerUp', 20);
   expect(preview.open).toHaveBeenCalledExactlyOnceWith(subject);
 });
+it('leaves vertical touch movement to native scrolling and still accepts a horizontal touch range', () => {
+  const { fire, choose, currentTarget } = setup();
+  const touch = { pointerType: 'touch' };
+  fire('onPointerDown', 20, touch);
+  fire('onPointerMove', 22, { ...touch, clientY: -30 });
+  expect(currentTarget.scrollTop).toBe(0);
+  fire('onPointerCancel', 22, touch);
+  expect(choose).not.toHaveBeenCalled();
+  fire('onPointerDown', 20, touch);
+  fire('onPointerMove', 40, touch);
+  fire('onPointerUp', 60, touch);
+  expect(choose).toHaveBeenCalledExactlyOnceWith(
+    subject,
+    { fromMs: 1200, toMs: 1600 },
+    expect.any(AbortSignal),
+  );
+});
 
 it('queries the complete calendar window when viewing the upcoming half of today', () => {
   const day = 86400000,

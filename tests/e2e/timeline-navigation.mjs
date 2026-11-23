@@ -219,7 +219,6 @@ try {
     ]);
   await page.locator('.track-table-scroll').evaluate((node) => {
     node.scrollTop += 5 * node.querySelector('.track-row').getBoundingClientRect().height;
-    node.scrollLeft = 30;
   });
   await page.waitForTimeout(80);
   await page.getByRole('button', { name: '后12小时', exact: true }).click();

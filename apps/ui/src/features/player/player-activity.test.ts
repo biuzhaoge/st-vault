@@ -32,6 +32,21 @@ it('hides immediately on leave and cancels deadlines on disposal', () => {
   expect(visible).toHaveBeenLastCalledWith(true);
 });
 
+it('gives a touch wake time to aim at a control without changing the mouse timeout', () => {
+  vi.useFakeTimers();
+  const visible = vi.fn();
+  const activity = new PlayerActivity(visible);
+  activity.wake(2400);
+  vi.advanceTimersByTime(2399);
+  expect(visible).toHaveBeenLastCalledWith(true);
+  vi.advanceTimersByTime(1);
+  expect(visible).toHaveBeenLastCalledWith(false);
+  activity.wake();
+  vi.advanceTimersByTime(1000);
+  expect(visible).toHaveBeenLastCalledWith(false);
+  activity.dispose();
+});
+
 it('holds visibility over interactive regions and starts a fresh idle deadline after leaving', () => {
   vi.useFakeTimers();
   const visible = vi.fn();

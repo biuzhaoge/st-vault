@@ -2,6 +2,7 @@ import { afterEach, expect, it } from 'vitest';
 import { setTimeZone, dayStart, calendarSlot, slotTime } from './time';
 import { dayKey, clockLabel } from './date-label';
 import {
+  calendarEnd,
   calendarWindow,
   moveWindow,
   restoreViewWindow,
@@ -35,6 +36,8 @@ it.each([
   expect(rulerDays(start, end)).toHaveLength(1);
   const noon = slotTime(calendarSlot(start) + 1);
   expect(clockLabel(noon)).toBe('12:00:00');
+  expect(calendarEnd(start + 3600000)).toBe(end);
+  expect(calendarEnd(noon)).toBe(end);
   expect(moveWindow(view, 1, first, end + DAY_MS).fromMs).toBe(noon);
 });
 it('preserves seven calendar days across the fall-back week', () => {

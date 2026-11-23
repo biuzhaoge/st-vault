@@ -48,10 +48,6 @@ export function messageFor(error: unknown): string {
       ),
       account_sync_unavailable: tr('本地加密凭据暂不可用，请检查状态目录权限或重新连接。'),
       account_library_changed: tr('媒体库已更换，请断开账户后重新连接。'),
-      account_sync_https_required: tr(
-        '公网地址发送登录凭据必须使用 HTTPS；局域网私有 IP 和 localhost 可使用 HTTP。',
-      ),
-      keys_https_required: tr('请通过 HTTPS 或受信任的局域网地址管理密钥。'),
       invalid_request: tr('提交内容无效，请检查输入后重试。'),
       subject_not_found: tr('主播目录已变化，请刷新后重试。'),
       archive_unavailable: tr('归档暂不可用，请稍后重试。'),

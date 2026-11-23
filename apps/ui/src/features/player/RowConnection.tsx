@@ -7,7 +7,7 @@ import {
   useSyncExternalStore,
   type RefObject,
 } from 'react';
-import type { RowAnchorStore } from './row-anchor';
+import type { RowAnchor, RowAnchorStore } from './row-anchor';
 import { Icon } from '../../design/Icon';
 import { connectionGeometry } from './connection-geometry';
 import { createPortal } from 'react-dom';
@@ -36,7 +36,13 @@ export function RowConnection({
     document.addEventListener('fullscreenchange', update);
     return () => document.removeEventListener('fullscreenchange', update);
   }, []);
-  const [geometry, setGeometry] = useState<ReturnType<typeof connectionGeometry> | null>(null);
+  const [geometry, setGeometry] = useState<
+    | (ReturnType<typeof connectionGeometry> & {
+        offscreen: RowAnchor['offscreen'];
+        attached: boolean;
+      })
+    | null
+  >(null);
   // The workspace is an ancestor ref: subscribe after the whole commit, when
   // that ref is attached, rather than abandoning setup in a child layout effect.
   useEffect(() => {
@@ -44,6 +50,7 @@ export function RowConnection({
       setGeometry(null);
       return;
     }
+    const workspaceElement = workspace.current;
     let frameId: number | undefined;
     const measure = (): void => {
       frameId = undefined;
@@ -55,34 +62,39 @@ export function RowConnection({
       const box = (fullscreenTarget ?? rail.current)?.getBoundingClientRect();
       const frame = (fullscreenTarget ?? viewer.current)?.getBoundingClientRect();
       if (!box || !frame) return;
-      const viewport = workspace.current
-        ?.querySelector('.track-table-scroll')
-        ?.getBoundingClientRect();
-      const moving = workspace.current?.querySelector('[data-row-motion="true"]');
-      const row = (
-        moving?.querySelector('.track-row-motion-ghost.selected') ??
-        workspace.current?.querySelector('.track-row.selected')
-      )?.getBoundingClientRect();
-      const target = viewport
-        ? moving && row
-          ? Math.max(viewport.top + 7, Math.min(viewport.bottom - 7, row.top + row.height / 2))
-          : anchor.offscreen === 'below'
-            ? viewport.bottom - 7
-            : anchor.offscreen
-              ? viewport.top + 7
-              : row
-                ? Math.max(
-                    viewport.top + 7,
-                    Math.min(viewport.bottom - 7, row.top + row.height / 2),
-                  )
-                : anchor.y
-        : anchor.y;
-      const next = connectionGeometry(
-        box,
-        { right: frame.right - 16, top: frame.top + 16, height: 0 },
-        target,
+      const scroller = workspaceElement.querySelector<HTMLElement>('.track-table-scroll');
+      const viewport = scroller?.getBoundingClientRect();
+      const viewportBottom = viewport && scroller ? viewport.top + scroller.clientHeight : 0;
+      const row =
+        scroller?.querySelector('.track-row-motion-ghost.selected') ??
+        scroller?.querySelector('.track-row.selected');
+      const node = row?.querySelector('.record-button') ?? row?.querySelector('.track-cover-wrap');
+      const coverPort = node?.getBoundingClientRect();
+      const targetY = coverPort ? coverPort.top + coverPort.height / 2 : anchor.y;
+      let offscreen = anchor.offscreen;
+      if (coverPort && viewport && offscreen !== 'filtered') {
+        offscreen = targetY < viewport.top ? 'above' : targetY >= viewportBottom ? 'below' : null;
+      }
+      const attached = !offscreen && !!coverPort;
+      let y = targetY;
+      if (viewport && offscreen) y = offscreen === 'below' ? viewportBottom - 7 : viewport.top + 7;
+      const next = {
+        ...connectionGeometry(
+          box,
+          { right: frame.right - 16, top: frame.top + 16, height: 0 },
+          y,
+          attached ? coverPort?.left : undefined,
+        ),
+        offscreen,
+        attached,
+      };
+      setGeometry((current) =>
+        current?.route === next.route &&
+        current.offscreen === offscreen &&
+        current.attached === attached
+          ? current
+          : next,
       );
-      setGeometry((current) => (current?.route === next.route ? current : next));
     };
     const schedule = (): void => {
       frameId ??= window.requestAnimationFrame(measure);
@@ -95,7 +107,6 @@ export function RowConnection({
     observer.observe(workspace.current);
     window.addEventListener('resize', schedule);
     window.addEventListener('scroll', schedule, true);
-    const workspaceElement = workspace.current;
     workspaceElement.addEventListener('stv-row-motion', schedule);
     return () => {
       unsubscribe();
@@ -124,17 +135,17 @@ export function RowConnection({
           <svg
             className="row-connection"
             aria-label={tr('{{v0}} 播放连接', { v0: name })}
-            data-offscreen={anchor.offscreen ?? 'visible'}
+            data-offscreen={geometry.offscreen ?? 'visible'}
           >
             <title>{name}</title>
             <path className="connection-bus" d={geometry.route} />
             <path className="connection-signal" d={geometry.route} />
-            <circle cx={geometry.endX} cy={geometry.endY} r="2" />
-            {(anchor.offscreen === 'above' || anchor.offscreen === 'below') && (
+            {!geometry.attached && <circle cx={geometry.endX} cy={geometry.endY} r="2" />}
+            {(geometry.offscreen === 'above' || geometry.offscreen === 'below') && (
               <path
                 className="connection-arrow"
                 d={
-                  anchor.offscreen === 'below'
+                  geometry.offscreen === 'below'
                     ? `M ${geometry.endX - 7} ${geometry.endY - 6} l 4 5 4 -5`
                     : `M ${geometry.endX - 7} ${geometry.endY + 6} l 4 -5 4 5`
                 }

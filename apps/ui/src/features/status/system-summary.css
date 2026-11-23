@@ -27,11 +27,73 @@
 .system-summary .panel-status-row {
   min-block-size: 22px;
 }
+.system-summary .panel-row-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25em;
+}
+.status-help {
+  display: inline-flex;
+}
+.status-help-trigger {
+  display: grid;
+  place-items: center;
+  inline-size: 1em;
+  block-size: 1.5em;
+  padding: 0;
+  border: 0;
+  color: inherit;
+  background: none;
+}
+.status-help-trigger:focus-visible {
+  outline-width: 1px;
+  outline-offset: 1px;
+}
+.status-help-trigger .ui-icon {
+  width: 1em;
+  height: 1em;
+}
+.status-help-popup {
+  display: none;
+  position: fixed;
+  inset: auto;
+  margin: 0;
+  inline-size: min(300px, calc(100vw - 24px));
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-field);
+  corner-shape: var(--corner-smooth);
+  box-shadow: var(--glass-shadow);
+  background: var(--glass-solid);
+  color: var(--ink);
+  font-size: 12px;
+  line-height: 1.5;
+  text-align: start;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+.status-help-popup:popover-open {
+  display: block;
+}
+.toolbar-popover[data-state='closing'] .status-help-popup {
+  visibility: hidden;
+}
+.status-help-popup > small {
+  display: block;
+  margin-top: 5px;
+}
 .system-summary .panel-badge {
   flex: 0 1 auto;
   min-inline-size: 0;
   text-align: end;
   white-space: normal;
+}
+.system-summary .panel-badge.is-success {
+  color: var(--success);
+}
+.system-summary .panel-badge.is-busy,
+.system-summary .panel-status.is-checking .panel-badge {
+  color: var(--orange);
 }
 .system-summary .panel-badge.is-busy::before {
   display: none;
@@ -48,19 +110,24 @@
   gap: 4px;
   min-inline-size: 64px;
 }
-.system-summary .disk-track {
-  flex: none;
-  inline-size: 40px;
-  block-size: 4px;
-  border-radius: var(--radius-pill);
-  background: var(--line);
+.system-summary .panel-badge:has(> .disk-capacity) {
+  padding: 0;
   overflow: hidden;
+  background: transparent;
 }
-.system-summary .disk-track > span {
-  display: block;
-  block-size: 100%;
-  background: var(--success);
+.system-summary .panel-badge:has(> .disk-capacity)::before {
+  display: none;
 }
-.system-row.is-warning .disk-track > span {
-  background: currentColor;
+.system-summary .disk-capacity {
+  min-inline-size: 104px;
+  padding: 2px 8px;
+  border-radius: inherit;
+  outline: 1px solid color-mix(in srgb, currentColor 48%, transparent);
+  outline-offset: -1px;
+  white-space: nowrap;
+  background-image: linear-gradient(
+    90deg,
+    color-mix(in srgb, currentColor 34%, transparent) var(--disk-used),
+    transparent var(--disk-used)
+  );
 }

@@ -2,7 +2,7 @@
 
 [简体中文](SECURITY.md) · **English**
 
-ST-Vault is a personal, single-administrator application, not a multi-tenant service, and has not undergone an independent security audit. Limit access to the local host or trusted networks; use HTTPS and restrict remote entry points.
+ST-Vault is a personal, single-administrator application. Limit access to the local host or trusted networks.
 
 ## Authentication and credentials
 
@@ -11,15 +11,15 @@ ST-Vault is a personal, single-administrator application, not a multi-tenant ser
 - Administrator sessions use HttpOnly, SameSite=Strict cookies with a default seven-day lifetime. Logout revokes the current client's session. The local PIN and site account are independent.
 - Site login, one-time codes and human verification happen in the user's own browser. Only exported cookies are pasted; ST-Vault does not accept site passwords or replace verification.
 - Cookies are used only for account information and the following list. Status, HLS and media requests are anonymous and grant no private/paid-content access.
-- Saved cookies and manual keys use purpose-separated AES-256-GCM encryption, with the master key under data/private. Routine status APIs do not return saved values. Only an explicit administrator disconnect returns the former cookies once in a non-cacheable HTTPS/private-LAN-IP/loopback response for reconnecting. Cookie drafts are stored unencrypted in localStorage for this browser and ST-Vault origin, surviving reloads and local administrator logout until manually cleared or the site changes. Use a trusted browser profile; clearing browser data also removes drafts. Disconnecting deletes credentials, archives broadcasters and stops recording while retaining media.
+- Saved cookies and manual keys use purpose-separated AES-256-GCM encryption, with the master key under data/private. Routine status APIs do not return saved values. An explicit administrator disconnect returns the former cookies once in a non-cacheable response for reconnecting. Cookie drafts are stored unencrypted in localStorage for this browser and ST-Vault origin, surviving reloads and local administrator logout until manually cleared or the site changes. Use a trusted browser profile. Clearing browser data also removes drafts. Disconnecting deletes credentials, archives broadcasters and stops recording while retaining media.
 
-Compose binds 127.0.0.1:10002 by default. Public IPs and DNS names require HTTPS. Private LAN IPs allow HTTP, exposing PINs, cookies and sessions in plaintext; use only on a trusted LAN. Reverse proxies must preserve Host and support SSE. `STV_SECURE_COOKIE=1` does not create certificates or TLS and cannot substitute for encrypted transport.
+The app serves HTTP by default, with Compose publishing port 10002 on all host interfaces. HTTP sends PINs, cookies, keys, and sessions in plaintext. Use a firewall to restrict access. If you terminate TLS at your own reverse proxy, preserve the browser-facing Host and support SSE. Same-origin browser authentication over HTTPS sets `Secure` on session cookies.
 
 ## Storage boundaries
 
 PostgreSQL listens only on an application-private Unix socket; port 5432 is not mapped. Database storage must be reliable and local, not SMB/NFS. Only one instance may write a library. State directories and backups include sensitive settings and need restricted permissions. Anyone controlling the host or application process can still access data; media has no application-level encryption at rest.
 
-Stop writes before backing up complete data and media. Moving only media can rebuild indexes for browsing and management, but does not restore PINs, cookies or private keys; initialize them again. Do not copy isolated PostgreSQL tables, WAL fragments or a single journal as a complete backup. See the [user guide](../README.en.md#backups-recovery-and-updates).
+Stop writes before backing up all of `data` (including PostgreSQL) and `media`. Include the database volume if it is mounted separately. Moving only media can rebuild indexes for browsing and management, but does not restore PINs, cookies or private keys; initialize them again. Do not copy isolated PostgreSQL tables, WAL fragments or a single journal as a complete backup. See the [user guide](../README.en.md#backups-recovery-and-updates).
 
 Shorter retention and manual deletion permanently reclaim media. Favorites protect automatic retention cleanup, not explicit manual deletion. Space thresholds, retries and recovery do not replace backups or guarantee uninterrupted recording on every system/network.
 

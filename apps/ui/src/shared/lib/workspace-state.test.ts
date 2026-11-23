@@ -9,7 +9,7 @@ it('retains a connection and list anchor across reloads, isolated by installatio
     removeItem: (key: string) => storage.delete(key),
   });
   const value: WorkspaceState = {
-    list: { id: 'stripchat:210', offset: 17, left: 0 },
+    list: { id: 'stripchat:210', offset: 17 },
     playback: {
       subjectId: 'stripchat:42',
       kind: 'archive',
@@ -62,7 +62,7 @@ it('retains media and list coordinates without trusting an unspecified view lock
   vi.stubGlobal('sessionStorage', {
     getItem: () =>
       JSON.stringify({
-        list: { id: '42', offset: 12, left: 0 },
+        list: { id: '42', offset: 12, left: 50 },
         playback: {
           subjectId: '42',
           kind: 'archive',
@@ -73,7 +73,7 @@ it('retains media and list coordinates without trusting an unspecified view lock
       }),
   });
   const saved = readWorkspace('key');
-  expect(saved.list?.offset).toBe(12);
+  expect(saved.list).toEqual({ id: '42', offset: 12 });
   expect(saved.playback).toEqual({
     subjectId: '42',
     kind: 'archive',

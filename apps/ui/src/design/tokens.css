@@ -3,6 +3,8 @@
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans SC', sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
   --ink: #f5f5f5;
   --muted: #c0c0c0;
   --subtle: #bcbcbc;
@@ -13,6 +15,7 @@
   --input: #171717;
   --accent: #df2c41;
   --accent-hover: #ff7888;
+  --favorite: #f58ac7;
   --success: #72dab3;
   --orange: #ff995c;
   --private: #e9d779;
@@ -24,6 +27,7 @@
   --glass-highlight: linear-gradient(135deg, #ffffff16, #ffffff03 45%, #cdcdcd09);
   --glass-shadow: inset 0 1px 0 #ffffff24, inset 0 -1px 0 #ffffff08, 0 8px 22px #07070732;
   --glass-blur: blur(22px) saturate(145%);
+  --glass-track-base: #17171780;
   --glass-track-sheen: linear-gradient(
     180deg,
     #ffffff58,
@@ -42,6 +46,8 @@
     #ffffff16
   );
   --glass-track-edge: inset 0 1px #ffffff40, inset 0 -1px #00000038;
+  --status-rail-share: calc(1 / 6);
+  --timeline-rail-gap: 4px;
   --segment-track-fill: linear-gradient(#ffffff0d, #ffffff05);
   --segment-track-shadow: inset 0 0 0 1px #ffffff16;
   --segment-hover-fill: #ffffff12;
@@ -58,8 +64,9 @@
   --motion-surface: 320ms;
   --motion-spring: cubic-bezier(0.16, 1.3, 0.35, 1);
   --motion-ease: cubic-bezier(0.2, 0.8, 0.2, 1);
-  --workspace-inset: 10px;
-  --workspace-gap: 8px;
-  --titlebar-height: 44px;
+  --workspace-inset: clamp(8px, 1.2vmin, 10px);
+  --workspace-gap: clamp(6px, 1vmin, 8px);
+  --navigation-height: clamp(30px, 3.8vmin, 34px);
+  --titlebar-height: calc(var(--navigation-height) + 10px);
   --surface-outline: inset 0 0 0 1px #d7d7d712;
 }

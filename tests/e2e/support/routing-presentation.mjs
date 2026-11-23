@@ -44,8 +44,8 @@ export async function verifyRoutingPresentation(page, options) {
         })),
       );
     let items = await read();
-    assert.match(await options.locator('.routing-toolbar .text-button').textContent(), /1\/4/);
-    assert.match(await options.locator('.routing-toolbar .text-button').textContent(), /测速中/);
+    const probe = options.locator('.routing-probe');
+    assert.match(await probe.getAttribute('aria-label'), /测速中.*1\/4/);
     const selected = options.locator('.routing-item[aria-pressed="true"]');
     assert.match(await selected.textContent(), /stripchat\.org/);
     assert.equal(await selected.count(), 1);
@@ -75,7 +75,7 @@ export async function verifyRoutingPresentation(page, options) {
       .evaluate((node) => node.getBoundingClientRect().height);
     assert(height <= 128, `Route list too tall: ${height}`);
     items = await read();
-    assert.match(await options.locator('.routing-toolbar .text-button').textContent(), /3\/4/);
+    assert.match(await probe.getAttribute('aria-label'), /测速中.*3\/4/);
     assert.match(await selected.textContent(), /stripchat\.org/);
     assert(items[0].tone.includes('is-good'));
   } finally {

@@ -1,6 +1,6 @@
 import { lstat, mkdir, open, realpath } from 'node:fs/promises';
 import path from 'node:path';
-import { subjectImagePath } from './paths.js';
+import { subjectImagePath, type SubjectImageKind } from './paths.js';
 import { AtomicDerivativeWriter } from '../previews/atomic-derivative.js';
 import { DerivativeDiagnostics, ioCode } from '../previews/derivative-diagnostics.js';
 import { MediaBudget } from '../provider/media-budget.js';
@@ -14,7 +14,7 @@ export class LibraryImages {
   private closed = false;
   constructor(
     private readonly mediaRoot: string,
-    private readonly kind: 'cover' | 'avatar',
+    private readonly kind: SubjectImageKind,
     concurrency = 4,
   ) {
     this.budget = new MediaBudget(concurrency);
@@ -27,9 +27,9 @@ export class LibraryImages {
   }
   private filename(key: string): string {
     const match =
-      this.kind === 'cover'
-        ? /^cover:([1-9]\d*)$/.exec(key)
-        : /^avatar:stripchat:([1-9]\d*)$/.exec(key);
+      this.kind === 'avatar'
+        ? /^avatar:stripchat:([1-9]\d*)$/.exec(key)
+        : /^cover:([1-9]\d*)$/.exec(key);
     if (!match) throw Error('INVALID_IMAGE_KEY');
     return subjectImagePath(this.mediaRoot, `stripchat:${match[1]}`, this.kind);
   }

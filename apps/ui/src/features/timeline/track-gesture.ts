@@ -15,6 +15,7 @@ interface Start {
   at: number;
   width: number;
   scrollTop: number;
+  nativeScroll?: boolean;
   window: ViewWindow;
   selection: ViewWindow;
   edge: string | null;
@@ -40,6 +41,9 @@ export class TrackGestureSession {
   get mode(): TrackGesture | null {
     return this.direction;
   }
+  get selecting(): boolean {
+    return this.direction === 'selection' && !this.start.preview;
+  }
   compensateScroll(delta: number): void {
     if (this.direction === 'scroll') this.scrollTop += delta;
   }
@@ -63,18 +67,16 @@ export class TrackGestureSession {
   move(x: number, y: number, now: number): Motion {
     if (!this.active) return { kind: 'idle' };
     this.direction ??= trackGesture(x - this.start.x, y - this.start.y);
-    if (this.direction === 'scroll')
+    if (this.direction === 'scroll' && !this.start.nativeScroll)
       return { kind: 'scroll', top: this.scrollTop - (y - this.start.y) };
-    if (this.direction === 'selection' && !this.start.preview)
-      return { kind: 'selection', range: this.rangeAt(x, now) };
+    if (this.selecting) return { kind: 'selection', range: this.rangeAt(x, now) };
     return { kind: 'idle' };
   }
   finish(x: number, now: number): Completion {
     if (!this.active) return { kind: 'none' };
     this.active = false;
     if (!this.direction && this.start.preview) return { kind: 'choose' };
-    const range =
-      this.direction === 'selection' && !this.start.preview ? this.rangeAt(x, now) : null;
+    const range = this.selecting ? this.rangeAt(x, now) : null;
     return range ? { kind: 'selection', range } : { kind: 'none' };
   }
   cancel(): void {

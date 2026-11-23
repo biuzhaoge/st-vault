@@ -77,14 +77,20 @@ foreach ($mode in @('graceful', 'database-failure')) {
   try {
     $dataVolume = 'st-vault-lifecycle-data-' + [guid]::NewGuid().ToString('N')
     $mediaVolume = 'st-vault-lifecycle-media-' + [guid]::NewGuid().ToString('N')
-    foreach ($volume in @($dataVolume, $mediaVolume)) {
+    $volumes = @($dataVolume, $mediaVolume)
+    if ($mode -eq 'database-failure') {
+      $postgresVolume = 'st-vault-lifecycle-pg-' + [guid]::NewGuid().ToString('N')
+      $volumes += $postgresVolume
+    }
+    foreach ($volume in $volumes) {
       Invoke-Docker @('volume', 'create', '--label', 'io.st-vault.test=lifecycle', $volume) | Out-Null
       $ownedVolumes += $volume
     }
     $run = New-IsolatedRun $container
-    $run += @(
-      '--mount', "type=volume,source=$dataVolume,target=/data", '--mount', "type=volume,source=$mediaVolume,target=/media")
-    if ($mode -eq 'database-failure') { $run += @('--env', 'STV_RUNTIME_UID=12345', '--env', 'STV_RUNTIME_GID=23456') }
+    $run += @('--mount', "type=volume,source=$dataVolume,target=/data", '--mount', "type=volume,source=$mediaVolume,target=/media")
+    if ($mode -eq 'database-failure') {
+      $run += @('--mount', "type=volume,source=$postgresVolume,target=/data/postgres", '--env', 'STV_RUNTIME_UID=12345', '--env', 'STV_RUNTIME_GID=23456')
+    }
     $run += $Image
     Invoke-Docker $run | Out-Null
     $owned = $true
@@ -121,7 +127,7 @@ foreach ($mode in @('graceful', 'database-failure')) {
         throw "Crash recovery shutdown failed: $(Invoke-Docker @('logs', $container))"
       }
     }
-    Write-Output "Embedded PostgreSQL lifecycle passed: $mode, memory limit $($service.mem_limit) bytes."
+    Write-Output "Embedded PostgreSQL lifecycle passed: $mode."
   } finally {
     if ($owned) { Invoke-Docker @('rm', '--force', $container) | Out-Null }
     foreach ($volume in $ownedVolumes) { Invoke-Docker @('volume', 'rm', $volume) | Out-Null }

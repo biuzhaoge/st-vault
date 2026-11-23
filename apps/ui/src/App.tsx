@@ -38,10 +38,7 @@ import { loadPlayerEngine } from './features/player/player-engine';
 import { requestNotice, type PlaybackNotice } from './features/player/player-status';
 import { playbackWindow, REPLAY_SPAN_MS, replayWindow } from './features/player/replay-window';
 import { SnapshotGrid } from './features/snapshots/SnapshotGrid';
-import {
-  deletionAffectsPlayback,
-  type MediaDeletionEvent,
-} from './features/snapshots/media-deletion';
+import { deletionOverlaps, type MediaDeletionEvent } from './features/snapshots/media-deletion';
 import { systemHealthStatus } from './features/status/display';
 import { TrackBoard } from './features/timeline/TrackBoard';
 import {
@@ -140,6 +137,11 @@ export default function App(): JSX.Element {
   const timelineStartMs = session?.timelineStartMs ?? timelineStartFallback.current;
   const [selectionEndMs, setSelectionEndMs] = useState<number | null>(null);
   const [selectionDurationMs, setSelectionDurationMs] = useState(REPLAY_SPAN_MS);
+  const [deletionReselection, setDeletionReselection] = useState<{
+    subjectId: string;
+    controller: AbortController;
+  } | null>(null);
+  const rangeIntent = useRef(0);
   const hasSelection = selectionEndMs !== null;
   const [broadcast, setBroadcast] = useState<{
     id: string;
@@ -564,8 +566,13 @@ export default function App(): JSX.Element {
     subject: Subject,
     next: ViewWindow,
     signal?: AbortSignal,
+    resumeAt?: number,
   ): Promise<ViewWindow | null> {
+    const reselecting = resumeAt !== undefined;
+    if (!reselecting) rangeIntent.current++;
+    const intent = rangeIntent.current;
     const controller = coordinator.begin('range');
+    if (reselecting) setDeletionReselection({ subjectId: subject.id, controller });
     const cancel = (): void => controller.abort();
     signal?.addEventListener('abort', cancel, { once: true });
     if (signal?.aborted) cancel();
@@ -574,21 +581,26 @@ export default function App(): JSX.Element {
         `/api/subjects/${encodeURIComponent(subject.id)}/recording-bounds?from=${Math.round(next.fromMs)}&to=${Math.round(next.toMs)}`,
         { signal: controller.signal },
       );
-      if (
-        controller.signal.aborted ||
-        !coordinator.owns('range', controller) ||
-        value.fromMs === null ||
-        value.toMs === null
-      )
+      if (!coordinator.owns('range', controller) || rangeIntent.current !== intent) return null;
+      if (value.fromMs === null || value.toMs === null) {
+        if (reselecting) closePlayer();
         return null;
+      }
       const range = { fromMs: value.fromMs, toMs: value.toMs };
       coordinator.settled('range', controller);
       applyRange(range);
-      void open(subject, range.fromMs, range, { intent: 'select' });
+      const target = Math.max(range.fromMs, Math.min(range.toMs - 1, resumeAt ?? range.fromMs));
+      void open(subject, target, range, {
+        intent: 'select',
+        preserveWindow: reselecting,
+        reselecting,
+      });
       return range;
     } finally {
       signal?.removeEventListener('abort', cancel);
       coordinator.settled('range', controller);
+      if (reselecting)
+        setDeletionReselection((current) => (current?.controller === controller ? null : current));
     }
   }
   async function open(
@@ -600,7 +612,7 @@ export default function App(): JSX.Element {
       restoring?: boolean;
       preserveWindow?: boolean;
       intent?: 'select' | 'seek';
-      resolved?: PlaybackResponse;
+      reselecting?: boolean;
       unitId?: string;
     } = {},
   ): Promise<void> {
@@ -613,7 +625,7 @@ export default function App(): JSX.Element {
       utc === undefined ? requestedRange : playbackWindow(utc, requestedRange, timelineStartMs);
     coordinator.cancel('range');
     if (
-      !options.resolved &&
+      !options.reselecting &&
       !restart &&
       utc !== undefined &&
       selectedIdRef.current === subject.id &&
@@ -645,7 +657,8 @@ export default function App(): JSX.Element {
       setSelectionEndMs(range.toMs);
       setSelectionDurationMs(range.toMs - range.fromMs);
       selectionRef.current = range;
-      updateSnapshotReference(subject.id, utc);
+      setBroadcast(null);
+      setSnapshotReference(Math.round(utc));
     } else if (changingSubject) {
       setSelectionEndMs(null);
       setSelectionDurationMs(REPLAY_SPAN_MS);
@@ -683,17 +696,16 @@ export default function App(): JSX.Element {
           kind: 'archive',
           subject,
           unitId: options.unitId,
-          playback:
-            options.resolved ??
-            (await request<PlaybackResponse>('/api/playback', {
-              method: 'POST',
-              operation: 'session',
-              headers: { 'content-type': 'application/json' },
-              body: JSON.stringify(
-                archiveRequest(subject.id, utc, following ? null : range, options.unitId),
-              ),
-              signal: controller.signal,
-            })),
+          playback: await request<PlaybackResponse>('/api/playback', {
+            method: 'POST',
+            operation: 'session',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              ...archiveRequest(subject.id, utc, following ? null : range, options.unitId),
+              ...(options.reselecting ? { gapPolicy: 'next-or-previous' } : {}),
+            }),
+            signal: controller.signal,
+          }),
         };
       }
       if (!coordinator.adopt(version, controller.signal, result)) return;
@@ -704,7 +716,8 @@ export default function App(): JSX.Element {
           setSelectionEndMs(actualRange.toMs);
           setSelectionDurationMs(actualRange.toMs - actualRange.fromMs);
         } else if (selecting) applyRange(preserveWindow ? range : actualRange);
-        if (!following) updateSnapshotReference(subject.id, result.playback.actualAtMs);
+        if (!following && !selecting)
+          updateSnapshotReference(subject.id, result.playback.actualAtMs);
         setTargetMs(
           result.playback.actualAtMs,
           options.unitId ??
@@ -714,6 +727,8 @@ export default function App(): JSX.Element {
     } catch (cause) {
       if (controller.signal.aborted || version !== coordinator.stamp()) return;
       if (cause instanceof ApiError && cause.status === 401) handleUnauthorized();
+      else if (options.reselecting && cause instanceof ApiError && cause.message === 'coverage_gap')
+        closePlayer();
       else setPlayerNotice(requestNotice(cause, utc === undefined));
     } finally {
       if (version === coordinator.stamp()) setPlayBusy(false);
@@ -785,113 +800,63 @@ export default function App(): JSX.Element {
     }
   }
   const deletionRecovery = useRef<{
-    commandId: string | undefined;
+    commandId: string;
+    window: ViewWindow;
     at: number;
     stamp: number;
+    intent: number;
+    suspended: boolean;
   } | null>(null);
   function onMediaDeletion(event: MediaDeletionEvent): void {
-    if (event.subjectId === selectedIdRef.current && event.knownEmpty) {
-      closePlayer();
-      return;
-    }
-    // Optimistic projection can already trim the removed edge from the visible
-    // range. Its owned recovery still needs the durable acceptance to resume.
-    const recovering =
-      deletionRecovery.current?.commandId === event.commandId &&
-      deletionRecovery.current?.stamp === coordinator.stamp();
-    const window =
-      !hasSelection && source?.kind === 'archive'
-        ? archiveRange(source.playback, selectionRef.current)
-        : selectionRef.current;
+    const recovery =
+      deletionRecovery.current?.commandId === event.commandId ? deletionRecovery.current : null;
+    if (recovery) deletionRecovery.current = null;
+    if (selected?.id !== selectedIdRef.current) return;
+    const { fromMs, toMs } = event.plan;
+    const range =
+      recovery?.window ??
+      (event.optimisticRanges && fromMs !== null && toMs !== null
+        ? { fromMs, toMs }
+        : selectionRef.current);
+    if (!deletionOverlaps(event, selected.id, range)) return;
     if (
-      !selected ||
-      (!recovering &&
-        !deletionAffectsPlayback(event, {
-          subjectId: selectedIdRef.current,
-          kind: playBusy ? playbackKind.current : (source?.kind ?? playbackKind.current),
-          range: window,
-        }))
+      recovery &&
+      (!coordinator.current(recovery.stamp) || recovery.intent !== rangeIntent.current)
     )
       return;
-    const owner = selected;
-    if (event.optimisticRanges) {
-      const at =
-        playbackClock.snapshot() ??
-        (source?.kind === 'archive' ? source.playback.actualAtMs : window.fromMs);
-      if (event.optimisticRanges.some((range) => range.fromMs <= at && range.toMs > at)) {
-        player.current?.stop();
-        invalidatePlayback(true);
-        setSource(null);
-        setTargetMs(null);
-        setPlayBusy(false);
-        deletionRecovery.current = { commandId: event.commandId, at, stamp: coordinator.stamp() };
+    const stamp = coordinator.stamp();
+    const intent = rangeIntent.current;
+    const at = recovery?.at ?? playbackClock.snapshot() ?? range.fromMs;
+    if (event.optimisticRanges && event.commandId) {
+      if (event.knownEmpty) {
+        closePlayer();
+        return;
       }
+      const suspended =
+        playbackKind.current === 'archive' &&
+        event.optimisticRanges.some(({ fromMs, toMs }) => fromMs <= at && at < toMs);
+      if (suspended) player.current?.suspend();
+      deletionRecovery.current = {
+        commandId: event.commandId,
+        window: range,
+        at,
+        stamp,
+        intent,
+        suspended,
+      };
       return;
     }
-    const recovery = deletionRecovery.current;
-    const recoveryAt =
-      recovery?.commandId === event.commandId && recovery?.stamp === coordinator.stamp()
-        ? recovery.at
-        : null;
-    const target =
-      recoveryAt ??
-      playbackClock.snapshot() ??
-      (source?.kind === 'archive' ? source.playback.actualAtMs : window.fromMs);
-    player.current?.suspend();
-    invalidatePlayback(true);
-    if (recoveryAt !== null && deletionRecovery.current)
-      deletionRecovery.current.stamp = coordinator.stamp();
-    setBroadcast(null);
-    setPlayBusy(true);
-    const version = coordinator.stamp();
-    const controller = coordinator.begin('range');
-    void request<PlaybackResponse>('/api/playback', {
-      method: 'POST',
-      operation: 'session',
-      signal: controller.signal,
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({
-        ...archiveRequest(owner.id, target, hasSelection ? window : null),
-        gapPolicy: 'next-or-previous',
-      }),
-    })
-      .then(async (playback) => {
-        if (
-          !coordinator.adopt(version, controller.signal, {
-            kind: 'archive',
-            subject: owner,
-            playback,
-          })
-        )
-          return;
-        const next = archiveRange(playback, window);
-        if (hasSelection) applyRange(next);
-        // The same server resolution supplies the range, surviving cursor and
-        // playlist. Keep the paused decoded frame until its replacement is ready.
-        await open(owner, playback.actualAtMs, next, {
-          preserveWindow: true,
-          resolved: playback,
-          intent: 'seek',
-        });
-      })
-      .catch((cause) => {
-        if (controller.signal.aborted || version !== coordinator.stamp()) return;
-        player.current?.stop();
-        setSource(null);
-        setTargetMs(null);
-        if (cause instanceof ApiError && cause.message === 'coverage_gap') {
-          // Release the complete playback owner, not just its range (which
-          // would otherwise fall back to live mode for the same subject).
-          closePlayer();
-        } else setPlayerNotice(requestNotice(cause, false));
-      })
-      .finally(() => {
-        if (version === coordinator.stamp()) setPlayBusy(false);
-        coordinator.settled('range', controller);
-      });
+    if (event.failed && !recovery?.suspended) return;
+    if (playbackKind.current === 'archive') player.current?.suspend();
+    void selectRange(selected, range, undefined, at).catch((cause: unknown) => {
+      if (!coordinator.current(stamp) || rangeIntent.current !== intent) return;
+      if (cause instanceof ApiError && cause.status === 401) handleUnauthorized();
+      else setPlayerNotice(requestNotice(cause, false));
+    });
   }
   function playSnapshot(at: number, range: ViewWindow, unitId: string): void {
     if (!selected) return;
+    rangeIntent.current++;
     if (source?.kind === 'archive' && player.current?.seek(at, true, unitId)) {
       setPlaybackNavigation((previous) => ({ id: previous.id + 1, atMs: at }));
       setTargetMs(at, unitId);
@@ -902,6 +867,7 @@ export default function App(): JSX.Element {
   }
   async function scrubPlayback(at: number): Promise<void> {
     if (!selected) return;
+    rangeIntent.current++;
     const owner = selected;
     await coordinator.scrub(
       at,
@@ -1048,7 +1014,7 @@ export default function App(): JSX.Element {
                 <ToolPopover
                   title={tr('密钥')}
                   icon="key"
-                  size="narrow"
+                  size="compact"
                   className={`key-tool${(keyInfo?.keyCount ?? 0) > 0 ? ' has-keys' : ''}${keyBusy ? ' is-busy' : ''}`}
                   busy={keyBusy}
                   open={tool === 'keys'}
@@ -1113,6 +1079,7 @@ export default function App(): JSX.Element {
                 onSession={onSnapshotSession}
                 onSeek={playSnapshot}
                 onDeletion={onMediaDeletion}
+                reselecting={deletionReselection?.subjectId === selectedId}
                 onJobs={setDeletionJobs}
                 jobSnapshot={
                   systemError ? null : system ? (system.deletionJobs ?? null) : undefined

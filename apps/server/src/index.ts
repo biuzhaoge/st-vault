@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { existsSync } from 'node:fs';
 import { closeRuntimeLogs } from './runtime/runtime-logs.js';
 import { mkdir, realpath, readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
@@ -133,7 +134,7 @@ try {
     provider: upstream,
     supervisor: { reconcile: () => supervisor?.reconcile() ?? Promise.resolve() },
     vault,
-    onImported: (ids) => previews?.warmCovers?.(ids),
+    onImported: (ids) => previews?.warmSubjectImages?.(ids),
   });
   const bindAccountSite = (): void =>
     sites.configure(
@@ -152,10 +153,13 @@ try {
     canGenerate: () => resources?.canRecord() ?? false,
   });
   const settings = (runtimeSettings = await SettingsStore.open(archive));
+  // Direct server runs can connect to a test database outside the application data directory.
+  const databaseRoot = path.join(root, 'postgres');
   resources = new ResourceMonitor({
     clock,
     root: mediaRoot,
     dataRoot: root,
+    databaseRoot: existsSync(databaseRoot) ? databaseRoot : undefined,
     archive,
     settings: settings.get,
     changed: () => {
@@ -247,7 +251,6 @@ try {
     live,
     backgroundTasks: () => [runEvents.backgroundTask()],
     ingressStats: () => sharedIngress.stats(),
-    secureCookie: process.env.STV_SECURE_COOKIE === '1',
     allowedOrigins: ['http://127.0.0.1:5174', 'http://localhost:5174'],
   });
   const onSignal = (): void => {

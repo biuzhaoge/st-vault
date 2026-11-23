@@ -224,22 +224,46 @@ try {
       frames: window.__trackRevealFrames,
     }));
     assert.deepEqual(result.ids, ids);
-    assert.ok(result.frames > 1, 'The viewport reveals over multiple frames');
+    if (ids.length > 1) assert.ok(result.frames > 1, 'New rows reveal over multiple frames');
   };
   const observeReveal = (waitForScroll) =>
     scroller.evaluate((node, wait) => {
       const order = (window.__trackRevealOrder = []);
       window.__trackRevealFrames = 0;
+      const interruptions = (window.__trackContinuityErrors = []);
+      const visibleRows = () => {
+        const viewport = node.getBoundingClientRect();
+        return [...node.querySelectorAll('.track-row')].filter((row) => {
+          const rect = row.getBoundingClientRect();
+          return rect.bottom > viewport.top && rect.top < viewport.bottom;
+        });
+      };
+      const retained = new Map(
+        wait
+          ? visibleRows().map((row) => [
+              row.dataset.subjectId,
+              row.querySelector('[data-track-state="ready"] .timeline-content'),
+            ])
+          : [],
+      );
       const frame = () => {
+        const visible = visibleRows();
+        for (const row of visible) {
+          const id = row.dataset.subjectId;
+          if (!retained.has(id)) continue;
+          const content = row.querySelector('[data-track-state="ready"] .timeline-content');
+          if (
+            content !== retained.get(id) ||
+            !content ||
+            Number(getComputedStyle(content).opacity) < 0.99
+          )
+            interruptions.push(id);
+        }
         if (node.dataset.scrolling === 'true') wait = false;
         else if (!wait) {
-          const viewport = node.getBoundingClientRect();
-          const visible = [...node.querySelectorAll('.track-row')].filter((row) => {
-            const rect = row.getBoundingClientRect();
-            return rect.bottom > viewport.top && rect.top < viewport.bottom;
-          });
+          const entering = visible.filter((row) => !retained.has(row.dataset.subjectId));
           const previousLength = order.length;
-          for (const row of visible) {
+          for (const row of entering) {
             const content = row.querySelector('[data-track-state="ready"] .timeline-content');
             if (
               content &&
@@ -249,18 +273,35 @@ try {
               order.push(row.dataset.subjectId);
           }
           if (order.length > previousLength) window.__trackRevealFrames++;
-          if (order.length >= visible.length) return;
+          if (order.length >= entering.length) return;
         }
         requestAnimationFrame(frame);
       };
       requestAnimationFrame(frame);
     }, waitForScroll);
   const beforeCachedArrival = await viewportIds();
+  await page.waitForFunction(
+    (ids) =>
+      ids.every((id) => {
+        const content = document.querySelector(
+          `.track-row[data-subject-id="${id}"] .timeline-content`,
+        );
+        return content && Number(getComputedStyle(content).opacity) === 1;
+      }),
+    beforeCachedArrival,
+  );
   await observeReveal(true);
   await visit(80);
   const cachedArrival = await viewportIds();
   assert.ok(cachedArrival.some((id) => beforeCachedArrival.includes(id)));
-  await assertRevealOrder(cachedArrival);
+  const entering = cachedArrival.filter((id) => !beforeCachedArrival.includes(id));
+  assert.ok(entering.length > 0, 'The partial scroll exposes at least one new row');
+  await assertRevealOrder(entering);
+  assert.deepEqual(
+    await page.evaluate(() => window.__trackContinuityErrors),
+    [],
+    'Rows that remain visible keep their loaded content fully visible during and after scrolling',
+  );
   await visit(0);
   timelineGate = new Promise((resolve) => {
     releaseTimeline = resolve;
@@ -362,6 +403,38 @@ try {
   const settledReads = timelineReads.slice(beforeScroll).flat();
   assert.ok(settledReads.length > 0 && settledReads.every((id) => visibleIds.includes(id)));
   assert.equal(await scroller.evaluate((node) => node.scrollTop), target);
+  const previousId = await scroller
+    .locator(`.track-row[data-subject-id="${visibleIds[0]}"]`)
+    .evaluate((row) => row.previousElementSibling?.dataset.subjectId);
+  assert.ok(previousId && !settledReads.includes(previousId));
+  firstTrackGate = {
+    id: previousId,
+    ready: new Promise((resolve) => {
+      releaseFirstTrack = resolve;
+    }),
+  };
+  await observeReveal(true);
+  await scroller.evaluate((node, top) => {
+    node.scrollTop = top;
+  }, target - 72);
+  const enteringLane = scroller.locator(`.track-row[data-subject-id="${previousId}"] .track-lane`);
+  await enteringLane.locator('.track-loading').waitFor();
+  const partialIds = await viewportIds();
+  assert.equal(partialIds[0], previousId);
+  for (const id of partialIds.slice(1)) {
+    assert.ok(visibleIds.includes(id));
+    assert.equal(
+      await scroller
+        .locator(`.track-row[data-subject-id="${id}"] .track-lane`)
+        .getAttribute('data-track-state'),
+      'ready',
+      'An uncached row above the viewport does not block previously displayed rows',
+    );
+  }
+  releaseFirstTrack();
+  await assertRevealOrder([previousId]);
+  assert.deepEqual(await page.evaluate(() => window.__trackContinuityErrors), []);
+  await visit(target);
   const rows = await page.locator('.track-row').evaluateAll((nodes) =>
     nodes.map((node) => ({
       height: Math.round(node.getBoundingClientRect().height),

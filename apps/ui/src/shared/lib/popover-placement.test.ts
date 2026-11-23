@@ -1,6 +1,17 @@
 import { expect, it } from 'vitest';
 import { popoverPlacement } from './popover-placement';
 
+it('fits a shifted visual viewport when the on-screen keyboard covers the layout viewport', () => {
+  const viewport = { width: 700, height: 270, left: 80, top: 40, layoutHeight: 800 };
+  const anchor = { left: 650, top: 250, bottom: 282 };
+  expect(popoverPlacement(anchor, { width: 340, height: 360 }, viewport)).toEqual({
+    side: 'above',
+    left: 428,
+    bottom: 558,
+    maxHeight: 190,
+  });
+});
+
 it('keeps the open panel attached to the same edge when refresh logs expand and shrink', () => {
   const anchor = { left: 200, top: 400, bottom: 430 };
   const viewport = { width: 1440, height: 900 };

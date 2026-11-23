@@ -25,11 +25,11 @@ Screenshots use synthetic test data.
 
 ![Site selection and the Cookies field in the Account panel](docs/assets/screenshots/account.png)
 
-**Live and replay in the same workspace.** Click a cover to watch a public stream. Enable automatic recording to save the highest available source quality. Select a recorded range and click an image to jump into it; short gaps remain visible, while long gaps are compressed.
+**Live and replay in the same workspace.** Click a cover to watch a public stream. Enable automatic recording to save the highest available source quality. Select a recorded range and click an image to jump into it. Short gaps remain visible and long gaps are compressed. Hover over a thumbnail to see its recording's start and end times.
 
 ![Recording playback and current playback position](docs/assets/screenshots/playback.png)
 
-**Keep the moments you like.** A heart protects the corresponding complete recording unit from retention cleanup. The toolbar offers “Unlike all” and “Delete unliked” for the entire current time range, including other pages; use each thumbnail’s heart to toggle its favorite. Progress appears in the status panel; refreshing or closing the browser does not cancel accepted deletion jobs.
+**Keep the moments you like.** Use the heart in the top-left corner of a thumbnail to favorite or unfavorite its recording unit. A favorite protects the whole unit from retention cleanup. “Unlike all” and “Delete unliked” apply to the entire current time range, including other pages. Progress appears in the status panel. Refreshing or closing the browser does not cancel accepted deletion jobs.
 
 ![Fullscreen playback with the screenshot management sidebar](docs/assets/screenshots/fullscreen.png)
 
@@ -49,15 +49,12 @@ services:
   app:
     image: biuzhaoge/st-vault:latest
     ports:
-      - '127.0.0.1:10002:10002'
+      - '10002:10002'
     volumes:
       - ./data:/data
       - ./media:/media
-    mem_limit: 2g
-    init: true
     restart: unless-stopped
     stop_grace_period: 180s
-    logging: { driver: local }
 ```
 
 ```sh
@@ -70,26 +67,27 @@ Run this from the deployment directory on your NAS or Linux host. Recordings and
 
 ```sh
 docker run -d --name st-vault --restart unless-stopped \
-  -p 127.0.0.1:10002:10002 --memory 2g \
+  -p 10002:10002 --stop-timeout 180 \
   -v "$PWD/data:/data" -v "$PWD/media:/media" \
-  --init --stop-timeout 180 --log-driver local \
   biuzhaoge/st-vault:latest
 ```
 
+Open `http://NAS-address:10002` after starting, or <http://127.0.0.1:10002> on the host. HTTP sends PINs, sessions, and credentials in plaintext. The default port mapping listens on all host interfaces. Use your firewall to limit access to a trusted LAN, and keep port 10002 off the public internet. Use your own VPN if you need remote access.
+
 ### Change settings as needed
 
-- **LAN access.** The default URL is <http://127.0.0.1:10002>. For direct access from a trusted LAN, replace `127.0.0.1` in `ports` or `-p` with the NAS's private IP. To change the port, edit only the host side.
-- **Storage.** In `volumes` or `-v`, edit the host path before the colon. The `data` directory stores PostgreSQL and private settings and works best on a local SSD. Store `media` on a larger drive if needed.
-- **Memory limit.** Start with `2g`. Raise `mem_limit` or `--memory` if concurrent recordings regularly approach that limit.
-- **Time zone and version.** The default time zone is `Asia/Shanghai`. To change it, add `TZ: America/New_York` under Compose `environment` or pass `-e TZ=America/New_York` to Docker. Replace `latest` with `0.1.0` to pin this release.
+- **Port.** If the port is in use, change the left side of `10002:10002`, for example to `10003:10002`.
+- **Storage.** `data` holds settings, credentials, and the `postgres` database directory. `media` holds recordings and the portable library. Edit their host paths as needed. PostgreSQL requires a local filesystem. On Windows Docker Desktop, place `data` on the WSL Linux filesystem or mount a local Docker volume at `/data/postgres` as described in the [storage guide](docs/CONTRIBUTING.en.md#postgresql-storage).
+- **Time zone and version.** The default time zone is `Asia/Shanghai`. To change it, add `TZ: America/New_York` under Compose `environment` or pass `-e TZ=America/New_York` to Docker. Replace `latest` with `0.1.1` to pin this release.
+- **Use an existing reverse proxy.** Join the app and proxy to the same Docker network. Point the proxy at the app's network name or alias on port `10002`. Omit `ports` if all access goes through the proxy.
 
-For access via a domain name or public IP, use an HTTPS reverse proxy that preserves the original Host and supports SSE. Set `STV_SECURE_COOKIE=1` if you need to explicitly enable HTTPS proxy mode.
-
-When upgrading, keep your existing `data` and `media` paths, custom ports, environment options, and runtime UID/GID. The stop timeout gives embedded PostgreSQL time to close cleanly. The `local` logging driver rotates container logs.
+The stop timeout gives recording and PostgreSQL time to finish writing. Keep your existing `data` and `media` paths and any database volume you have configured when upgrading.
 
 Set a six-digit PIN on first visit. Connect an account from the workbench, and import a key before playing an encrypted stream. If a live connection times out, open the player's CDN menu to test actual download speeds and select a node. Changing nodes reconnects all live streams and recordings immediately and may cause a short interruption.
 
-Affected rows in the Status panel offer **Retry** when the app can recheck or resume the work in the background. Replace expired cookies in Account. Address read-only or full disks before retrying storage.
+The workbench uses a landscape layout. The browser viewport must be at least 744 × 600 CSS pixels and no wider than 21:9. Phones, portrait tablets, and undersized split windows show a display-size prompt. On touchscreens, swipe vertically to scroll the broadcaster list or page through screenshots, and drag horizontally on a timeline to select a range.
+
+The Status panel uses color to distinguish healthy, running, warning, and error states. Hover over or focus a row's info icon to learn what the task does, when it runs, and which settings apply. The full storage bar represents total capacity. The filled section shows used space, and the unfilled section and text show free space. Affected rows offer **Retry** when the app can recheck or resume the work. Replace expired cookies in Account. Address read-only or full disks before retrying storage.
 
 ## Connect an account
 
@@ -103,11 +101,13 @@ Affected rows in the Status panel offer **Retry** when the app can recheck or re
 
 Choose a matching entry in the public key list. Its JSON property name is the `pkey` and its value is the `pdkey`. Open the player's key panel, paste the pair in `pkey:pdkey` format with an ASCII colon, and add it. Upstream keys can rotate, so check the panel's validation result. [Public key list](https://github.com/kesamom/stripchat_mouflon/blob/main/stripchat_mouflon_keys.json) · [Community discussion](https://github.com/lossless1024/StreaMonitor/issues/359)
 
+The panel displays the saved name and value on separate lines. Scroll a long value horizontally to view it in full.
+
 The key setup draws on two third-party projects. [StripchatRecorder](https://github.com/ChanTrail/StripchatRecorder/blob/master/README.en.md#mouflon-hls-decryption-keys) · [scp-standalone](https://github.com/aitschti/scp-standalone#files)
 
 ## Backups, recovery and updates
 
-Stop the container before backing up the complete `data`, `media` and deployment configuration. Keep the matching image. To update with Compose, run `docker compose pull && docker compose up -d`. Migrating only `media` can rebuild the media index and requires setting up the PIN, account and key again. [Maintenance guide](docs/CONTRIBUTING.en.md)
+Stop the container before backing up all of `data` (including `postgres`), `media`, and the deployment configuration. Include the PostgreSQL volume if you use a separate mount. Keep the matching image. To update in place with Compose, keep the existing mounts and run `docker compose pull && docker compose up -d`. Migrating only `media` can rebuild the media index and requires setting up the PIN, account and key again. [Storage guide](docs/CONTRIBUTING.en.md#postgresql-storage)
 
 ## Boundaries
 

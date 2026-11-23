@@ -43,7 +43,7 @@ const content = `<style>${styles.join('\n')}</style>
       <span class="snapshot-total">30 张</span>
       <div class="snapshot-actions"><button><svg class="ui-icon"></svg><span>取消所有喜欢</span></button></div>
     </nav>
-    <div class="record-policy-fixture">
+    <div class="record-policy-fixture" style="position:relative;z-index:5;min-height:44px">
       <button class="recording-toggle record-button" aria-checked="false" aria-label="Auto off"><i></i></button>
       <button class="recording-toggle record-button" aria-checked="true" aria-label="Auto on"><i></i></button>
     </div>
@@ -56,20 +56,19 @@ const content = `<style>${styles.join('\n')}</style>
     <button class="secondary" disabled>Unavailable secondary</button>
     <button class="text-button" disabled>Unavailable text action</button>
     <button class="icon-button" disabled>Unavailable icon</button>
-    <div class="routing-toolbar"><button class="text-button" aria-busy="true" disabled>Testing 1/3</button></div>
     <a href="#account">Account</a>
     <label class="field"><input aria-label="Login"></label>
     <button class="primary">Login</button>
     <section class="panel-content" style="width:360px">
+      <div class="routing-toolbar"><span>Connection</span><button class="secondary panel-button-compact routing-probe" aria-busy="true" disabled>Testing 1/3</button></div>
       <label class="field"><input aria-label="Setting"></label>
       <button class="primary">Save</button>
       <span class="recording-mode"><button class="recording-toggle"><i></i></button></span>
     </section>
     <div class="player-actions"><button class="player-control">Play</button></div>
-    <div class="snapshot-grid"><button class="snapshot-favorite">Like</button></div>
     <section class="snapshot-section" style="position:relative;width:200px;height:100px;min-height:0">
       <div class="snapshot-grid" style="position:relative;left:0;transform:none;width:200px;height:100px;display:block">
-        <div class="snapshot-cell test-cell" style="width:200px;height:100px"><button data-unit-index="0" class="selected"><div><span class="minute-image"></span></div></button></div>
+        <div class="snapshot-cell test-cell" style="width:200px;height:100px"><button data-unit-index="0" class="selected"><div><span class="minute-image"></span></div></button><button class="snapshot-favorite" aria-label="Like"></button></div>
       </div>
     </section>
     <div class="view-position-window" style="position:relative;width:100px;height:26px">
@@ -112,7 +111,12 @@ try {
       const differences = samples.slice(1).flatMap((node) => {
         const value = getComputedStyle(node);
         return parameters
-          .filter((key) => value[key] !== reference[key])
+          .filter((key) => {
+            // Menus retain the shared outline underneath their elevation shadow.
+            if (key === 'boxShadow' && node.className === 'toolbar-popover')
+              return !value[key].startsWith(reference[key]);
+            return value[key] !== reference[key];
+          })
           .map((key) => `${node.className}.${key}: ${value[key]} != ${reference[key]}`);
       });
       samples.forEach((node) => node.remove());
@@ -191,42 +195,47 @@ try {
     'Track content clips inside its outline, independently of the playhead',
   );
   await page.locator('.media-review').screenshot({ path: '/tmp/continuous-review.png' });
-  const emptyCoverage = await page.locator('.material-fixture .recording-line').evaluate((node) => {
-    const style = getComputedStyle(node);
-    return {
-      fill: style.backgroundImage,
-      shadow: style.boxShadow,
-      reflection: getComputedStyle(node, '::after').content,
-    };
-  });
-  assert.deepEqual(
-    emptyCoverage,
-    { fill: 'none', shadow: 'none', reflection: 'none' },
-    'Empty coverage must not carry a white reflection layer',
-  );
-  const glass = await page.locator('.material-fixture .status-line').evaluateAll((nodes) =>
-    nodes.map((node) => {
-      const surface = getComputedStyle(node, '::after');
+  const [statusRail, coverageRail] = await page.locator('.material-fixture').evaluate((node) =>
+    [
+      ['::before', '.status-line'],
+      ['::after', '.recording-line'],
+    ].map(([part, selector]) => {
+      const rail = getComputedStyle(node, part);
+      const data = getComputedStyle(node.querySelector(selector));
       return {
-        reflection: surface.content,
-        fill: surface.backgroundImage,
-        events: surface.pointerEvents,
-        filter: getComputedStyle(node).backdropFilter,
+        glass: {
+          background: rail.background,
+          edge: rail.boxShadow,
+          content: rail.content,
+          events: rail.pointerEvents,
+          filter: rail.backdropFilter,
+        },
+        aligned: ['top', 'height'].every(
+          (key) => Math.abs(parseFloat(rail[key]) - parseFloat(data[key])) < 0.5,
+        ),
+        transparentData:
+          data.backgroundImage === 'none' && data.backgroundColor === 'rgba(0, 0, 0, 0)',
       };
     }),
   );
-  assert(
-    glass.every(
-      (surface) =>
-        surface.reflection !== 'none' &&
-        surface.fill.includes('linear-gradient') &&
-        surface.events === 'none',
-    ),
-    'The status track retains its non-interactive glass reflection layer',
+  assert.deepEqual(
+    coverageRail.glass,
+    statusRail.glass,
+    'Both rails share the same glass material',
   );
+  assert(statusRail.aligned && coverageRail.aligned, 'Each rail aligns with its data layer');
   assert(
-    glass.every((surface) => surface.filter === 'none'),
-    'Plain track backgrounds should not allocate backdrop blur surfaces',
+    statusRail.transparentData && coverageRail.transparentData,
+    'Moving data layers leave their empty pixels transparent',
+  );
+  const glass = statusRail.glass;
+  assert(
+    glass.content !== 'none' &&
+      glass.background.includes('linear-gradient') &&
+      glass.edge !== 'none' &&
+      glass.events === 'none' &&
+      glass.filter === 'none',
+    'Track reflections must be non-interactive and use no backdrop blur',
   );
   assert.equal(
     await page
@@ -440,14 +449,14 @@ try {
     return issues;
   });
   problems.push(...noticeLayout);
-  if (favoriteSize.width < 24 || favoriteSize.height < 24)
-    problems.push('Desktop snapshot favorite hit area must be at least 24px');
+  if (favoriteSize.width > 22 || favoriteSize.height !== favoriteSize.width)
+    problems.push('Snapshot heart must fit the image and keep its circular shape');
   const gridGesture = await page
     .locator('.snapshot-grid')
     .first()
     .evaluate((node) => getComputedStyle(node).touchAction);
-  if (gridGesture !== 'pan-y')
-    problems.push('Non-editing screenshots must allow vertical touch scrolling');
+  if (!gridGesture.includes('pan-x') || !gridGesture.includes('pinch-zoom'))
+    problems.push('Screenshot grid must reserve vertical swipes and allow native pinch zoom');
   const cell = page.locator('.test-cell');
   const resting = await cell.boundingBox();
   await cell.hover();
@@ -458,13 +467,26 @@ try {
   const touch = await browser.newContext({ hasTouch: true, isMobile: true });
   const touchPage = await touch.newPage();
   await touchPage.setContent(content);
-  for (const selector of ['.player-control', '.recording-toggle']) {
+  for (const [selector, minimum] of [
+    ['.player-control', 24],
+    ['.recording-toggle:not(.record-button)', 44],
+  ]) {
     for (const button of await touchPage.locator(selector).all()) {
       const bounds = await button.boundingBox();
-      if (bounds.width < 44 || bounds.height < 44)
-        problems.push(`${selector}: touch hit area must be at least 44px`);
+      if (bounds.width < minimum || bounds.height < minimum)
+        problems.push(`${selector}: touch hit area must be at least ${minimum}px`);
     }
   }
+  const compactTouchTarget = await touchPage
+    .locator('.record-policy-fixture button')
+    .last()
+    .evaluate((button) => {
+      const bounds = button.getBoundingClientRect();
+      const hit = document.elementFromPoint(bounds.left + 35, bounds.top + 35);
+      return bounds.width === 24 && hit === button;
+    });
+  if (!compactTouchTarget)
+    problems.push('Touch must retain a compact recording icon and a larger hit area');
   await touch.close();
   for (const width of [320, 768, 1280]) {
     await page.setViewportSize({ width, height: 900 });

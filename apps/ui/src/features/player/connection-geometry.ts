@@ -9,7 +9,7 @@ interface Port {
   top: number;
   height: number;
 }
-export function connectionGeometry(rail: Rail, port: Port, targetY: number) {
+export function connectionGeometry(rail: Rail, port: Port, targetY: number, targetX?: number) {
   const stacked = rail.width > 80;
   const startX = port.right - rail.left;
   const relative = (y: number): number =>
@@ -17,6 +17,6 @@ export function connectionGeometry(rail: Rail, port: Port, targetY: number) {
   const y = relative(port.top + port.height / 2),
     endY = relative(targetY);
   const bendX = stacked ? rail.width - 12 : rail.width / 2,
-    endX = rail.width - 2;
+    endX = targetX === undefined ? rail.width - 2 : targetX - rail.left;
   return { startX, y, endY, bendX, endX, route: `M ${startX} ${y} H ${bendX} V ${endY} H ${endX}` };
 }

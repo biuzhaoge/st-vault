@@ -61,6 +61,23 @@ export function splitSeenCoverage(
   ];
 }
 
+export function coverageTones(
+  bands: CoverageBand[],
+  seen: MediaTimeRange[],
+  unread?: MediaTimeRange[],
+  favorites?: MediaTimeRange[],
+) {
+  const [liked, ordinary] = favorites?.length ? partitionCoverage(bands, favorites) : [[], bands];
+  return [
+    ...splitSeenCoverage(ordinary, seen, unread).map(({ seen, bands }) => ({
+      tone: seen ? ('seen' as const) : ('unread' as const),
+      bands,
+    })),
+    // Draw last so a favorite keeps its color when the minimum one-pixel markers touch.
+    { tone: 'favorite' as const, bands: liked },
+  ];
+}
+
 /** Coalesce visually adjacent surfaces; precise gaps remain in the original buckets. */
 export function coverageBands(
   buckets: CoverageBucket[],

@@ -447,78 +447,100 @@ describe('server integration boundaries', () => {
       expect((await app.inject({ ...route, headers })).statusCode).toBe(401);
     expect(provider.importList).not.toHaveBeenCalled();
   });
-  it('creates a PIN without connecting an account and confines the temporary setup capability', async () => {
-    const { app } = await fixture(undefined, undefined, undefined, undefined, undefined, false);
-    expect((await app.inject({ url: '/api/session' })).json<SessionInfo>()).toMatchObject({
-      authenticated: false,
-      setupRequired: true,
-      setupAuthorized: false,
-    });
-    expect(
-      (await app.inject({ method: 'POST', url: '/api/setup', payload: { pin: '012345' } }))
-        .statusCode,
-    ).toBe(401);
-    expect(
-      (
-        await app.inject({
-          method: 'POST',
-          url: '/api/setup/session',
-          headers: { host: 'nas.local' },
-          payload: {},
-        })
-      ).statusCode,
-    ).toBe(412);
-    const start = await app.inject({ method: 'POST', url: '/api/setup/session', payload: {} });
-    expect(start.statusCode).toBe(200);
-    const setupCookie = String(start.headers['set-cookie']).split(';')[0],
-      headers = { cookie: setupCookie };
-    expect(
-      (await app.inject({ method: 'POST', url: '/api/setup/session', payload: {} })).statusCode,
-    ).toBe(409);
-    expect((await app.inject({ url: '/api/session', headers })).json<SessionInfo>()).toMatchObject({
-      authenticated: false,
-      setupAuthorized: true,
-    });
-    for (const [method, url] of [
-      ['GET', '/api/subjects'],
-      ['GET', '/api/keys'],
-      ['GET', '/api/system'],
-      ['GET', '/api/events'],
-      ['DELETE', '/api/account-sync'],
-      ['POST', '/api/subjects/stripchat:42/deletion-intents'],
-    ] as const) {
-      expect((await app.inject({ method, url, headers })).statusCode, `${method} ${url}`).toBe(401);
-    }
-    for (const pin of ['12345', '1234567', '１２３４５６', '12345x'])
+  it.each(['http', 'https'])(
+    'creates a scoped PIN setup session on a %s host name',
+    async (scheme) => {
+      const { app } = await fixture(undefined, undefined, undefined, undefined, undefined, false);
+      const host = 'nas.test:10002';
+      const origin = `${scheme}://${host}`;
+      const site = { host, origin };
+      const expectCookie = (cookie: string) => {
+        expect(cookie).toContain('HttpOnly; SameSite=Strict');
+        expect(cookie.includes('; Secure')).toBe(scheme === 'https');
+      };
+      expect((await app.inject({ url: '/api/session' })).json<SessionInfo>()).toMatchObject({
+        authenticated: false,
+        setupRequired: true,
+        setupAuthorized: false,
+      });
       expect(
-        (await app.inject({ method: 'POST', url: '/api/setup', headers, payload: { pin } }))
+        (await app.inject({ method: 'POST', url: '/api/setup', payload: { pin: '012345' } }))
           .statusCode,
-      ).toBe(400);
-    const complete = await app.inject({
-      method: 'POST',
-      url: '/api/setup',
-      headers,
-      payload: { pin: '012345' },
-    });
-    expect(complete.statusCode).toBe(200);
-    const admin = String(complete.headers['set-cookie']).split(';')[0];
-    expect((await app.inject({ url: '/api/account-sync', headers })).statusCode).toBe(401);
-    expect(
-      (await app.inject({ url: '/api/session', headers: { cookie: admin } })).json<SessionInfo>(),
-    ).toMatchObject({
-      authenticated: true,
-      setupRequired: false,
-      credential: 'pin',
-      setupAuthorized: false,
-    });
-    expect(
-      (await app.inject({ method: 'POST', url: '/api/login', payload: { pin: '012345' } }))
-        .statusCode,
-    ).toBe(200);
-    expect(
-      (await app.inject({ method: 'POST', url: '/api/setup/session', payload: {} })).statusCode,
-    ).toBe(409);
-  });
+      ).toBe(401);
+      const start = await app.inject({
+        method: 'POST',
+        url: '/api/setup/session',
+        headers: site,
+        payload: {},
+      });
+      expect(start.statusCode).toBe(200);
+      expectCookie(String(start.headers['set-cookie']));
+      const setupCookie = String(start.headers['set-cookie']).split(';')[0],
+        headers = { ...site, cookie: setupCookie };
+      expect(
+        (await app.inject({ method: 'POST', url: '/api/setup/session', payload: {} })).statusCode,
+      ).toBe(409);
+      expect(
+        (await app.inject({ url: '/api/session', headers })).json<SessionInfo>(),
+      ).toMatchObject({
+        authenticated: false,
+        setupAuthorized: true,
+      });
+      for (const [method, url] of [
+        ['GET', '/api/subjects'],
+        ['GET', '/api/keys'],
+        ['GET', '/api/system'],
+        ['GET', '/api/events'],
+        ['DELETE', '/api/account-sync'],
+        ['POST', '/api/subjects/stripchat:42/deletion-intents'],
+      ] as const) {
+        expect((await app.inject({ method, url, headers })).statusCode, `${method} ${url}`).toBe(
+          401,
+        );
+      }
+      for (const pin of ['12345', '1234567', '１２３４５６', '12345x'])
+        expect(
+          (await app.inject({ method: 'POST', url: '/api/setup', headers, payload: { pin } }))
+            .statusCode,
+        ).toBe(400);
+      const complete = await app.inject({
+        method: 'POST',
+        url: '/api/setup',
+        headers,
+        payload: { pin: '012345' },
+      });
+      expect(complete.statusCode).toBe(200);
+      for (const cookie of [complete.headers['set-cookie']!].flat()) expectCookie(cookie);
+      const admin = String(complete.headers['set-cookie']).split(';')[0];
+      expect((await app.inject({ url: '/api/account-sync', headers })).statusCode).toBe(401);
+      expect(
+        (await app.inject({ url: '/api/session', headers: { cookie: admin } })).json<SessionInfo>(),
+      ).toMatchObject({
+        authenticated: true,
+        setupRequired: false,
+        credential: 'pin',
+        setupAuthorized: false,
+      });
+      const login = await app.inject({
+        method: 'POST',
+        url: '/api/login',
+        headers: { ...site, 'x-forwarded-proto': scheme === 'http' ? 'https' : 'http' },
+        payload: { pin: '012345' },
+      });
+      expect(login.statusCode).toBe(200);
+      expectCookie(String(login.headers['set-cookie']));
+      const logout = await app.inject({
+        method: 'POST',
+        url: '/api/logout',
+        headers: { ...site, cookie: String(login.headers['set-cookie']).split(';')[0] },
+      });
+      expect(logout.statusCode).toBe(200);
+      for (const cookie of [logout.headers['set-cookie']!].flat()) expectCookie(cookie);
+      expect(
+        (await app.inject({ method: 'POST', url: '/api/setup/session', payload: {} })).statusCode,
+      ).toBe(409);
+    },
+  );
 
   it('returns a cooldown after repeated invalid PINs even from different addresses', async () => {
     const { app } = await fixture();
@@ -1519,32 +1541,11 @@ describe('server integration boundaries', () => {
       if (timer) clearTimeout(timer);
     }
   });
-  it('exposes one authenticated no-store sync API, requires safe transport to save and preserves local policy', async () => {
+  it('exposes one authenticated no-store sync API over HTTP and preserves local policy', async () => {
     const { app, archive, cookie, provider } = await fixture();
     const config = { cookiesText: 'synthetic-persistent-secret' };
+    const site = { cookie, host: 'nas.lan:10002', origin: 'http://nas.lan:10002' };
     expect((await app.inject({ url: '/api/account-sync' })).statusCode).toBe(401);
-    expect(
-      (
-        await app.inject({
-          method: 'PUT',
-          url: '/api/account-sync',
-          headers: { cookie, host: 'nas.lan:10002' },
-          remoteAddress: '192.0.2.3',
-          payload: config,
-        })
-      ).statusCode,
-    ).toBe(412);
-    expect(
-      (
-        await app.inject({
-          method: 'PUT',
-          url: '/api/account-sync',
-          headers: { cookie, host: 'nas.lan:10002' },
-          remoteAddress: '192.0.2.3',
-          payload: { cookiesText: config.cookiesText },
-        })
-      ).statusCode,
-    ).toBe(412);
     expect(provider.importList).not.toHaveBeenCalled();
     expect(
       (
@@ -1594,8 +1595,7 @@ describe('server integration boundaries', () => {
     const configured = await app.inject({
       method: 'PUT',
       url: '/api/account-sync',
-      headers: { cookie, host: 'localhost:10002' },
-      remoteAddress: '172.18.0.1',
+      headers: site,
       payload: config,
     });
     expect(configured.statusCode).toBe(200);
@@ -1633,17 +1633,10 @@ describe('server integration boundaries', () => {
     expect(metadata.headers['cache-control']).toBe('no-store, private');
     expect(metadata.body).not.toContain(config.cookiesText);
     expect(metadata.json()).not.toHaveProperty('cookiesText');
-    const insecureDisconnect = await app.inject({
-      method: 'DELETE',
-      url: '/api/account-sync',
-      headers: { cookie, host: 'nas.lan:10002' },
-      remoteAddress: '192.0.2.3',
-    });
-    expect(insecureDisconnect.statusCode).toBe(412);
     const removed = await app.inject({
       method: 'DELETE',
       url: '/api/account-sync',
-      headers: { cookie },
+      headers: site,
     });
     expect(removed.statusCode).toBe(200);
     expect(removed.json()).toMatchObject({

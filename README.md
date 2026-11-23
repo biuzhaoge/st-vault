@@ -25,11 +25,11 @@
 
 ![账户面板中的站点选择与 Cookies 输入框](docs/assets/screenshots/account.png)
 
-**直播与回看在同一面板。** 点击封面直接看公开直播，开启自动录制后保存最高可用源画质。拖选录到的范围，再点截图跳到对应画面；短空档留白，长空档压缩，不必反复拖动进度条。
+**直播与回看在同一面板。** 点击封面直接看公开直播，开启自动录制后保存最高可用源画质。拖选录到的范围，再点截图跳到对应画面；短空档留白，长空档压缩。鼠标悬停在截图上可查看对应录像的起止时间。
 
 ![录像回放与当前播放位置](docs/assets/screenshots/playback.png)
 
-**喜欢的画面长期留下。** 桃心保护对应完整录像单元，不受保留天数清理；截图工具栏直接提供“取消所有喜欢”和“删除所有非喜欢”，均作用于整个当前时间范围（包含其他页）；单张喜欢由桃心切换。运行进度在状态面板查看，刷新或关闭网页不会中断已接纳的删除任务。
+**喜欢的画面长期留下。** 点击截图左上角的桃心可收藏或取消收藏。收藏保护对应的完整录像单元，不受保留天数清理。截图工具栏提供“取消所有喜欢”和“删除所有非喜欢”，均作用于整个当前时间范围，包含其他页。运行进度在状态面板查看，刷新或关闭网页不会中断已接纳的删除任务。
 
 ![全屏回放与截图管理侧栏](docs/assets/screenshots/fullscreen.png)
 
@@ -49,15 +49,12 @@ services:
   app:
     image: biuzhaoge/st-vault:latest
     ports:
-      - '127.0.0.1:10002:10002'
+      - '10002:10002'
     volumes:
       - ./data:/data
       - ./media:/media
-    mem_limit: 2g
-    init: true
     restart: unless-stopped
     stop_grace_period: 180s
-    logging: { driver: local }
 ```
 
 ```sh
@@ -70,26 +67,27 @@ docker compose up -d
 
 ```sh
 docker run -d --name st-vault --restart unless-stopped \
-  -p 127.0.0.1:10002:10002 --memory 2g \
+  -p 10002:10002 --stop-timeout 180 \
   -v "$PWD/data:/data" -v "$PWD/media:/media" \
-  --init --stop-timeout 180 --log-driver local \
   biuzhaoge/st-vault:latest
 ```
 
+启动后通过 `http://NAS地址:10002` 打开，同机访问用 <http://127.0.0.1:10002>。HTTP 会明文传输 PIN、会话和凭据。默认端口映射会在宿主机各网络接口开放，请通过防火墙限制在可信局域网，避免将 10002 直接暴露到公网。需要远程访问时可使用自己的 VPN。
+
 ### 需要时再改参数
 
-- **局域网访问**。默认地址是 <http://127.0.0.1:10002>。要从可信局域网直连，把 `ports` 或 `-p` 中的 `127.0.0.1` 换成 NAS 的私有 IP。修改端口时只改宿主机一侧。
-- **存储位置**。修改 `volumes` 或 `-v` 中冒号前的宿主机路径。保存 PostgreSQL 和私有配置的 `data` 建议用本地 SSD，录像目录 `media` 可放在大容量硬盘。
-- **内存上限**。从 `2g` 起步。多路录制时若经常碰到上限，再增大 `mem_limit` 或 `--memory`。
-- **时区与版本**。默认时区是 `Asia/Shanghai`。更换时在 Compose 的 `environment` 中添加 `TZ: America/New_York`，或在 CLI 中加 `-e TZ=America/New_York`。将 `latest` 改为 `0.1.0` 可固定此版本。
+- **端口**。如有冲突，将 `10002:10002` 左侧改为其他端口，例如 `10003:10002`。
+- **存储位置**。`data` 保存配置、凭据和 `postgres` 数据库目录，`media` 保存录像和可迁移媒体库。可按需修改两个目录的宿主机路径。PostgreSQL 要求本机文件系统。Windows Docker Desktop 请把 `data` 放在 WSL 的 Linux 文件系统，或按维护说明将本地 Docker 卷挂载到 `/data/postgres`。[数据库存储说明](docs/CONTRIBUTING.md#postgresql-存储)
+- **时区与版本**。默认时区是 `Asia/Shanghai`。更换时在 Compose 的 `environment` 中添加 `TZ: America/New_York`，或在 CLI 中加 `-e TZ=America/New_York`。将 `latest` 改为 `0.1.1` 可固定此版本。
+- **使用已有反向代理**。让应用和代理加入同一个 Docker 网络，在代理中连接应用的网络名称或别名及端口 `10002`。仅通过代理访问时可移除 `ports`。
 
-通过域名或公网 IP 访问时，使用支持 SSE 的 HTTPS 反向代理并保留原始 Host。需要显式启用 HTTPS 代理模式时，设置 `STV_SECURE_COOKIE=1`。
-
-升级时沿用原来的 `data` 和 `media` 路径，以及已配置的端口、环境变量和 UID/GID。停机宽限给内置 PostgreSQL 留出安全关闭的时间，`local` 日志驱动会自动轮转。
+停机宽限为录制收尾和 PostgreSQL 落盘预留时间。升级时沿用原来的 `data`、`media` 路径及已配置的数据库卷。
 
 首次打开时设置六位 PIN。进入工作台后可连接账户，播放加密直播前需导入密钥。直播连接超时时，可在播放器的 CDN 菜单手动测速并选择节点。测速会下载小段媒体作比较。更换节点会让所有直播和录制立即重新连接，期间可能短暂停顿。
 
-状态面板的异常行会提供可用的「重试」操作，由后台完成检查或恢复。Cookies 失效时请到「账户」更新。磁盘只读或空间不足时，请先处理存储问题再重试。
+工作台使用横向布局。浏览器内容区至少需 744 × 600 CSS 像素，宽高比不得超过 21:9。手机、平板竖屏或过小的分屏窗口会显示尺寸提示。触屏上可上下滑动主播列表、横拖时间线取段、上下滑动截图翻页。
+
+状态面板用颜色区分可用、运行中、警告和异常。悬停或聚焦事项旁的信息图标可查看任务用途、运行方式和适用的当前设置。存储条全长代表总容量，实心部分代表已用空间，空心部分和文字显示剩余空间。支持恢复的异常行会提供「重试」。Cookies 失效时请到「账户」更新。磁盘只读或空间不足时，请先处理存储问题再重试。
 
 ## 连接账户
 
@@ -103,11 +101,13 @@ docker run -d --name st-vault --restart unless-stopped \
 
 从公开密钥列表选择匹配的条目。JSON 属性名是 `pkey`，对应值是 `pdkey`。打开播放器钥匙面板，将一对密钥按 `pkey:pdkey` 格式粘贴并添加，中间使用英文冒号。上游会轮换密钥，请以面板验证结果为准。[公开密钥列表](https://github.com/kesamom/stripchat_mouflon/blob/main/stripchat_mouflon_keys.json) · [社区讨论](https://github.com/lossless1024/StreaMonitor/issues/359)
 
+面板分行显示已保存的密钥名和密钥值。较长的密钥值可横向滚动查看。
+
 密钥配置参考了两个第三方项目。[StripchatRecorder](https://github.com/ChanTrail/StripchatRecorder/blob/master/README.en.md#mouflon-hls-decryption-keys) · [scp-standalone](https://github.com/aitschti/scp-standalone#files)
 
 ## 备份恢复与更新
 
-停止容器后备份完整的 `data`、`media` 和部署配置，保留备份对应的镜像。Compose 更新用 `docker compose pull && docker compose up -d`。只迁移 `media` 可以重建媒体索引，PIN、账户和密钥需重新配置。[维护说明](docs/CONTRIBUTING.md)
+停止容器后备份完整的 `data`（含 `postgres`）、`media` 和部署配置，保留备份对应的镜像。若 PostgreSQL 使用单独的 Docker 卷，也要备份该卷。Compose 更新用 `docker compose pull && docker compose up -d`，沿用原挂载即可原位升级。只迁移 `media` 可以重建媒体索引，PIN、账户和密钥需重新配置。[数据库存储说明](docs/CONTRIBUTING.md#postgresql-存储)
 
 ## 使用边界
 

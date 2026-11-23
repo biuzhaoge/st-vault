@@ -59,6 +59,17 @@ Existing deployments can keep a read-only root filesystem, writable `/tmp`, and 
 
 Keep production data/media, required rollback backups and matching images. Cleanup applies to disposable validation output and Docker resources.
 
+## PostgreSQL storage
+
+PostgreSQL uses `postgres/18` under the data directory, normally `/data/postgres/18` inside the container. Linux and NAS deployments using a local filesystem can keep their mounts when upgrading. On Windows Docker Desktop or with an SMB data share, use local Linux storage for the database. Run Compose from the WSL Linux filesystem on Windows or mount a local Docker named volume at `/data/postgres`. Restore an existing cluster to the destination before switching mounts. An empty volume hides the original directory.
+
+To migrate an unsupported mount, stop the application normally and retain the old image, deployment configuration, `data` and `media`. Start the old cluster in an isolated maintenance container with a matching PostgreSQL version and private Unix socket for export. For a Windows share, the export session can use `io_method=sync` and `default_transaction_read_only=on`.
+
+1. Export the full database with `pg_dump --format=custom --no-owner --no-acl --file=stvault.dump stvault`. Protect the dump because it contains private settings. Retain `data/private/postgres.json` and the other private files.
+2. Initialize an empty cluster on the destination using the existing runtime UID/GID and database credentials. Import with `pg_restore --exit-on-error --no-owner --no-acl --dbname=stvault stvault.dump`. Compare business and private table row counts before starting the workbench. Verify the existing PIN, account and recordings. Keep the source cluster and dump as a backup.
+
+Startup rejects PostgreSQL cluster and WAL locations on 9p and SMB. The status panel checks space and write access on the actual database directory. Look for `postgres_child_terminated` in `data/logs/supervisor.jsonl` and its rotations for the child PID and signal, including incidents the postmaster recovers from.
+
 ## Verification and release
 
 Pushes to `main` and PRs targeting `main` run CI only. Checks cover formatting, types, tests, builds, the dependency audit and Compose validation. Run browser regression suites locally with the commands above.
@@ -91,7 +102,7 @@ Use synthetic data from `scripts/benchmarks`, recording CPU/memory limits, stora
 The [runtime performance report](../scripts/diagnostics/runtime-performance.mjs) reads a JSONL slice from stdin. It emits the observed time range, event counts, maximum timings and counts of samples sharing a request ID. Output is limited to known diagnostic fields. Check `input.firstAt` and `input.lastAt` for the observed range. `highestWindowP95UpperMs` is the highest upper bound across the observed windows. Computing a combined P95 requires the original bucket counts.
 
 ```sh
-docker logs --since 30m --tail 20000 st-vault-app-1 2>&1 | docker run --rm -i --network none --entrypoint node st-vault:qa scripts/diagnostics/runtime-performance.mjs
+docker compose logs --since 30m --tail 20000 --no-color --no-log-prefix app 2>&1 | docker run --rm -i --network none --entrypoint node st-vault:qa scripts/diagnostics/runtime-performance.mjs
 docker run --rm --network none st-vault:qa sh -ec 'npm run build && node scripts/benchmarks/recording-start.mjs && node scripts/benchmarks/capture-sweep.mjs'
 docker run --rm --network none --entrypoint sh st-vault:qa -ec 'npm run build && node scripts/benchmarks/workbench-cost.mjs'
 ```
