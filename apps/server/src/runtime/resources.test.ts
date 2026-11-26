@@ -1,7 +1,166 @@
 import { describe, expect, it, vi } from 'vitest';
 import { ResourceMonitor } from './resources.js';
 import { defaultRuntimeSettings } from './settings.js';
+import { SyncClock } from './sync-clock.js';
 describe('storage budgets and retention ownership', () => {
+  it('resumes empty date cleanup on its own schedule even with keep-forever recordings', async () => {
+    let now = 200000000,
+      freeBytes = 50;
+    const pruneEmptyDays = vi.fn().mockResolvedValueOnce(86400000).mockResolvedValue(null);
+    const pruneBefore = vi.fn();
+    const monitor = new ResourceMonitor({
+      root: '/media',
+      databaseRoot: '/data',
+      archive: { pruneBefore, pruneEmptyDays },
+      cleanEmptyDays: true,
+      settings: () => ({ ...defaultRuntimeSettings, minFreeBytes: 100, retentionDays: 0 }),
+      readDisk: () => Promise.resolve({ freeBytes, totalBytes: 1000 }),
+      writeProbe: () => Promise.resolve(),
+      now: () => now,
+    });
+    try {
+      await monitor.check();
+      expect(pruneEmptyDays).not.toHaveBeenCalled();
+      const task = () => monitor.backgroundTasks().find(({ id }) => id === 'empty-day-cleanup');
+      expect(task()?.state).toBe('paused');
+      freeBytes = 500;
+      await monitor.check();
+      expect(pruneEmptyDays).toHaveBeenNthCalledWith(1, now, undefined);
+      expect(task()?.nextRunAtMs).toBe(now + 5000);
+      now += 4999;
+      await monitor.check();
+      expect(pruneEmptyDays).toHaveBeenCalledOnce();
+      now += 1;
+      await monitor.check();
+      expect(pruneEmptyDays).toHaveBeenNthCalledWith(2, now, 86400000);
+      expect(task()?.nextRunAtMs).toBe(now + 3600000);
+      expect(pruneBefore).not.toHaveBeenCalled();
+    } finally {
+      await monitor.close();
+    }
+  });
+  it('checks at deployment midnight plus the recording grace even when the hourly sweep is later', async () => {
+    let now = Date.parse('2026-11-26T23:55:00+08:00');
+    const midnight = Date.parse('2026-11-27T00:00:00+08:00');
+    vi.stubEnv('TZ', 'Asia/Shanghai');
+    const pruneEmptyDays = vi.fn().mockResolvedValue(null);
+    const monitor = new ResourceMonitor({
+      root: '/media',
+      archive: { pruneBefore: vi.fn(), pruneEmptyDays },
+      cleanEmptyDays: true,
+      settings: () => ({ ...defaultRuntimeSettings, minFreeBytes: 100, retentionDays: 0 }),
+      readDisk: () => Promise.resolve({ freeBytes: 500, totalBytes: 1000 }),
+      writeProbe: () => Promise.resolve(),
+      now: () => now,
+    });
+    try {
+      await monitor.check();
+      const task = () => monitor.backgroundTasks().find(({ id }) => id === 'empty-day-cleanup');
+      expect(task()?.nextRunAtMs).toBe(midnight + 60000);
+      now = midnight + 59999;
+      await monitor.check();
+      expect(pruneEmptyDays).toHaveBeenCalledOnce();
+      now = midnight + 60000;
+      await monitor.check();
+      expect(pruneEmptyDays).toHaveBeenNthCalledWith(2, now, undefined);
+      expect(task()?.nextRunAtMs).toBe(now + 3600000);
+    } finally {
+      await monitor.close();
+      vi.unstubAllEnvs();
+    }
+  });
+  it('rechecks on the shared clock after completed deletions and retains notices during a batch', async () => {
+    vi.useFakeTimers();
+    let now = Date.parse('2026-11-26T12:00:00Z'),
+      releaseBatch!: (cursor: number | null) => void;
+    const clock = new SyncClock({ intervalMs: () => 1000, now: () => now });
+    const batch = new Promise<number | null>((resolve) => {
+      releaseBatch = resolve;
+    });
+    const pruneEmptyDays = vi
+      .fn()
+      .mockResolvedValueOnce(null)
+      .mockReturnValueOnce(batch)
+      .mockResolvedValue(null);
+    const listeners = new Set<() => void>();
+    const subscribeDeletionComplete = vi.fn((listener: () => void) => {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    });
+    const monitor = new ResourceMonitor({
+      root: '/media',
+      clock,
+      archive: { pruneBefore: vi.fn(), pruneEmptyDays, subscribeDeletionComplete },
+      cleanEmptyDays: true,
+      settings: () => ({ ...defaultRuntimeSettings, minFreeBytes: 100, retentionDays: 0 }),
+      readDisk: () => Promise.resolve({ freeBytes: 500, totalBytes: 1000 }),
+      writeProbe: () => Promise.resolve(),
+      now: () => now,
+    });
+    try {
+      monitor.start();
+      monitor.start();
+      await monitor.check();
+      const completed = () => {
+        for (const listener of listeners) listener();
+      };
+      completed();
+      completed();
+      now += 1000;
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(pruneEmptyDays).toHaveBeenNthCalledWith(2, now, undefined);
+      expect(subscribeDeletionComplete).toHaveBeenCalledOnce();
+      completed();
+      releaseBatch(86400000);
+      await clock.runNow('resources');
+      now += 4999;
+      await clock.runNow('resources');
+      expect(pruneEmptyDays).toHaveBeenCalledTimes(2);
+      now += 1;
+      await clock.runNow('resources');
+      expect(pruneEmptyDays).toHaveBeenNthCalledWith(3, now, undefined);
+      now += 1000;
+      await clock.runNow('resources');
+      expect(pruneEmptyDays).toHaveBeenCalledTimes(3);
+    } finally {
+      releaseBatch(null);
+      await monitor.close();
+      await clock.close();
+      vi.useRealTimers();
+    }
+    expect(listeners.size).toBe(0);
+  });
+  it.each([true, false])(
+    'admits cleanup according to free space on the database volume (shared=%s)',
+    async (shared) => {
+      const pruneBefore = vi.fn().mockResolvedValue({ deletedSegments: 0, reclaimedBytes: 0 });
+      const monitor = new ResourceMonitor({
+        root: '/media',
+        dataRoot: '/data',
+        databaseRoot: '/data/postgres',
+        archive: { pruneBefore },
+        settings: () => ({ ...defaultRuntimeSettings, minFreeBytes: 100, retentionDays: 1 }),
+        readDisk: (root) =>
+          Promise.resolve({
+            freeBytes: shared || root === '/media' ? 50 : 500,
+            totalBytes: 1000,
+          }),
+        now: () => 200000000,
+      });
+      try {
+        await monitor.check();
+        expect(monitor.canRecord()).toBe(false);
+        if (shared) {
+          await expect(monitor.retry('retention')).rejects.toThrow('STORAGE_UNAVAILABLE');
+          expect(pruneBefore).not.toHaveBeenCalled();
+        } else {
+          expect(pruneBefore).toHaveBeenCalledOnce();
+        }
+      } finally {
+        await monitor.close();
+      }
+    },
+  );
   it.each(['dataRoot', 'databaseRoot'] as const)(
     'blocks recording when the %s volume alone is full',
     async (volume) => {
@@ -158,7 +317,7 @@ describe('storage budgets and retention ownership', () => {
     });
     await monitor.check();
     expect(monitor.canRecord()).toBe(false);
-    expect(pruneBefore).toHaveBeenCalledWith(200000000 - 86400000);
+    expect(pruneBefore).toHaveBeenCalledWith(200000000 - 86400000, 1);
     freeBytes = 200;
     await monitor.check();
     expect(monitor.canRecord()).toBe(true);

@@ -332,6 +332,32 @@ export class EventStore {
     await this.expireDue(at);
     await this.prune(at);
   }
+  /** Reclaim events by their own timestamp and runs wholly contained in the interval. */
+  async pruneWindow(from: number, to: number, limit: number): Promise<boolean> {
+    const events = await this.db
+      .prepare(
+        `DELETE FROM archive_events WHERE id IN (
+        SELECT id FROM archive_events WHERE at_ms>=? AND at_ms<? ORDER BY at_ms,id LIMIT ?
+      )`,
+      )
+      .run(from, to, limit);
+    const runs = await this.db
+      .prepare(
+        `DELETE FROM program_runs WHERE id IN (
+        SELECT id FROM program_runs WHERE started>=? AND started<? AND ended<=? ORDER BY started,id LIMIT ?
+      )`,
+      )
+      .run(from, to, to, limit);
+    const eventCount = Number(events.changes),
+      runCount = Number(runs.changes);
+    if (eventCount || runCount)
+      await this.db
+        .prepare(
+          'UPDATE event_meta SET event_count=event_count-?,run_count=run_count-?,revision=revision+1 WHERE id=1',
+        )
+        .run(eventCount, runCount);
+    return eventCount === limit || runCount === limit;
+  }
   async prune(at: number): Promise<void> {
     const state = await this.state(),
       cutoff = Math.max(0, at - this.retentionDays * DAY),

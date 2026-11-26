@@ -20,6 +20,7 @@ export interface SystemInfo {
   retries?: SystemRetry[];
   retryableTargets?: SystemRetryTarget[];
   deletionJobs?: MediaDeletionJob[] | null;
+  deletionWaiting?: number | null;
   version: string;
   maintenanceError?: string | null;
   archiveHealth?: ArchiveHealthStatus | null;

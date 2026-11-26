@@ -2,13 +2,13 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { expect, it } from 'vitest';
 import { RecordingMode, GlobalRecordingSettings } from './RecordingMode';
 const save = () => Promise.resolve();
-it('uses an icon-only policy switch with complete accessible state descriptions', () => {
+it('uses the row number as the policy switch with complete accessible state descriptions', () => {
   const render = (value: boolean, captureState: 'IDLE' | 'CAPTURING' | 'RESOLVING') =>
     renderToStaticMarkup(
       <RecordingMode
         value={value}
         captureState={captureState}
-        appearance="record"
+        rowNumber={123}
         label="record"
         onChange={save}
       />,
@@ -16,12 +16,15 @@ it('uses an icon-only policy switch with complete accessible state descriptions'
   for (const captureState of ['IDLE', 'RESOLVING', 'CAPTURING'] as const) {
     for (const value of [false, true]) {
       const html = render(value, captureState);
-      expect(html).not.toContain('record-button-label');
       expect(html).not.toContain('title=');
       expect(html).toContain(`aria-checked="${value}"`);
       expect(html).toContain(value ? '自动录制已开启' : '自动录制已关闭');
       const content = /<button[^>]*>([\s\S]*?)<\/button>/.exec(html)![1];
-      expect(content.replace(/<[^>]*>/g, '').trim()).toBe('');
+      expect(content).toContain('class="directory-row-number" aria-hidden="true"');
+      expect(content.replace(/<[^>]*>/g, '').trim()).toBe('123');
+      expect(content).toContain(
+        value && captureState === 'RESOLVING' ? 'operation-spinner' : 'record-action',
+      );
     }
   }
 });
@@ -40,7 +43,7 @@ it.each(['QUEUED', 'RESOLVING'] as const)(
     const html = renderToStaticMarkup(
       <RecordingMode
         value={true}
-        appearance="record"
+        rowNumber={1}
         label="record"
         captureState={captureState}
         onChange={save}
@@ -56,7 +59,7 @@ it('reports confirmed capture separately from the auto-recording policy', () => 
     renderToStaticMarkup(
       <RecordingMode
         value={value}
-        appearance="record"
+        rowNumber={1}
         providerStatus="PUBLIC"
         label="record"
         captureState={captureState}

@@ -1,13 +1,18 @@
 import { tr } from '../../shared/lib/i18n';
 import { forwardRef, useEffect, useImperativeHandle, useLayoutEffect, useRef } from 'react';
 import type Hls from 'hls.js';
-import type { PlayerSource } from './Player';
+import type { LivePlaybackResponse, PlaybackResponse, Subject } from '@st-vault/api-schema';
 import { request, ApiError } from '../../shared/lib/api';
 import { loadPlayerEngine } from './player-engine';
 import { archiveMediaEnd } from './playback-continuation';
 import type { MediaPhase } from './player-status';
 import { LiveClock } from './live-clock';
 import { createMediaTimeIndex, playbackEndUtc, utcToMediaTime } from '../timeline/timeline';
+
+export type PlayerSource =
+  | { kind: 'live'; stream: LivePlaybackResponse; subject: Subject }
+  | { kind: 'archive'; playback: PlaybackResponse; subject: Subject; unitId?: string };
+export type ArchivePlayerSource = Extract<PlayerSource, { kind: 'archive' }>;
 
 export function sourceKey(source: PlayerSource): string {
   return `${source.kind}:${source.kind === 'live' ? source.stream.sessionId : `${source.playback.sessionId}:${source.unitId ?? ''}`}`;

@@ -57,10 +57,14 @@ try {
       .dispatchEvent('pointermove', { clientX: Date.now() % 10000, clientY: 500 });
   };
   await wake();
-  await page.locator('.snapshot-favorite').nth(1).click();
+  await page
+    .locator('.snapshot-grid button[data-unit-index][data-favorite-ready="true"]')
+    .nth(1)
+    .dblclick();
   await page.waitForFunction(
     () =>
-      document.querySelectorAll('.snapshot-favorite[aria-pressed="true"]').length === 1 &&
+      document.querySelectorAll('.snapshot-grid button[data-unit-index][data-liked="true"]')
+        .length === 1 &&
       document.querySelector('.snapshot-pages')?.getAttribute('aria-busy') === 'false',
   );
   await wake();
@@ -201,7 +205,7 @@ try {
   await page.getByRole('button', { name: '取消所有喜欢', exact: true }).click();
   await page.waitForFunction(
     () =>
-      !document.querySelector('.snapshot-favorite[aria-pressed="true"]') &&
+      !document.querySelector('.snapshot-grid button[data-unit-index][data-liked="true"]') &&
       document.querySelector('.snapshot-pages')?.getAttribute('aria-busy') === 'false',
   );
   await wake();

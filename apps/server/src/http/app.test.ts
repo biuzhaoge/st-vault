@@ -288,21 +288,24 @@ describe('server integration boundaries', () => {
     let now = Date.now();
     const { app, archive, cookie, resources } = await fixture(undefined, undefined, () => now);
     const retry = vi.spyOn(archive, 'retryDeletions').mockResolvedValue(undefined);
-    const deletionJobs = vi.spyOn(archive, 'deletionJobs').mockResolvedValue([
-      {
-        id: 'retry-fixture',
-        subjectId: 'stripchat:42',
-        state: 'retry',
-        total: 2,
-        processed: 0,
-        reclaimedBytes: 0,
-        fromMs: 1000,
-        toMs: 2000,
-        createdAtMs: now,
-        updatedAtMs: now,
-        error: 'storage_unavailable',
-      },
-    ]);
+    const deletionJobs = vi.spyOn(archive, 'deletionInventory').mockResolvedValue({
+      waiting: 0,
+      jobs: [
+        {
+          id: 'retry-fixture',
+          subjectId: 'stripchat:42',
+          state: 'retry',
+          total: 2,
+          processed: 0,
+          reclaimedBytes: 0,
+          fromMs: 1000,
+          toMs: 2000,
+          createdAtMs: now,
+          updatedAtMs: now,
+          error: 'storage_unavailable',
+        },
+      ],
+    });
     const disk = resources.get();
     const readDisk = vi
       .spyOn(resources, 'get')
@@ -567,6 +570,21 @@ describe('server integration boundaries', () => {
         .statusCode,
     ).toBe(429);
   });
+  it('rejects out-of-range provider IDs before playback and CDN lookup', async () => {
+    const { app, cookie } = await fixture();
+    const subjectId = 'stripchat:9007199254740992';
+    const requests = [
+      { url: '/api/playback', payload: { subjectId, targetUtcMs: 0 } },
+      { url: '/api/network/probe', payload: { kind: 'cdn', subjectId } },
+    ];
+    const replies = await Promise.all(
+      requests.map((request) => app.inject({ ...request, method: 'POST', headers: { cookie } })),
+    );
+    expect(replies.map((reply) => [reply.statusCode, reply.json<unknown>()])).toEqual([
+      [400, { error: 'invalid_request' }],
+      [400, { error: 'invalid_request' }],
+    ]);
+  });
   it('authenticates preferences and measures CDN downloads only on manual request', async () => {
     const { app, cookie } = await fixture();
     expect((await app.inject({ url: '/api/network/routes' })).statusCode).toBe(401);
@@ -672,6 +690,35 @@ describe('server integration boundaries', () => {
         })
       ).statusCode,
     ).toBe(404);
+  });
+  it('looks up one authenticated deletion command without admitting a missing command', async () => {
+    const { app, archive, cookie } = await fixture();
+    const headers = { cookie },
+      commandId = randomUUID();
+    const url = '/api/media-deletions/' + commandId;
+    expect((await app.inject({ url })).statusCode).toBe(401);
+    const missing = await app.inject({ url, headers });
+    expect(missing.statusCode).toBe(404);
+    expect(missing.json()).toEqual({ error: 'media_deletion_not_found' });
+    expect((await app.inject({ url: '/api/media-deletions/invalid', headers })).statusCode).toBe(
+      400,
+    );
+    expect(await archive.deletionJobs!()).toEqual([]);
+    await archive.upsertSubjects([{ id: 'stripchat:42', providerId: 42, handle: 'fixture' }]);
+    const posted = await app.inject({
+      method: 'POST',
+      url: '/api/subjects/stripchat:42/deletion-intents',
+      headers,
+      payload: { commandId, target: { kind: 'range', mode: 'all', fromMs: 100, toMs: 200 } },
+    });
+    expect(posted.statusCode).toBe(202);
+    await archive.resumeDeletions!();
+    const result = await app.inject({ url, headers });
+    expect(result.statusCode).toBe(200);
+    expect(result.json()).toMatchObject({ id: commandId, state: 'completed', total: 0 });
+    expect(result.headers['cache-control']).toContain('no-store');
+    vi.spyOn(archive, 'deletionJob').mockRejectedValueOnce(Error('STORAGE_READ_FAILED'));
+    expect((await app.inject({ url, headers })).statusCode).toBeGreaterThanOrEqual(500);
   });
   it('authenticates bounded media batches, rejects stale confirmation, and reports explicit favorite deletion', async () => {
     const { app, archive, cookie } = await fixture();
@@ -781,6 +828,9 @@ describe('server integration boundaries', () => {
       })
     ).json<MediaDeletePlan>();
     expect(fresh.favoriteSegments).toBe(1);
+    expect(
+      (await app.inject({ url: '/api/media-deletions/' + fresh.id, headers })).statusCode,
+    ).toBe(404);
     const deleted = await app.inject({
       method: 'POST',
       url,
@@ -790,6 +840,13 @@ describe('server integration boundaries', () => {
     expect(deleted.statusCode).toBe(202);
     expect(deleted.json<{ total: number }>().total).toBe(1);
     await archive.resumeDeletions!();
+    expect(
+      (await app.inject({ url: '/api/media-deletions/' + fresh.id, headers })).json(),
+    ).toMatchObject({
+      id: fresh.id,
+      state: 'completed',
+      processed: 1,
+    });
     const jobs = await app.inject({ url: '/api/media-deletions', headers });
     expect(jobs.statusCode).toBe(200);
     expect(jobs.json()).toEqual([
@@ -831,6 +888,26 @@ describe('server integration boundaries', () => {
     expect(vault.count).toBe(0);
     expect(await archive.listSubjects()).toEqual([]);
     expect((await app.inject({ url: '/health/ready' })).statusCode).toBe(200);
+  });
+
+  it('records a failed readiness response at error level and its recovery at info level', async () => {
+    const { app, archive } = await fixture();
+    const info = vi.fn();
+    const error = vi.fn();
+    app.addHook('preHandler', (request, _reply, done) => {
+      const logger = Object.create(request.log) as typeof request.log;
+      request.log = Object.assign(logger, { info, error });
+      done();
+    });
+    vi.spyOn(archive, 'syncRevisions').mockRejectedValueOnce(new Error('archive unavailable'));
+    expect((await app.inject({ url: '/health/ready' })).statusCode).toBe(503);
+    expect((await app.inject({ url: '/health/ready' })).statusCode).toBe(200);
+    expect(error).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ event: 'http_completed', route: '/health/ready', status: 503 }),
+    );
+    expect(info).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ event: 'http_completed', route: '/health/ready', status: 200 }),
+    );
   });
 
   it('returns cached health failures promptly and exposes the reason without waiting for a stalled archive', async () => {
@@ -2059,6 +2136,34 @@ describe('server integration boundaries', () => {
     expect(await readdir(target)).toEqual([]);
   });
 
+  it('dispatches global recording to the committed targets without rereading the subject directory', async () => {
+    const { app, archive, cookie, supervisor } = await fixture();
+    const tracked = { id: 'stripchat:1', providerId: 1, handle: 'tracked' };
+    const archived = { id: 'stripchat:2', providerId: 2, handle: 'archived' };
+    const manual = { id: 'stripchat:3', providerId: 3, handle: 'manual' };
+    await archive.upsertSubjects([tracked, archived], { syncAccount: true });
+    await archive.upsertSubjects([tracked], { syncAccount: true });
+    await archive.upsertSubjects([manual]);
+    const directory = vi.spyOn(archive, 'listSubjects');
+    const dispatch = vi.fn<NonNullable<SupervisorPort['requestRecording']>>(() =>
+      Promise.resolve(),
+    );
+    supervisor.requestRecording = dispatch;
+    for (const enabled of [true, false]) {
+      const result = await app.inject({
+        method: 'PUT',
+        url: '/api/subjects/recording-default',
+        headers: { cookie },
+        payload: { enabled },
+      });
+      expect(result.statusCode).toBe(200);
+      await vi.waitFor(() => expect(dispatch).toHaveBeenCalledOnce());
+      expect([...dispatch.mock.calls[0][0]].sort()).toEqual([tracked.id, manual.id]);
+      expect(directory).not.toHaveBeenCalled();
+      dispatch.mockClear();
+    }
+  });
+
   it('stores the global recording default independently of current membership and remote reconciliation', async () => {
     const { app, archive, cookie, supervisor } = await fixture();
     let release!: () => void;
@@ -2271,7 +2376,7 @@ it('keeps the status endpoint useful when an observer fails without leaking its 
     .spyOn(archive, 'backgroundTasks')
     .mockRejectedValue(Error('Cookie=secret; D:/private/state'));
   const deletion = vi
-    .spyOn(archive, 'deletionJobs')
+    .spyOn(archive, 'deletionInventory')
     .mockRejectedValue(Error('private deletion failure'));
   try {
     const response = await app.inject({ url: '/api/system', headers: { cookie } });

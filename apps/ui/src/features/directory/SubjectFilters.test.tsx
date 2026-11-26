@@ -2,11 +2,11 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { expect, it } from 'vitest';
 import { SubjectFilters } from './SubjectFilters';
 
-it('shows only three groups, hides zero counts and preserves the active group', () => {
+it('renders independent states for multiple selected filters and hides zero counts', () => {
   const html = renderToStaticMarkup(
     <SubjectFilters
-      statusFilter="OFFLINE"
-      setStatusFilter={() => undefined}
+      filters={['ONLINE', 'OFFLINE']}
+      onToggle={() => undefined}
       counts={{ ONLINE: 12, OFFLINE: 3, ARCHIVED: 0 }}
     />,
   );
@@ -18,6 +18,20 @@ it('shows only three groups, hides zero counts and preserves the active group', 
     '<span class="filter-label-compact">离线</span><span class="filter-count">3</span>',
   );
   expect(html).toContain('<span class="filter-label-compact">归档</span></button>');
-  expect(html).toContain('class="active" aria-pressed="true" aria-label="离线"');
+  expect(html).toContain('aria-pressed="true" aria-label="在线"');
+  expect(html).toContain('aria-pressed="true" aria-label="离线"');
+  expect(html).toContain('aria-pressed="false" aria-label="归档"');
+  expect(html).not.toContain('<svg');
   expect(html).not.toContain('全部');
+});
+
+it('renders all three filters off when none is selected', () => {
+  const html = renderToStaticMarkup(
+    <SubjectFilters
+      filters={[]}
+      onToggle={() => undefined}
+      counts={{ ONLINE: 1, OFFLINE: 0, ARCHIVED: 1 }}
+    />,
+  );
+  expect(html.match(/aria-pressed="false"/g) ?? []).toHaveLength(3);
 });

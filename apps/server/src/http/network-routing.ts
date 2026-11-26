@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { subjectIdSchema } from '@st-vault/api-schema';
 import type { FastifyInstance } from 'fastify';
 import type { AccountSyncPort, ArchivePort } from '../ports.js';
 import type { NetworkRouting } from '../network/network-routing.js';
@@ -18,10 +19,7 @@ export function registerNetworkRouting(
         z
           .object({
             kind: z.literal('cdn'),
-            subjectId: z
-              .string()
-              .regex(/^stripchat:[1-9]\d*$/)
-              .optional(),
+            subjectId: subjectIdSchema.optional(),
           })
           .strict(),
       ])

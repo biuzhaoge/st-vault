@@ -139,8 +139,10 @@ it('releases cancelled coverage waiting for the shared index and never posts its
   });
   const reads = vi.spyOn(Metadata.prototype, 'read');
   const archive = await openArchive({ root });
-  const index = archive as unknown as { unitWork: Promise<void>; unitIndexWaiters: Set<unknown> };
-  const subscribe = vi.spyOn(index.unitWork, 'then');
+  const { unitIndex } = archive as unknown as {
+    unitIndex: { work: Promise<void>; waiters: Set<unknown> };
+  };
+  const subscribe = vi.spyOn(unitIndex.work, 'then');
   const controllers = Array.from({ length: 24 }, () => new AbortController());
   const aborted = new DOMException('Fixture request cancelled', 'AbortError');
   const drained = Promise.allSettled(
@@ -154,7 +156,7 @@ it('releases cancelled coverage waiting for the shared index and never posts its
     );
     expect(reads.mock.calls.filter(([method]) => method === 'coverage')).toHaveLength(0);
     expect(subscribe).not.toHaveBeenCalled();
-    expect(index.unitIndexWaiters.size).toBe(0);
+    expect(unitIndex.waiters.size).toBe(0);
     const { signal } = new AbortController();
     const kept = Promise.all([
       archive.coverage('stripchat:42', 0, 1000, 5, false, signal),
@@ -164,7 +166,7 @@ it('releases cancelled coverage waiting for the shared index and never posts its
     expect(await kept).toMatchObject(
       Array.from({ length: 2 }, () => ({ subjectId: 'stripchat:42' })),
     );
-    expect(index.unitIndexWaiters.size).toBe(0);
+    expect(unitIndex.waiters.size).toBe(0);
     expect(getEventListeners(signal, 'abort')).toHaveLength(0);
     expect(reads.mock.calls.filter(([method]) => method === 'coverage')).toHaveLength(2);
   } finally {

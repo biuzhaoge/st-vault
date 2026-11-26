@@ -1,6 +1,10 @@
 import type { SqlDatabase } from '../database/sql.js';
-import type { MediaDeletionJob, MediaDeletionTarget } from '@st-vault/api-schema';
-import type { DeletionStore } from './deletion-store.js';
+import type {
+  MediaDeletionJob,
+  MediaDeletionQueue,
+  MediaDeletionTarget,
+} from '@st-vault/api-schema';
+import { deletionItemStates, type DeletionStore } from './deletion-store.js';
 import type { MediaSelectionStore } from './media-selection-store.js';
 import { initializeDeletionVisibility } from './unit-visibility.js';
 type IntentTarget = MediaDeletionTarget & { protectedFavorites?: Record<string, true> };
@@ -23,6 +27,12 @@ type IntentProgress = Pick<
   Intent,
   'job' | 'phase' | 'scanned' | 'selected' | 'from_ms' | 'to_ms' | 'revision'
 >;
+const receiptKey = (id: string): string => 'deletion.receipt.' + id;
+function terminalReceipt(id: string, job: MediaDeletionJob | null): MediaDeletionJob {
+  if (job?.id !== id || (job.state !== 'failed' && job.state !== 'completed'))
+    throw Error('INVALID_DELETION_RECEIPT');
+  return job;
+}
 function withIntentProgress(job: MediaDeletionJob, intent?: IntentProgress): MediaDeletionJob {
   if (!intent) return job;
   return {
@@ -48,7 +58,7 @@ const matches = `u.created_revision<=i.cutoff AND (
     OR EXISTS(SELECT 1 FROM selection_units x WHERE x.selection=(i.payload::jsonb #>> '{baseSelectionId}') AND x.unit=u.id)))
   OR u.id IN(SELECT value FROM json_array_elements_text(coalesce(i.payload::json #> '{patch,includeUnitIds}','[]'::json)) AS j(value)))
   AND u.id NOT IN(SELECT value FROM json_array_elements_text(coalesce(i.payload::json #> '{patch,excludeUnitIds}','[]'::json)) AS j(value))`;
-/** Small durable admission; each continuation changes at most 256 units or 128 fragments. */
+/** Small durable admission followed by bounded continuations. */
 export class DeletionIntents {
   private readonly db: SqlDatabase;
   private readonly jobs: DeletionStore;
@@ -78,15 +88,34 @@ export class DeletionIntents {
       CREATE INDEX IF NOT EXISTS deletion_intents_subject ON deletion_intents(subject,phase);
       CREATE OR REPLACE VIEW deletion_intent_units AS
       SELECT u.id AS unit,i.job FROM recording_units u JOIN deletion_intents i ON i.subject=u.subject
-      JOIN media_deletions d ON d.id=i.job WHERE d.state='preparing' AND u.deleted=0 AND
+      JOIN media_deletions d ON d.id=i.job WHERE d.state IN ('waiting','preparing') AND u.deleted=0 AND
       (CASE WHEN i.phase='plan' THEN EXISTS(SELECT 1 FROM deletion_units x WHERE x.job=i.job AND x.unit=u.id)
       ELSE (${matches}) END)
       UNION ALL SELECT x.unit,x.job FROM deletion_units x JOIN media_deletions d ON d.id=x.job
-      WHERE d.state IN ('queued','running','retry');`);
+      WHERE d.state IN (${deletionItemStates});`);
     await initializeDeletionVisibility(this.db);
   }
-  async admit(subject: string, id: string, target: MediaDeletionTarget): Promise<MediaDeletionJob> {
+  async admit(
+    subject: string,
+    id: string,
+    target: MediaDeletionTarget,
+    publish?: () => Promise<number>,
+  ): Promise<MediaDeletionJob> {
     const payload = JSON.stringify(target);
+    // Compact terminal receipts live in the existing portable key/value table. Its
+    // schema is already present in historical checkpoints and journal headers.
+    const receipt = await this.db
+      .prepare(
+        `SELECT value::jsonb->'job' AS job,
+        value::jsonb->>'target'=encode(sha256(convert_to((?::jsonb)::text,'UTF8')),'hex') AS same
+        FROM settings WHERE key=?`,
+      )
+      .get<{ job: MediaDeletionJob; same: boolean }>(payload, receiptKey(id));
+    if (receipt) {
+      const job = terminalReceipt(id, receipt.job);
+      if (job.subjectId !== subject || !receipt.same) throw Error('COMMAND_ID_CONFLICT');
+      return job;
+    }
     const prior = await this.db
       .prepare(
         "SELECT subject,(payload::jsonb-'protectedFavorites')=?::jsonb AS same FROM deletion_intents WHERE job=?",
@@ -121,7 +150,10 @@ export class DeletionIntents {
       )
       .run(id, subject, stored, cutoff, await this.personal(), target.fromMs, target.toMs);
     if (base) await this.selections.pin(base, id);
-    await this.db.prepare("UPDATE media_deletions SET state='preparing' WHERE id=?").run(id);
+    const state = await this.jobs.admissionState('preparing');
+    await this.db
+      .prepare('UPDATE media_deletions SET state=?,updated=? WHERE id=?')
+      .run(state, Date.now(), id);
     await this.db.prepare('DELETE FROM deletion_growth WHERE job=?').run(id);
     // Seal only the selected open unit. Future recording belongs to a successor
     // and cannot enter this already-confirmed command, even after a long restart.
@@ -131,7 +163,28 @@ export class DeletionIntents {
       SELECT 1 FROM deletion_intent_units x WHERE x.unit=recording_units.id AND x.job=?)`,
       )
       .run(subject, id);
+    if (publish)
+      await this.db
+        .prepare('UPDATE deletion_intents SET revision=? WHERE job=?')
+        .run(await publish(), id);
     return await this.get(id);
+  }
+  async cleanup(): Promise<boolean> {
+    return this.jobs.cleanup(async (id) => {
+      const key = receiptKey(id);
+      const intent = await this.db
+        .prepare(
+          `SELECT
+          encode(sha256(convert_to((payload::jsonb-'protectedFavorites')::text,'UTF8')),'hex') AS target
+          FROM deletion_intents WHERE job=? AND NOT EXISTS(SELECT 1 FROM settings WHERE key=?)`,
+        )
+        .get<{ target: string }>(id, key);
+      if (!intent) return;
+      const job = await this.get(id);
+      await this.db
+        .prepare('INSERT INTO settings(key,value) VALUES(?,?)')
+        .run(key, JSON.stringify({ target: intent.target, job }));
+    });
   }
   /** Hidden units cannot be newly liked. Preserve only those exclusions which
    * an accepted unlike would otherwise remove, without scanning the delete
@@ -144,7 +197,7 @@ export class DeletionIntents {
         FROM deletion_intents i JOIN media_deletions d ON d.id=i.job
         JOIN selection_units x ON x.selection=?
         JOIN recording_units u ON u.id=x.unit AND u.subject=i.subject
-        WHERE i.subject=? AND d.state='preparing' AND i.phase IN ('units','extras')
+        WHERE i.subject=? AND d.state IN ('waiting','preparing') AND i.phase IN ('units','extras')
         AND jsonb_exists(i.payload::jsonb,'protectedFavorites')
         AND u.deleted=0 AND u.created_revision<=i.cutoff AND u.start<i.to_ms AND u."end">i.from_ms
         AND EXISTS(SELECT 1 FROM unit_favorite_facts f WHERE f.unit=u.id)
@@ -157,24 +210,41 @@ export class DeletionIntents {
       .run(selection, subject);
   }
   async get(id: string): Promise<MediaDeletionJob> {
-    const job = await this.jobs.get(id);
+    return this.progress(await this.jobs.get(id));
+  }
+  async lookup(id: string): Promise<MediaDeletionJob | null> {
+    const receipt = await this.db
+      .prepare("SELECT value::jsonb->'job' AS job FROM settings WHERE key=?")
+      .get<{ job: MediaDeletionJob }>(receiptKey(id));
+    if (receipt) return terminalReceipt(id, receipt.job);
+    const job = await this.jobs.find(id);
+    if (!job || String(job.state) === 'planned') return null;
+    const result = await this.progress(job);
+    return String(result.state) === 'discarding' ? null : result;
+  }
+  private async progress(job: MediaDeletionJob): Promise<MediaDeletionJob> {
     const intent = await this.db
       .prepare(
         'SELECT job,phase,scanned,selected,from_ms,to_ms,revision FROM deletion_intents WHERE job=?',
       )
-      .get<IntentProgress>(id);
+      .get<IntentProgress>(job.id);
+    // The previous release may have begun paged cleanup before upgrading. Only
+    // terminal accepted intents enter discarding; failures carry their error.
+    if (intent && String(job.state) === 'discarding')
+      job.state = job.error ? 'failed' : 'completed';
     return withIntentProgress(job, intent);
   }
-  async list(): Promise<MediaDeletionJob[]> {
-    const jobs = await this.jobs.list();
-    if (jobs.length === 0) return jobs;
+  async list(): Promise<MediaDeletionQueue> {
+    const inventory = await this.jobs.list();
+    const { jobs } = inventory;
+    if (jobs.length === 0) return inventory;
     const rows = await this.db
       .prepare(
         'SELECT job,phase,scanned,selected,from_ms,to_ms,revision FROM deletion_intents WHERE job IN (SELECT value FROM json_array_elements_text(?::json))',
       )
       .all<IntentProgress>(JSON.stringify(jobs.map((job) => job.id)));
     const byId = new Map(rows.map((row) => [row.job, row]));
-    return jobs.map((job) => withIntentProgress(job, byId.get(job.id)));
+    return { ...inventory, jobs: jobs.map((job) => withIntentProgress(job, byId.get(job.id))) };
   }
   private async unpin(intent: Intent): Promise<void> {
     const target = JSON.parse(intent.payload) as MediaDeletionTarget;
@@ -185,20 +255,6 @@ export class DeletionIntents {
           ? target.baseSelectionId
           : undefined;
     if (base) await this.selections.unpin(base, intent.job);
-  }
-  async pending(excludedSubjects: readonly string[] = []): Promise<MediaDeletionJob | null> {
-    const row = await this.db
-      .prepare(
-        `SELECT id FROM media_deletions d WHERE state='preparing' AND retry_at<=?
-        AND subject NOT IN(SELECT value FROM json_array_elements_text(?::json) AS busy(value))
-        AND NOT EXISTS(SELECT 1 FROM media_deletions older WHERE older.subject=d.subject
-          AND older.state IN ('preparing','queued','running','retry') AND (older.created,older.id)<(d.created,d.id))
-        ORDER BY updated,id LIMIT 1`,
-      )
-      .get<{
-        id: string;
-      }>(Date.now(), JSON.stringify(excludedSubjects));
-    return row ? await this.get(row.id) : null;
   }
   async step(jobId?: string): Promise<MediaDeletionJob | null> {
     const i = await this.db
@@ -224,13 +280,14 @@ export class DeletionIntents {
         )
         .run(Date.now(), i.job);
       await this.unpin(i);
+      await this.jobs.promoteWaiting();
       return await this.get(i.job);
     }
     if (i.phase === 'plan') {
       if (!(await this.jobs.build(i.job))) {
         await this.db
           .prepare(
-            "UPDATE media_deletions SET state=CASE WHEN total=0 THEN 'completed' ELSE 'queued' END,updated=? WHERE id=?",
+            "UPDATE media_deletions SET state=CASE WHEN total=processed THEN 'completed' ELSE 'queued' END,updated=? WHERE id=?",
           )
           .run(Date.now(), i.job);
         await this.db.prepare("UPDATE deletion_intents SET phase='delete' WHERE job=?").run(i.job);
@@ -238,63 +295,46 @@ export class DeletionIntents {
       }
     } else {
       const range = i.phase === 'units' && target.kind === 'range';
-      const rows = range
-        ? await this.db
-            .prepare(
-              `SELECT id,start FROM recording_units WHERE subject=? AND deleted=0
-        AND start>? AND start<? AND created_revision<=? AND (start,id)>(?,?) ORDER BY start,id LIMIT 256`,
-            )
-            .all<{
-              id: string;
-              start: number;
-            }>(
-              i.subject,
-              Math.max(-1, i.from_ms - 86460000),
-              i.to_ms,
-              i.cutoff,
-              i.cursor_start,
-              i.cursor_id,
-            )
-        : await this.db
-            .prepare(
-              `SELECT u.id,u.start FROM recording_units u WHERE u.subject=? AND u.id IN(
-          SELECT value FROM json_array_elements_text(coalesce(?::json #> '{unitIds}','[]'::json)) AS j(value) UNION SELECT value FROM json_array_elements_text(coalesce(?::json #> '{patch,includeUnitIds}','[]'::json)) AS j(value)
-          UNION SELECT unit FROM selection_units WHERE selection=coalesce((?::jsonb #>> '{selectionId}'),(?::jsonb #>> '{baseSelectionId}')))
-          AND u.id>? ORDER BY u.id LIMIT 256`,
-            )
-            .all<{
-              id: string;
-              start: number;
-            }>(i.subject, i.payload, i.payload, i.payload, i.payload, i.cursor_id);
-      const selected = (
-        await this.db
-          .prepare(
-            `INSERT INTO deletion_units(job,unit)
-         SELECT i.job,u.id FROM recording_units u JOIN deletion_intents i ON i.job=?
-         WHERE u.id IN(SELECT value FROM json_array_elements_text(?::json) AS candidate(value))
-         AND u.deleted=0 AND (${matches}) ON CONFLICT DO NOTHING`,
-          )
-          .run(i.job, JSON.stringify(rows.map((row) => row.id)))
-      ).changes;
-      const last = rows.at(-1);
-      const next = rows.length === 256 ? i.phase : range ? 'extras' : 'plan';
+      const next =
+        range && (target.baseSelectionId || target.patch?.includeUnitIds?.length)
+          ? 'extras'
+          : 'plan';
+      const candidates = range
+        ? `u.deleted=0 AND u.start>GREATEST(-1,i.from_ms-86400000) AND u.start<i.to_ms
+        AND u.created_revision<=i.cutoff AND (u.start,u.id)>(i.cursor_start,i.cursor_id)`
+        : `u.id>i.cursor_id AND u.id IN(
+          SELECT value FROM json_array_elements_text(coalesce(i.payload::json #> '{unitIds}','[]'::json)) AS j(value)
+          UNION SELECT value FROM json_array_elements_text(coalesce(i.payload::json #> '{patch,includeUnitIds}','[]'::json)) AS j(value)
+          UNION SELECT unit FROM selection_units
+          WHERE selection=coalesce(i.payload::jsonb #>> '{selectionId}',i.payload::jsonb #>> '{baseSelectionId}'))`;
       await this.db
         .prepare(
-          `UPDATE deletion_intents SET phase=?,cursor_start=?,cursor_id=?,scanned=scanned+?,selected=selected+? WHERE job=?`,
+          `WITH intent AS MATERIALIZED (SELECT * FROM deletion_intents WHERE job=?),
+          candidates AS MATERIALIZED (
+            SELECT u.* FROM intent i JOIN recording_units u ON u.subject=i.subject
+            WHERE ${candidates} ORDER BY ${range ? 'u.start,u.id' : 'u.id'} LIMIT 256
+          ), selected AS (
+            INSERT INTO deletion_units(job,unit)
+            SELECT i.job,u.id FROM candidates u CROSS JOIN intent i
+            WHERE u.deleted=0 AND (${matches}) ON CONFLICT DO NOTHING RETURNING unit
+          ), counts AS (
+            SELECT (SELECT count(*) FROM candidates) AS scanned,(SELECT count(*) FROM selected) AS selected
+          ), last AS (
+            SELECT start,id FROM candidates ORDER BY ${range ? 'start DESC,id DESC' : 'id DESC'} LIMIT 1
+          )
+          UPDATE deletion_intents i SET phase=CASE WHEN c.scanned=256 THEN i.phase ELSE ? END,
+          cursor_start=CASE WHEN c.scanned=256 THEN (SELECT start FROM last) ELSE -1 END,
+          cursor_id=CASE WHEN c.scanned=256 THEN (SELECT id FROM last) ELSE '' END,
+          scanned=i.scanned+c.scanned,selected=i.selected+c.selected FROM counts c WHERE i.job=?`,
         )
-        .run(
-          next,
-          next === i.phase ? (last?.start ?? i.cursor_start) : -1,
-          next === i.phase ? (last?.id ?? i.cursor_id) : '',
-          rows.length,
-          selected,
-          i.job,
-        );
+        .run(i.job, next, i.job);
     }
     await this.db
       .prepare('UPDATE media_deletions SET updated=?,error=NULL,retry_at=0 WHERE id=?')
       .run(Date.now(), i.job);
-    return await this.get(i.job);
+    const job = await this.get(i.job);
+    if (job.state === 'completed') await this.jobs.promoteWaiting();
+    return job;
   }
   async retry(id: string): Promise<void> {
     await this.db

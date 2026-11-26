@@ -20,7 +20,7 @@ import {
 import { TimelineRuler } from './TimelineRuler';
 import { dayLabel } from '../../shared/lib/date-label';
 import { Icon } from '../../design/Icon';
-import { calendarSpan } from '../../shared/lib/time';
+import { fullCalendar, type ArchiveCalendar } from './archive-calendar';
 
 export const TimeRangeControl = memo(function TimeRangeControl({
   fromMs,
@@ -30,16 +30,18 @@ export const TimeRangeControl = memo(function TimeRangeControl({
   onMove,
   nowMs = Date.now(),
   filters,
+  calendar = fullCalendar,
 }: ViewWindow & {
   timelineStartMs: number;
   onChange: (window: ViewWindow) => void;
   onMove: (direction: -1 | 1) => void;
   nowMs?: number;
   filters?: ReactNode;
+  calendar?: ArchiveCalendar;
 }): JSX.Element {
   const first = dayStart(timelineStartMs),
     last = calendarEnd(nowMs);
-  const total = Math.max(0.5, calendarSpan(first, last) / DAY_MS);
+  const total = Math.max(0.5, calendar.visibleSpan(first, last) / DAY_MS);
   const root = useRef<HTMLDivElement>(null),
     rail = useRef<HTMLDivElement>(null);
   const move = useRef(onMove);
@@ -55,8 +57,8 @@ export const TimeRangeControl = memo(function TimeRangeControl({
   } | null>(null);
   const [preview, setPreview] = useState<ViewWindow | null>(null);
   const shown = preview ?? { fromMs, toMs };
-  const startDay = calendarSpan(first, shown.fromMs) / DAY_MS,
-    visibleDays = calendarSpan(shown.fromMs, shown.toMs) / DAY_MS;
+  const startDay = calendar.visibleSpan(first, shown.fromMs) / DAY_MS,
+    visibleDays = calendar.visibleSpan(shown.fromMs, shown.toMs) / DAY_MS;
   const spanLabel =
     visibleDays < 1 ? `${visibleDays * 24}${tr('小时')}` : tr('{{v0}}天', { v0: visibleDays });
   // The readable minimum thumb width must share the same available travel scale as dragging.
@@ -96,8 +98,15 @@ export const TimeRangeControl = memo(function TimeRangeControl({
     const delta = ((event.clientX - current.x) * current.days) / current.width;
     const next =
       current.edge === 'move'
-        ? moveWindow(current.window, delta * 2, timelineStartMs, nowMs)
-        : resizeCalendarWindow(current.window, current.edge, delta, timelineStartMs, nowMs);
+        ? moveWindow(current.window, delta * 2, timelineStartMs, nowMs, undefined, calendar)
+        : resizeCalendarWindow(
+            current.window,
+            current.edge,
+            delta,
+            timelineStartMs,
+            nowMs,
+            calendar,
+          );
     if (next.fromMs === current.next.fromMs && next.toMs === current.next.toMs) return;
     current.next = next;
     setPreview(next);
@@ -126,8 +135,8 @@ export const TimeRangeControl = memo(function TimeRangeControl({
     const window = { fromMs, toMs };
     const next =
       edge === 'move'
-        ? moveWindow(window, delta, timelineStartMs, nowMs)
-        : resizeCalendarWindow(window, edge, delta / 2, timelineStartMs, nowMs);
+        ? moveWindow(window, delta, timelineStartMs, nowMs, undefined, calendar)
+        : resizeCalendarWindow(window, edge, delta / 2, timelineStartMs, nowMs, calendar);
     if (next.fromMs !== fromMs || next.toMs !== toMs) onChange(next);
   };
   const dragProps = (edge: 'from' | 'to' | 'move') => ({
@@ -143,7 +152,10 @@ export const TimeRangeControl = memo(function TimeRangeControl({
         pointerId: event.pointerId,
         x: event.clientX,
         width: edge === 'move' ? Math.max(1, width - thumbWidth) : width,
-        days: edge === 'move' ? Math.max(0, total - calendarSpan(fromMs, toMs) / DAY_MS) : total,
+        days:
+          edge === 'move'
+            ? Math.max(0, total - calendar.visibleSpan(fromMs, toMs) / DAY_MS)
+            : total,
         window,
         next: window,
       };
@@ -176,7 +188,7 @@ export const TimeRangeControl = memo(function TimeRangeControl({
           <button
             className="day-step"
             aria-label={tr('前12小时')}
-            disabled={fromMs <= first}
+            disabled={calendar.visibleSpan(first, fromMs) <= 0}
             onClick={() => onMove(-1)}
           >
             <Icon name="chevron-left" />
@@ -242,7 +254,7 @@ export const TimeRangeControl = memo(function TimeRangeControl({
           <button
             className="day-step"
             aria-label={tr('后12小时')}
-            disabled={toMs >= last}
+            disabled={calendar.visibleSpan(toMs, last) <= 0}
             onClick={() => onMove(1)}
           >
             <Icon name="chevron-right" />
@@ -250,7 +262,13 @@ export const TimeRangeControl = memo(function TimeRangeControl({
         </div>
       </div>
       <div className="time-ruler-row">
-        <TimelineRuler fromMs={fromMs} toMs={toMs} overscanMs={DAY_MS} nowMs={dayStart(nowMs)} />
+        <TimelineRuler
+          fromMs={fromMs}
+          toMs={toMs}
+          overscanMs={DAY_MS}
+          nowMs={dayStart(nowMs)}
+          calendar={calendar}
+        />
       </div>
     </div>
   );

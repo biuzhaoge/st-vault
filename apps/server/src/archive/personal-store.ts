@@ -7,6 +7,16 @@ import type {
   UnitSeenEvidence,
 } from '@st-vault/api-schema';
 
+export const storedFavoriteUnitsSql = `SELECT f.unit FROM unit_favorites f JOIN recording_units u ON u.id=f.unit
+  WHERE u.subject=? AND u.start>? AND u.start<? AND u."end">? AND u.deleted=0`;
+export function favoriteCoverageWindow(
+  subject: string,
+  from: number,
+  to: number,
+): [string, number, number, number] {
+  return [subject, Math.max(-1, from - 86400000), to, from];
+}
+
 function appendCoverageSpan(
   spans: MediaTimeRange[],
   fromMs: number | null,
@@ -139,8 +149,7 @@ export class PersonalStore {
     return this.db
       .prepare(
         `WITH candidates AS (
-          SELECT f.unit FROM unit_favorites f JOIN recording_units u ON u.id=f.unit
-          WHERE u.subject=? AND u.start>? AND u.start<? AND u."end">? AND u.deleted=0
+          ${storedFavoriteUnitsSql}
           UNION
           SELECT x.unit FROM favorite_commands c JOIN selection_units x ON x.selection=c.selection
           JOIN recording_units u ON u.id=x.unit
@@ -165,14 +174,8 @@ export class PersonalStore {
         ORDER BY "fromMs"`,
       )
       .all<MediaTimeRange>(
-        subjectId,
-        Math.max(-1, from - 86400000),
-        to,
-        from,
-        subjectId,
-        Math.max(-1, from - 86400000),
-        to,
-        from,
+        ...favoriteCoverageWindow(subjectId, from, to),
+        ...favoriteCoverageWindow(subjectId, from, to),
         from,
         to,
         to,

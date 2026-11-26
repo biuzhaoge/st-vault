@@ -133,8 +133,7 @@ button:disabled {
 .tool-trigger .ui-icon,
 .header-tools > button .ui-icon,
 .player-control .ui-icon,
-.day-step .ui-icon,
-.snapshot-favorite .ui-icon {
+.day-step .ui-icon {
   transition:
     transform var(--motion-surface) var(--motion-spring),
     color var(--motion-fast);
@@ -194,51 +193,31 @@ button:disabled {
 }
 .subject-filters,
 .time-control-row,
-.snapshot-pages {
+.snapshot-pages::before {
   padding: 2px;
   background: var(--segment-track-fill);
   border-radius: var(--radius-pill);
   corner-shape: round;
   box-shadow: var(--segment-track-shadow);
 }
+.snapshot-pages::before {
+  padding: 0;
+}
 .subject-filters {
-  position: relative;
-  isolation: isolate;
-  gap: 0;
+  gap: 2px;
 }
 .subject-filters button {
-  background: transparent;
-  z-index: 1;
   border-radius: var(--radius-pill);
   corner-shape: round;
-  transition: color var(--motion-fast);
 }
-.subject-filters button.active {
-  background: transparent;
-  color: var(--ink);
-}
-.subject-filters button:not(.active):hover:enabled {
-  color: var(--ink);
-  background: var(--segment-hover-fill);
-}
-.glass-selection {
-  position: absolute;
-  z-index: 0;
-  top: 2px;
-  bottom: 2px;
-  left: 2px;
-  width: calc((100% - 4px) / var(--selection-count, 3));
-  border-radius: var(--radius-pill);
-  corner-shape: round;
+.subject-filters button[aria-pressed='true'] {
   background: var(--segment-active-fill);
   box-shadow: var(--segment-active-shadow);
-  pointer-events: none;
-  transition:
-    transform var(--motion-surface) var(--motion-spring),
-    border-radius var(--motion-fast);
+  color: var(--ink);
 }
-.subject-filters:active .glass-selection {
-  border-radius: 12px;
+.subject-filters button:hover:enabled:not([aria-pressed='true']) {
+  color: var(--ink);
+  background: var(--segment-hover-fill);
 }
 .day-step {
   border-radius: var(--radius-pill);
@@ -289,12 +268,17 @@ button:disabled {
   content: '';
   position: absolute;
   inset: 2px 0;
+  inset-inline-start: var(--subject-number-width);
   z-index: 6;
   pointer-events: none;
   border-radius: var(--radius-small);
-  background: linear-gradient(90deg, #ff78882e, #ff788815 55%, #ffffff05);
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--accent-hover) 18%, transparent),
+    color-mix(in srgb, var(--accent-hover) 8%, transparent) 55%,
+    #ffffff05
+  );
   box-shadow:
-    inset 3px 0 var(--accent-hover),
     inset 0 1px #ffffff14,
     inset 0 -1px #ffffff0a;
   opacity: 0;
@@ -350,23 +334,43 @@ svg.track-clip[data-favorite='true'] {
       color-mix(in srgb, var(--track-tint) 24%, #202020)
     ),
     color-mix(in srgb, var(--track-tint) 32%, #222222);
-  box-shadow:
-    var(--glass-track-edge),
-    inset 3px 0 color-mix(in srgb, var(--track-tint) 80%, white 20%);
+  box-shadow: var(--glass-track-edge);
 }
-:is(.track-row, .track-row-motion-ghost).selected {
-  background: #f07b8a1a;
-  box-shadow:
-    inset 0 1px #ffc4d73d,
-    inset 0 -1px #ffc4d72e;
+.record-button[aria-checked='true'] {
+  --row-number-ink: var(--accent-hover);
+  --row-number-light: color-mix(in srgb, var(--accent) 23%, white);
+  --row-number-middle: color-mix(in srgb, var(--accent) 38%, white);
+  --row-number-shade: color-mix(in srgb, var(--accent) 65%, white);
 }
-:is(.track-row, .track-row-motion-ghost).selected .track-label {
-  box-shadow: inset 3px 0 #ffa7b1;
+.record-button.is-recording {
+  --row-number-ink: color-mix(in srgb, var(--accent) 75%, white);
+  --row-number-light: color-mix(in srgb, var(--accent) 40%, white);
+  --row-number-middle: var(--accent-hover);
+  --row-number-shade: var(--accent);
+}
+@media (forced-colors: none) {
+  @supports (background-clip: text) {
+    .directory-row-number > span {
+      background-image: linear-gradient(
+        168deg,
+        #fff 5%,
+        var(--row-number-light, #edf4f8) 33%,
+        var(--row-number-middle, #c4d1dc) 48%,
+        var(--row-number-shade, #9aabb9) 53%,
+        var(--row-number-middle, #ccd9e3) 83%,
+        var(--row-number-light, #f2f8fc) 100%
+      );
+      background-clip: text;
+      color: transparent;
+      -webkit-text-stroke: 0.25px #edf7ff7a;
+      filter: drop-shadow(0 1px 1px #0007);
+    }
+  }
 }
 .track-cover-wrap {
   border-radius: var(--radius-small);
 }
-.recording-toggle {
+.recording-toggle:not(.record-button) {
   box-shadow: inset 0 1px 3px #0004;
 }
 .recording-toggle i {
@@ -406,20 +410,12 @@ svg.track-clip[data-favorite='true'] {
 }
 .range-selection {
   border-radius: var(--radius-small);
-  border-color: #ffb1ba;
-  background: #dd526120;
   box-shadow:
     0 0 0 1px #17171755,
-    inset 0 1px 0 #ffe3ee22;
-}
-.connection-rail {
-  background: transparent;
-}
-.row-connection {
-  color: #f598a4;
+    inset 0 1px 0 color-mix(in srgb, var(--accent-hover) 15%, transparent);
 }
 .connection-close {
-  background: #313131;
+  background: var(--panel-raised);
   border-radius: var(--radius-pill);
   corner-shape: round;
   box-shadow:
@@ -443,7 +439,7 @@ svg.track-clip[data-favorite='true'] {
 }
 .player-actions .player-control--primary:hover:enabled,
 .primary:hover:enabled {
-  background: #d33a48;
+  background: var(--accent-fill-hover);
   color: white;
 }
 .player-actions .tool-trigger {
@@ -494,19 +490,16 @@ svg.track-clip[data-favorite='true'] {
   border-radius: var(--radius-small);
   background: #252525;
 }
-:is(.snapshot-grid, .snapshot-page-exit) button.selected > div::after {
-  border-radius: var(--radius-small);
-  border-color: #ffb4bd;
-}
 .snapshot-cell,
+.snapshot-ghost,
 .snapshot-gap {
   border-radius: var(--radius-small);
 }
 .snapshot-cell {
   transition: transform var(--motion-surface) var(--motion-spring);
 }
-:is(.snapshot-grid, .snapshot-exits) .snapshot-cell > button[data-unit-index],
-:is(.snapshot-grid, .snapshot-exits) .snapshot-cell > button[data-unit-index] > div {
+:is(.snapshot-cell, .snapshot-ghost) > button,
+:is(.snapshot-cell, .snapshot-ghost) > button > div {
   border-radius: inherit;
   corner-shape: inherit;
 }
@@ -626,21 +619,12 @@ select option {
   transition: filter var(--motion-fast);
 }
 @media (hover: hover) {
-  .track-label:hover {
+  .track-cover-cell:hover {
     filter: brightness(1.08);
   }
   .snapshot-section .snapshot-cell:hover .minute-image {
     filter: brightness(1.12);
   }
-  .recording-toggle.record-button:hover:enabled {
-    filter: brightness(1.15);
-  }
-}
-.snapshot-favorite[aria-pressed='true'] .ui-icon {
-  transform: scale(1.1);
-}
-.snapshot-favorite:active:not(:disabled) .ui-icon {
-  transform: scale(0.78) rotate(-8deg);
 }
 .recording-toggle i,
 .language-toggle-thumb {
@@ -661,7 +645,7 @@ select option {
 }
 
 @media (pointer: coarse) {
-  .recording-mode:not(.recording-icon) {
+  .recording-mode:not(.recording-number) {
     width: 44px;
   }
   /* The switch stays visually compact while its whole touch target is usable. */
@@ -703,23 +687,6 @@ select option {
   }
 }
 @media (any-pointer: coarse) {
-  .recording-toggle.record-button::after {
-    content: '';
-    position: absolute;
-    /* Grow inward over the cover without enlarging the visible connector. */
-    inset: -3px auto auto -3px;
-    width: 44px;
-    height: 44px;
-  }
-  .snapshot-cell > .snapshot-favorite::after {
-    --favorite-hit-size: clamp(24px, calc(var(--shot-width) * 0.39), 36px);
-    content: '';
-    position: absolute;
-    inset: -2px auto auto -2px;
-    /* Keep the center of the image available for seeking, even on small cells. */
-    inline-size: min(var(--favorite-hit-size), calc(var(--shot-width) / 2 - 2px));
-    block-size: min(var(--favorite-hit-size), calc(var(--shot-width) * 9 / 16));
-  }
   .view-position-handle {
     width: clamp(14px, 28%, 24px);
   }
@@ -778,7 +745,7 @@ select option {
   .media-review,
   .aligned-arrangement,
   .toolbar-popover,
-  .snapshot-actions,
+  .snapshot-pages::before,
   .media-delete-dialog,
   .auth-card,
   .playback-status--compact {
@@ -816,12 +783,29 @@ select option {
   }
 }
 @media (forced-colors: active) {
+  .record-button[aria-checked='true'] .directory-row-number {
+    text-decoration: underline;
+  }
+  .record-button.is-recording .directory-row-number {
+    text-decoration-style: double;
+  }
+  .row-connection {
+    color: Highlight;
+  }
+  :is(.snapshot-cell, .snapshot-ghost)[data-selected='true']::before {
+    border: 2px solid Highlight;
+  }
+  .snapshot-mark .ui-icon > path {
+    forced-color-adjust: none;
+    fill: Highlight;
+    stroke: Canvas;
+  }
   .topbar,
   .player-stage,
   .media-review,
   .aligned-arrangement,
   .toolbar-popover,
-  .snapshot-actions,
+  .snapshot-pages::before,
   .media-delete-dialog,
   .auth-card {
     background: Canvas;
@@ -830,9 +814,8 @@ select option {
     box-shadow: none;
     backdrop-filter: none;
   }
-  .glass-selection {
-    border: 2px solid Highlight;
-    background: Canvas;
+  .subject-filters button[aria-pressed='true'] {
+    border: 1px solid Highlight;
   }
   .ui-icon {
     color: ButtonText;

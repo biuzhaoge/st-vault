@@ -16,18 +16,23 @@ import { parentPort, workerData } from 'node:worker_threads';
 import { SqlDatabase } from '../database/sql.js';
 import { initializeBaseSchema } from '../database/catalog-schema.js';
 import { FileLease } from '../database/file-lease.js';
+import { deploymentTimeZone } from '../runtime/time-zone.js';
 import { readStatusHistory } from './status-history.js';
+import { createCoverageReader, MINUTE, readWorkbenchHistory } from './coverage-reader.js';
 import type { SQLInputValue } from '../database/sql.js';
 import { join } from 'node:path';
 import { lstatSync, mkdirSync } from 'node:fs';
-import type { DeletionStore } from './deletion-store.js';
+import {
+  activeDeletionStates,
+  deletionBatchSize,
+  unfinishedDeletionStates,
+  type DeletionStore,
+} from './deletion-store.js';
 import type * as DeletionModule from './deletion-store.js';
 import type * as DeletionIntentModule from './deletion-intents.js';
 import type { MediaDeletionTarget } from '@st-vault/api-schema';
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import type {
-  CoverageResponse,
-  CoverageBucket,
   GapPolicy,
   PublicStatus,
   Segment,
@@ -37,7 +42,7 @@ import type {
 } from '@st-vault/api-schema';
 import type { SubjectInput } from '../ports.js';
 import type { SnapshotItem, SnapshotPagesResponse, SnapshotSession } from '@st-vault/api-schema';
-import type { JournalRecord, ObjectRecord } from './index.js';
+import type { JournalRecord, ObjectRecord } from './records.js';
 import type { EventStore as EventStoreType } from './events-store.js';
 import type * as EventsModule from './events-store.js';
 import type { PersonalStore as PersonalStoreType } from './personal-store.js';
@@ -48,35 +53,61 @@ import type * as LibraryModule from '../library/storage.js';
 import type * as SettingsModule from '../library/settings.js';
 import type * as RpcModule from '../library/worker-rpc.js';
 import type * as ObjectQueriesModule from './object-queries.js';
-const { hasMediaSql, liveObjectsSql, overlappingSegmentsSql } = (await import(
-  new URL(
-    import.meta.url.endsWith('.ts') ? './object-queries.ts' : './object-queries.js',
-    import.meta.url,
-  ).href
-)) as typeof ObjectQueriesModule;
+import type * as EmptyDaysModule from './empty-days.js';
+const { deletionMinuteOverlapSql, hasMediaSql, liveObjectsSql, overlappingSegmentsSql } =
+  (await import(
+    new URL(
+      import.meta.url.endsWith('.ts') ? './object-queries.ts' : './object-queries.js',
+      import.meta.url,
+    ).href
+  )) as typeof ObjectQueriesModule;
+const { readEmptyDays, pruneEmptyHistory } = (await import(
+  new URL(import.meta.url.endsWith('.ts') ? './empty-days.ts' : './empty-days.js', import.meta.url)
+    .href
+)) as typeof EmptyDaysModule;
 // Unit-based deletions retire entire units. Their last visible end is enough
 // for directory sorting, even when thousands of source fragments are hidden.
+// The status-interval end index finds each adjacent online predecessor. A mode
+// change continues the observed session; an OFFLINE interval or a gap ends it.
 const subjectSelect = (activity = true): string => `SELECT s.*,
   ${
     activity
-      ? `CASE WHEN EXISTS(SELECT 1 FROM media_deletions WHERE subject=s.id AND state IN ('preparing','queued','running','retry'))
+      ? `CASE WHEN EXISTS(SELECT 1 FROM media_deletions WHERE subject=s.id AND state IN (${unfinishedDeletionStates}))
     THEN CASE
       WHEN (SELECT ready FROM unit_index WHERE id=1)=1 AND NOT EXISTS(
-        SELECT 1 FROM media_deletions d WHERE d.subject=s.id AND d.state IN ('preparing','queued','running','retry')
+        SELECT 1 FROM media_deletions d WHERE d.subject=s.id AND d.state IN (${unfinishedDeletionStates})
         AND NOT EXISTS(SELECT 1 FROM deletion_intents i WHERE i.job=d.id)
       ) THEN (SELECT "end" FROM visible_recording_units WHERE subject=s.id ORDER BY "end" DESC LIMIT 1)
       ELSE (SELECT "end" FROM visible_segments WHERE subject=s.id AND deleted=0 AND start IS NOT NULL AND "end" IS NOT NULL ORDER BY "end" DESC LIMIT 1)
     END
     ELSE (SELECT minute+(spans::json->-1->>1)::double precision FROM coverage_minutes WHERE subject=s.id AND covered_ms>0 ORDER BY minute DESC LIMIT 1)
   END AS last_recorded,
-  (SELECT start FROM status_intervals WHERE subject=s.id AND status IN ('PUBLIC','PRIVATE') ORDER BY start DESC LIMIT 1) AS last_online,`
-      : 'NULL AS last_recorded, NULL AS last_online,'
+  latest_online.start AS last_online,
+  CASE WHEN a.following IS DISTINCT FROM 0 AND COALESCE(NULLIF(s.status,'UNKNOWN'),e.status) IN ('PUBLIC','PRIVATE')
+    THEN (WITH RECURSIVE online_run(start) AS (
+      SELECT latest_online.start WHERE latest_online.start IS NOT NULL
+      UNION ALL
+      SELECT previous.start FROM online_run r CROSS JOIN LATERAL (
+        SELECT start FROM status_intervals
+        WHERE subject=s.id AND "end"=r.start AND start<r.start AND status IN ('PUBLIC','PRIVATE')
+        ORDER BY start DESC LIMIT 1
+      ) previous
+    ) SELECT min(start) FROM online_run)
+  END AS online_since,`
+      : 'NULL AS last_recorded, NULL AS last_online, NULL AS online_since,'
   }
   (SELECT coalesce(json_agg(handle)::text,'[]') FROM
     (SELECT handle FROM subject_name_history WHERE subject=s.id AND handle<>s.handle ORDER BY changed_at DESC,handle)) AS former_names,
   h.valid_until AS status_valid_until,a.following AS account_following,e.status AS last_known_status
   FROM subjects s LEFT JOIN status_heads h ON s.id=h.subject LEFT JOIN account_subjects a ON a.subject=s.id
-  LEFT JOIN status_event_states e ON e.subject=s.id`;
+  LEFT JOIN status_event_states e ON e.subject=s.id
+  ${
+    activity
+      ? `LEFT JOIN LATERAL (
+    SELECT start FROM status_intervals WHERE subject=s.id AND status IN ('PUBLIC','PRIVATE') ORDER BY start DESC LIMIT 1
+  ) latest_online ON true`
+      : ''
+  }`;
 interface SubjectRow {
   id: string;
   provider_id: number;
@@ -89,6 +120,7 @@ interface SubjectRow {
   observed: number | null;
   last_recorded: number | null;
   last_online: number | null;
+  online_since: number | null;
   unlocated: number;
   deletion_revision: number;
   status_valid_until?: number | null;
@@ -103,18 +135,18 @@ interface ObjectRow {
   kind: 'init' | 'fragment';
   deleted: number;
 }
-interface SegmentRow {
+interface DeletedSegment {
   id: string;
-  subject: string;
   media: string;
   init: string | null;
   start: number | null;
-  json: string;
-  deleted: number;
+  end: number | null;
+  visible: boolean;
 }
 interface RequestInput {
   activity?: boolean;
   includeProtection?: boolean;
+  includePendingDeletion?: boolean;
   enabled: boolean;
   excludedSubjects?: string[];
   commandId?: string;
@@ -124,7 +156,8 @@ interface RequestInput {
   selectionMode?: MediaSelectionMode;
   selectionOptions?: MediaSelectionOptions;
   selectionPatch?: MediaSelectionPatch;
-  liked?: boolean;
+  favoriteFilter?: boolean;
+  favoriteChanges?: FavoriteCommandsModule.FavoriteSelectionChange[];
   followLive?: boolean;
   unitId?: string;
   unitIds?: string[];
@@ -132,7 +165,7 @@ interface RequestInput {
   planId?: string;
   personalRevision?: number;
   processed?: number;
-  reclaimedBytes?: number;
+  gcObjectIds?: string[];
   window: MediaTimeRange;
   ranges?: MediaTimeRange[];
   segmentIds?: string[];
@@ -167,6 +200,7 @@ interface RequestInput {
   ids: string[];
   unlocated?: boolean;
   cutoff?: number;
+  retentionDays?: number;
   recovery?: boolean;
   clean?: boolean;
   eventAfter: number;
@@ -180,13 +214,6 @@ interface Minute {
   starts: string;
   ends: string;
   count: number;
-}
-interface MinuteSummary {
-  minute: number;
-  count: number;
-  covered_ms: number;
-  start_count: number;
-  end_count: number;
 }
 interface Cursor {
   subject: string;
@@ -207,7 +234,6 @@ if (typeof data !== 'object' || data === null || !('root' in data) || typeof dat
 const root = data.root;
 const mediaRoot =
   'mediaRoot' in data && typeof data.mediaRoot === 'string' ? data.mediaRoot : join(root, 'media');
-const MINUTE = 60000;
 let db!: SqlDatabase;
 let instance!: FileLease;
 let mediaInstance: FileLease | undefined;
@@ -218,6 +244,7 @@ let libraryReady = false;
 let eventStore!: EventStoreType;
 let personalStore!: PersonalStoreType;
 let deletionStore!: DeletionStore;
+let readCoverage!: ReturnType<typeof createCoverageReader>;
 let deletionIntents!: InstanceType<typeof DeletionIntentModule.DeletionIntents>;
 let units!: InstanceType<typeof UnitsModule.RecordingUnits>;
 let favoriteCommands!: InstanceType<typeof FavoriteCommandsModule.FavoriteCommands>;
@@ -334,6 +361,7 @@ try {
   )) as typeof DeletionModule;
   await transaction(async () => {
     deletionStore = new DeletionStore(db, async () => await personalStore.revision());
+    readCoverage = createCoverageReader(db, personalStore, snapshotLayoutVersion);
     await deletionStore.initialize();
   });
   const { MediaSelectionStore } = (await import(
@@ -498,11 +526,17 @@ function subject(row: SubjectRow): Subject {
       : {}),
     lastRecordedAtMs: row.last_recorded,
     lastOnlineAtMs: row.last_online,
+    ...(row.online_since != null ? { onlineSinceMs: row.online_since } : {}),
   };
 }
 type CoreSubjectRow = Omit<
   SubjectRow,
-  'last_recorded' | 'last_online' | 'former_names' | 'last_known_status' | 'status_valid_until'
+  | 'last_recorded'
+  | 'last_online'
+  | 'online_since'
+  | 'former_names'
+  | 'last_known_status'
+  | 'status_valid_until'
 >;
 /** Internal checks must not calculate directory-only activity/name summaries. */
 async function requireSubject(id: string): Promise<CoreSubjectRow> {
@@ -597,6 +631,23 @@ function mergeSpans(spans: number[][]): number[][] {
   }
   return result;
 }
+function minuteCoverage(spans: number[][], starts: number[], ends: number[], count: number) {
+  const union = mergeSpans(spans);
+  return {
+    spans: JSON.stringify(union),
+    starts: JSON.stringify(starts.sort((a, b) => a - b)),
+    ends: JSON.stringify(ends.sort((a, b) => a - b)),
+    count,
+    covered_ms: union.reduce((sum, [s, e]) => sum + e - s, 0),
+    start_count: starts.length,
+    end_count: ends.length,
+  };
+}
+const coverageMinutesInsert = `INSERT INTO coverage_minutes
+  (subject,minute,spans,starts,ends,count,covered_ms,start_count,end_count)`;
+const coverageMinutesUpdate = `ON CONFLICT(subject,minute) DO UPDATE SET
+  spans=excluded.spans,starts=excluded.starts,ends=excluded.ends,count=excluded.count,
+  covered_ms=excluded.covered_ms,start_count=excluded.start_count,end_count=excluded.end_count`;
 async function putMinute(
   subject: string,
   minute: number,
@@ -605,24 +656,19 @@ async function putMinute(
   ends: number[],
   count: number,
 ): Promise<void> {
-  const union = mergeSpans(spans);
+  const row = minuteCoverage(spans, starts, ends, count);
   await db
-    .prepare(
-      `INSERT INTO coverage_minutes(subject,minute,spans,starts,ends,count,covered_ms,start_count,end_count)
-        VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(subject,minute) DO UPDATE SET
-        spans=excluded.spans,starts=excluded.starts,ends=excluded.ends,count=excluded.count,
-        covered_ms=excluded.covered_ms,start_count=excluded.start_count,end_count=excluded.end_count`,
-    )
+    .prepare(`${coverageMinutesInsert} VALUES(?,?,?,?,?,?,?,?,?) ${coverageMinutesUpdate}`)
     .run(
       subject,
       minute,
-      JSON.stringify(union),
-      JSON.stringify(starts.sort((a, b) => a - b)),
-      JSON.stringify(ends.sort((a, b) => a - b)),
-      count,
-      union.reduce((sum, [s, e]) => sum + e - s, 0),
-      starts.length,
-      ends.length,
+      row.spans,
+      row.starts,
+      row.ends,
+      row.count,
+      row.covered_ms,
+      row.start_count,
+      row.end_count,
     );
 }
 async function addCoverage(
@@ -646,28 +692,54 @@ async function addCoverage(
     await putMinute(subject, minute, spans, starts, ends, (row?.count ?? 0) + 1);
   }
 }
-async function rebuildMinute(subject: string, minute: number): Promise<void> {
-  const rows = await many<{
-    start: number;
-    end: number;
-  }>(overlappingSegmentsSql('segments'), subject, minute, minute + MINUTE);
-  if (!rows.length) {
-    await db
-      .prepare('DELETE FROM coverage_minutes WHERE subject=? AND minute=?')
-      .run(subject, minute);
-    return;
-  }
-  await putMinute(
-    subject,
-    minute,
-    rows.map((s) => [
-      Math.max(s.start, minute) - minute,
-      Math.min(s.end, minute + MINUTE) - minute,
-    ]),
-    rows.filter((s) => s.start >= minute).map((s) => s.start - minute),
-    rows.filter((s) => s.end <= minute + MINUTE).map((s) => s.end - minute),
-    rows.length,
+async function rebuildMinuteBatch(subject: string, minutes: number[]): Promise<void> {
+  const byMinute = new Map<number, { start: number; end: number }[]>(
+    minutes.map((minute) => [minute, []]),
   );
+  const overlaps = await many<{ minute: number; start: number; end: number }>(
+    deletionMinuteOverlapSql,
+    subject,
+    JSON.stringify(minutes),
+  );
+  for (const row of overlaps) byMinute.get(row.minute)!.push(row);
+
+  const empty: number[] = [];
+  const occupied: (ReturnType<typeof minuteCoverage> & { minute: number })[] = [];
+  for (const [minute, rows] of byMinute) {
+    if (!rows.length) {
+      empty.push(minute);
+      continue;
+    }
+    occupied.push({
+      minute,
+      ...minuteCoverage(
+        rows.map((s) => [
+          Math.max(s.start, minute) - minute,
+          Math.min(s.end, minute + MINUTE) - minute,
+        ]),
+        rows.filter((s) => s.start >= minute).map((s) => s.start - minute),
+        rows.filter((s) => s.end <= minute + MINUTE).map((s) => s.end - minute),
+        rows.length,
+      ),
+    });
+  }
+  if (empty.length)
+    await db
+      .prepare(
+        `DELETE FROM coverage_minutes WHERE subject=? AND minute IN (
+        SELECT value::bigint FROM json_array_elements_text(?::json)
+      )`,
+      )
+      .run(subject, JSON.stringify(empty));
+  if (occupied.length)
+    await db
+      .prepare(
+        `${coverageMinutesInsert}
+        SELECT ?,minute,spans,starts,ends,count,covered_ms,start_count,end_count
+        FROM json_to_recordset(?::json) AS c(minute bigint,spans text,starts text,ends text,
+          count bigint,covered_ms bigint,start_count bigint,end_count bigint) ${coverageMinutesUpdate}`,
+      )
+      .run(subject, JSON.stringify(occupied));
 }
 async function saveSource(
   s: Pick<Segment, 'subjectId' | 'sourceEpoch' | 'sourceSequence' | 'wallStartMs'>,
@@ -760,6 +832,55 @@ async function disableStatus(id: string): Promise<void> {
   }
   await db.prepare("UPDATE subjects SET status='UNKNOWN' WHERE id=?").run(id);
 }
+async function deleteJournalSegments(subject: string, segmentIds: string[]): Promise<boolean> {
+  const segments = await many<DeletedSegment>(
+    `WITH target AS MATERIALIZED (
+      SELECT s.id,(SELECT true FROM visible_segments v WHERE v.id=s.id AND v.deleted=0 LIMIT 1) IS TRUE AS visible
+      FROM segments s WHERE s.subject=? AND s.deleted=0
+      AND s.id IN (SELECT value FROM json_array_elements_text(?::json))
+    ) UPDATE segments s SET deleted=1 FROM target WHERE s.id=target.id
+    RETURNING s.id,s.media,s.init,s.start,s."end",target.visible`,
+    subject,
+    JSON.stringify(segmentIds),
+  );
+  if (!segments.length) return false;
+
+  await units.retireSegments(segments);
+  // Shared initialization files remain live until the last referencing fragment retires.
+  // This statement sees the segment tombstones written above in the same transaction.
+  await db
+    .prepare(
+      `UPDATE objects SET deleted=1 WHERE deleted=0 AND id IN (
+        SELECT value FROM json_array_elements_text(?::json)
+        UNION ALL SELECT value FROM json_array_elements_text(?::json) AS candidate(value)
+        WHERE (SELECT 1 FROM segments s WHERE s.init=candidate.value AND s.deleted=0 LIMIT 1) IS NULL
+      )`,
+    )
+    .run(
+      JSON.stringify(segments.map((segment) => segment.media)),
+      JSON.stringify([
+        ...new Set(segments.flatMap((segment) => (segment.init ? [segment.init] : []))),
+      ]),
+    );
+
+  const minutes = new Set<number>();
+  let unlocated = 0;
+  for (const { start, end } of segments) {
+    if (start === null) unlocated++;
+    else if (end !== null)
+      for (let minute = Math.floor(start / MINUTE) * MINUTE; minute < end; minute += MINUTE)
+        minutes.add(minute);
+  }
+  if (unlocated)
+    await db
+      .prepare('UPDATE subjects SET unlocated=unlocated-? WHERE id=?')
+      .run(unlocated, subject);
+  const affected = [...minutes];
+  // Even legacy fragments can span many minutes. Bound the minute probes per query.
+  for (let offset = 0; offset < affected.length; offset += 128)
+    await rebuildMinuteBatch(subject, affected.slice(offset, offset + 128));
+  return unlocated > 0 || segments.some((segment) => segment.visible);
+}
 async function apply(record: JournalRecord, recovery = false): Promise<void> {
   return await transaction(async () => {
     const previous = await head(record.subject.id);
@@ -818,41 +939,7 @@ async function apply(record: JournalRecord, recovery = false): Promise<void> {
       if (s.wallStartMs === null)
         await db.prepare('UPDATE subjects SET unlocated=unlocated+1 WHERE id=?').run(s.subjectId);
     } else if (record.kind === 'delete') {
-      const minutes = new Set<number>();
-      for (const id of record.segmentIds) {
-        const s = await one<SegmentRow>(
-          'SELECT * FROM segments WHERE id=? AND subject=? AND deleted=0',
-          id,
-          record.subject.id,
-        );
-        if (!s) continue;
-        const value = JSON.parse(s.json) as Segment;
-        if (value.wallStartMs !== null && value.wallEndMs !== null)
-          for (
-            let m = Math.floor(value.wallStartMs / MINUTE) * MINUTE;
-            m < value.wallEndMs;
-            m += MINUTE
-          )
-            minutes.add(m);
-        const wasVisible = !!(await db
-          .prepare('SELECT 1 FROM visible_segments WHERE id=? AND deleted=0')
-          .get(id));
-        visibilityChanged ||= wasVisible || s.start === null;
-        await db.prepare('UPDATE segments SET deleted=1 WHERE id=?').run(id);
-        await units.deleted(id, wasVisible);
-        await db.prepare('UPDATE objects SET deleted=1 WHERE id=?').run(s.media);
-        if (
-          s.init &&
-          !(await db
-            .prepare('SELECT 1 FROM segments WHERE init=? AND deleted=0 LIMIT 1')
-            .get(s.init))
-        ) {
-          await db.prepare('UPDATE objects SET deleted=1 WHERE id=?').run(s.init);
-        }
-        if (s.start === null)
-          await db.prepare('UPDATE subjects SET unlocated=unlocated-1 WHERE id=?').run(s.subject);
-      }
-      for (const minute of minutes) await rebuildMinute(record.subject.id, minute);
+      visibilityChanged = await deleteJournalSegments(record.subject.id, record.segmentIds);
       // A queued deletion is already hidden at admission. Its portable
       // tombstones update the journal and minute index without another UI revision.
       if (visibilityChanged)
@@ -1055,209 +1142,6 @@ async function snapshotUnit(id: string, at: number, unitId?: string): Promise<Sn
   const unit = unitId ? await units.get(id, unitId) : await units.at(id, at);
   return unit ? await units.item(unit) : null;
 }
-function lower(values: number[], target: number, inclusive = false): number {
-  let lo = 0,
-    hi = values.length;
-  while (lo < hi) {
-    const mid = (lo + hi) >>> 1;
-    if (values[mid] < target || (inclusive && values[mid] === target)) lo = mid + 1;
-    else hi = mid;
-  }
-  return lo;
-}
-/** Minute-aligned views can keep dense histories in PostgreSQL and return only pixels.
- * A merged union covering a whole minute already supplies both exact endpoints. */
-async function alignedMinuteCoverage(
-  subject: string,
-  from: number,
-  to: number,
-  width: number,
-  buckets: CoverageBucket[],
-): Promise<void> {
-  const rows = await many<{
-    bucket: number;
-    occupied: number;
-    starts: number;
-    ends: number;
-    entering: number;
-    first: number | null;
-    last: number | null;
-  }>(
-    `SELECT ((minute-?::bigint)/?::bigint)::integer AS bucket,
-      sum(covered_ms)::bigint AS occupied,sum(start_count)::bigint AS starts,
-      sum(end_count)::bigint AS ends,
-      coalesce(max(count-start_count) FILTER (WHERE minute=?),0)::bigint AS entering,
-      min(CASE WHEN covered_ms=${MINUTE} THEN minute
-        ELSE minute+(spans::json->0->>0)::double precision END) FILTER (WHERE covered_ms>0) AS first,
-      max(CASE WHEN covered_ms=${MINUTE} THEN minute+${MINUTE}
-        ELSE minute+(spans::json->-1->>1)::double precision END) FILTER (WHERE covered_ms>0) AS last
-    FROM coverage_minutes WHERE subject=? AND minute>=? AND minute<? GROUP BY 1 ORDER BY 1`,
-    from,
-    width,
-    from,
-    subject,
-    from,
-    to,
-  );
-  let cursor = 0;
-  let active = rows[0]?.bucket === 0 ? rows[0].entering : 0;
-  for (const [index, bucket] of buckets.entries()) {
-    const row = rows[cursor];
-    bucket.segmentCount = active;
-    if (row?.bucket !== index) continue;
-    cursor++;
-    bucket.coveredMs = row.occupied;
-    bucket.segmentCount += row.starts;
-    if (row.first !== null) bucket.mediaFromMs = row.first;
-    if (row.last !== null) bucket.mediaToMs = row.last;
-    active += row.starts - row.ends;
-  }
-}
-async function coverage(
-  id: string,
-  from: number,
-  to: number,
-  count: number,
-): Promise<CoverageResponse> {
-  const subject = await requireSubject(id);
-  const buckets: CoverageBucket[] = Array.from({ length: count }, (_, i) => ({
-    fromMs: from + Math.floor(((to - from) * i) / count),
-    toMs: from + Math.floor(((to - from) * (i + 1)) / count),
-    coveredMs: 0,
-    segmentCount: 0,
-  }));
-  const result = async (): Promise<CoverageResponse> => ({
-    subjectId: id,
-    fromMs: from,
-    toMs: to,
-    buckets,
-    unlocatedCount: subject.unlocated,
-    revision: await currentRevision(),
-  });
-  const occupy = (bucket: CoverageBucket, lo: number, hi: number): void => {
-    if (hi <= lo) return;
-    bucket.coveredMs += hi - lo;
-    bucket.mediaFromMs = Math.min(bucket.mediaFromMs ?? Infinity, lo);
-    bucket.mediaToMs = Math.max(bucket.mediaToMs ?? -Infinity, hi);
-  };
-  if (await deletionStore.pending(id)) {
-    // Pending deletion is already absent from the logical archive. Stream the
-    // remaining indexed spans until physical GC catches up; never load all IDs.
-    let start = -1,
-      end = -1;
-    const add = (lo: number, hi: number): void => {
-      const first = Math.max(
-        0,
-        Math.min(count - 1, Math.floor(((lo - from) * count) / (to - from))),
-      );
-      for (let b = first; b < count && buckets[b].fromMs < hi; b++)
-        occupy(buckets[b], Math.max(lo, buckets[b].fromMs), Math.min(hi, buckets[b].toMs));
-    };
-    for await (const raw of db
-      .prepare(`${overlappingSegmentsSql('visible_segments')} ORDER BY start,id`)
-      .iterate(id, from, to)) {
-      const row = raw as {
-        start: number;
-        end: number;
-      };
-      const lo = Math.max(from, row.start),
-        hi = Math.min(to, row.end);
-      const first = Math.max(
-        0,
-        Math.min(count - 1, Math.floor(((lo - from) * count) / (to - from))),
-      );
-      for (let b = first; b < count && buckets[b].fromMs < hi; b++) buckets[b].segmentCount++;
-      if (start < 0) {
-        start = lo;
-        end = hi;
-      } else if (lo <= end) end = Math.max(end, hi);
-      else {
-        add(start, end);
-        start = lo;
-        end = hi;
-      }
-    }
-    if (start >= 0) add(start, end);
-    return result();
-  }
-  const width = (to - from) / count;
-  if (from % MINUTE === 0 && width >= 2 * MINUTE && width % MINUTE === 0) {
-    await alignedMinuteCoverage(id, from, to, width, buckets);
-    return result();
-  }
-  const startCounts = new Array<number>(count).fill(0),
-    endCounts = new Array<number>(count).fill(0);
-  const boundaryMinutes = new Set<number>();
-  for (const boundary of [from, ...buckets.map((bucket) => bucket.toMs)]) {
-    if (boundary % MINUTE) boundaryMinutes.add(Math.floor(boundary / MINUTE) * MINUTE);
-  }
-  let active = 0;
-  const rows = await many<
-    MinuteSummary & {
-      first: number;
-      last: number;
-      spans: string | null;
-      starts: string | null;
-      ends: string | null;
-    }
-  >(
-    `SELECT m.minute,count,covered_ms,start_count,end_count,
-      (spans::json->0->>0)::double precision AS first,(spans::json->-1->>1)::double precision AS last,
-      CASE WHEN edge.value IS NOT NULL THEN spans END AS spans,
-      CASE WHEN edge.value IS NOT NULL THEN starts END AS starts,
-      CASE WHEN edge.value IS NOT NULL THEN ends END AS ends
-      FROM coverage_minutes m LEFT JOIN jsonb_array_elements_text(?::jsonb) AS edge(value)
-        ON m.minute=edge.value::bigint
-      WHERE m.subject=? AND m.minute>=? AND m.minute<? ORDER BY m.minute`,
-    JSON.stringify([...boundaryMinutes]),
-    id,
-    Math.floor(from / MINUTE) * MINUTE,
-    to,
-  );
-  let bucketIndex = 0;
-  for (const row of rows) {
-    while (bucketIndex < count && buckets[bucketIndex].toMs <= row.minute) bucketIndex++;
-    if (row.minute === from) active = row.count - row.start_count;
-    if (
-      bucketIndex < count &&
-      buckets[bucketIndex].fromMs <= row.minute &&
-      buckets[bucketIndex].toMs >= row.minute + MINUTE
-    ) {
-      buckets[bucketIndex].coveredMs += row.covered_ms;
-      if (row.covered_ms > 0) {
-        const bucket = buckets[bucketIndex];
-        bucket.mediaFromMs = Math.min(bucket.mediaFromMs ?? Infinity, row.minute + row.first);
-        bucket.mediaToMs = Math.max(bucket.mediaToMs ?? -Infinity, row.minute + row.last);
-      }
-      startCounts[bucketIndex] += row.start_count;
-      endCounts[bucketIndex] += row.end_count;
-      continue;
-    }
-    if (row.spans === null || row.starts === null || row.ends === null)
-      throw new Error('COVERAGE_INDEX_INCONSISTENT');
-    const spans = JSON.parse(row.spans) as number[][],
-      starts = JSON.parse(row.starts) as number[],
-      ends = JSON.parse(row.ends) as number[];
-    if (row.minute < from && row.minute + MINUTE > from)
-      active =
-        row.count -
-        (starts.length - lower(starts, from - row.minute)) -
-        lower(ends, from - row.minute, true);
-    for (let b = bucketIndex; b < count && buckets[b].fromMs < row.minute + MINUTE; b++) {
-      const lo = Math.max(from, buckets[b].fromMs) - row.minute,
-        hi = Math.min(to, buckets[b].toMs) - row.minute;
-      for (const [s, e] of spans)
-        occupy(buckets[b], row.minute + Math.max(s, lo), row.minute + Math.min(e, hi));
-      startCounts[b] += lower(starts, hi) - lower(starts, lo);
-      endCounts[b] += lower(ends, hi, true) - lower(ends, lo, true);
-    }
-  }
-  for (let b = 0; b < count; b++) {
-    buckets[b].segmentCount = active + startCounts[b];
-    active += startCounts[b] - endCounts[b];
-  }
-  return result();
-}
 const unitIndexObservation = {
   processed: 0,
   lastRunAtMs: null as number | null,
@@ -1270,7 +1154,26 @@ async function publishDeletionGeneration(id: string, from: number, to: number): 
     .prepare('UPDATE subjects SET deletion_revision=? WHERE id=?')
     .run(await currentRevision(), id);
 }
+const calendarZone = deploymentTimeZone();
+const calendarDate = new Intl.DateTimeFormat('en-CA', {
+  timeZone: calendarZone,
+  dateStyle: 'short',
+});
+let emptyDayCache: { key: string; days: MediaTimeRange[] } | undefined;
 const handlers: Record<string, (input: RequestInput) => unknown> = {
+  emptyRecordingDays: async ({ at, from, includePendingDeletion }) => {
+    const origin = personalStore.identity.timelineStartMs;
+    // Tombstones after deletion admission do not publish a new visible revision.
+    if (includePendingDeletion)
+      return await readEmptyDays(db, calendarZone, Math.max(origin, from), at);
+    const key = `${await currentRevision()}:${calendarDate.format(at)}`;
+    if (emptyDayCache?.key === key) return emptyDayCache.days;
+    const days = await readEmptyDays(db, calendarZone, origin, at, 'visible_segments');
+    emptyDayCache = { key, days };
+    return days;
+  },
+  pruneEmptyHistory: async ({ from, to }) =>
+    await transaction(() => pruneEmptyHistory(db, eventStore, { fromMs: from, toMs: to })),
   markUnitsSeen: async ({ id, seenEvidence }) =>
     await transaction(() => personalStore.markSeen(id, seenEvidence!)),
   prepareAccountSubjects: async ({ subjects, generation }) =>
@@ -1286,24 +1189,28 @@ const handlers: Record<string, (input: RequestInput) => unknown> = {
     await transaction(
       async () => await selections.begin(id, window, selectionMode!, selectionOptions),
     ),
-  buildMediaSelection: async ({ id, selectionId }) =>
-    await transaction(async () => await selections.build(id, selectionId!)),
+  buildMediaSelection: async ({ id, selectionId, favoriteFilter }) =>
+    await transaction(async () => await selections.build(id, selectionId!, favoriteFilter)),
   stageSelectionPatch: async ({ id, selectionId, selectionPatch }) =>
     await transaction(
       async () => await selections.patch(id, selectionId!, selectionPatch ?? {}, false),
     ),
   selectionMaintenance: async () =>
-    await transaction(async () => (await selections.cleanup()) || (await deletionStore.cleanup())),
+    await transaction(
+      async () => (await selections.cleanup()) || (await deletionIntents.cleanup()),
+    ),
   favoriteSubjects: async (input?: RequestInput) =>
     await favoriteCommands.subjects(input?.limit ?? 1, input?.excludedSubjects),
   materializeFavorites: async (input?: RequestInput) =>
     await transaction(async () => await favoriteCommands.step(input?.id)),
   favoriteMaterializationStatus: async () => await favoriteCommands.status(),
   mediaSelection: async ({ id, selectionId }) => await selections.summary(id, selectionId!),
-  favoriteMediaSelection: async ({ id, selectionId, liked, personalRevision }) =>
+  favoriteMediaSelection: async ({ id, favoriteChanges, personalRevision }) =>
     await transaction(async () => {
-      if (!liked) await deletionIntents.preserveFavorites(id, selectionId!);
-      return await favoriteCommands.accept(id, selectionId!, liked!, personalRevision!);
+      for (const change of favoriteChanges!) {
+        if (!change.liked) await deletionIntents.preserveFavorites(id, change.selectionId);
+      }
+      return await favoriteCommands.accept(id, favoriteChanges!, personalRevision!);
     }),
   beginSelectedDeletionPlan: async ({ id, selectionId, selectionPatch }) =>
     await transaction(async () => {
@@ -1426,19 +1333,17 @@ const handlers: Record<string, (input: RequestInput) => unknown> = {
     if (job.subjectId !== id) throw Error('STALE_DELETE_PLAN');
     return String(job.state) === 'planned' ? null : job;
   },
-  mediaDeletionJobs: async () => await deletionIntents.list(),
+  mediaDeletionInventory: async () => await deletionIntents.list(),
+  mediaDeletionJob: async ({ commandId }) => await deletionIntents.lookup(commandId!),
   admitDeletionIntent: async ({ id, commandId, deletionTarget }) =>
     await transaction(async () => {
-      const existing = await db
-        .prepare('SELECT 1 FROM deletion_intents WHERE job=?')
-        .get(commandId!);
-      const job = await deletionIntents.admit(id, commandId!, deletionTarget!);
-      if (existing) return job;
-      await publishDeletionGeneration(id, job.fromMs ?? 0, job.toMs ?? Number.MAX_SAFE_INTEGER);
-      await db
-        .prepare('UPDATE deletion_intents SET revision=? WHERE job=?')
-        .run(await currentRevision(), commandId!);
-      return await deletionIntents.get(commandId!);
+      let published = false;
+      const job = await deletionIntents.admit(id, commandId!, deletionTarget!, async () => {
+        await publishDeletionGeneration(id, deletionTarget!.fromMs, deletionTarget!.toMs);
+        published = true;
+        return currentRevision();
+      });
+      return { job, published };
     }),
   prepareDeletionIntent: async (input?: RequestInput) =>
     (await units.ready())
@@ -1454,14 +1359,12 @@ const handlers: Record<string, (input: RequestInput) => unknown> = {
           return job;
         })
       : null,
-  pendingDeletionIntent: async (input?: RequestInput) =>
-    (await units.ready()) ? await deletionIntents.pending(input?.excludedSubjects) : null,
   retryDeletionIntent: async ({ id }) =>
     await transaction(async () => await deletionIntents.retry(id)),
   nextMediaDeletion: async (input?: RequestInput) =>
-    await transaction(async () => await deletionStore.next(input?.excludedSubjects)),
-  advanceMediaDeletion: async ({ id, processed, reclaimedBytes }) =>
-    await transaction(async () => await deletionStore.advance(id, processed!, reclaimedBytes!)),
+    await deletionStore.next(input?.excludedSubjects, await units.ready()),
+  advanceMediaDeletion: async ({ id, processed, gcObjectIds }) =>
+    await transaction(async () => await deletionStore.advance(id, processed!, 0, gcObjectIds)),
   retryMediaDeletion: async ({ id }) => await deletionStore.retry(id),
   expediteMediaDeletions: async ({ limit }) => await deletionStore.expediteRetries(limit),
   upsert: async ({ subjects, syncAccount }) =>
@@ -1503,14 +1406,11 @@ const handlers: Record<string, (input: RequestInput) => unknown> = {
         )
         .run(String(enabled));
       const rows = await many<{ id: string }>(
-        'SELECT s.id FROM subjects s LEFT JOIN account_subjects a ON a.subject=s.id WHERE a.following IS DISTINCT FROM 0',
+        'UPDATE subjects SET auto_record=?,monitor=1 WHERE id IN (SELECT s.id FROM subjects s LEFT JOIN account_subjects a ON a.subject=s.id WHERE a.following IS DISTINCT FROM 0) RETURNING id',
+        enabled ? 1 : 0,
       );
-      await db
-        .prepare(
-          'UPDATE subjects SET auto_record=?,monitor=1 WHERE id IN (SELECT s.id FROM subjects s LEFT JOIN account_subjects a ON a.subject=s.id WHERE a.following IS DISTINCT FROM 0)',
-        )
-        .run(enabled ? 1 : 0);
       if (!enabled) for (const { id } of rows) await units.seal(id);
+      return rows.map(({ id }) => id);
     }),
   policies: async ({ ids, patch }) =>
     await transaction(async () => {
@@ -1538,8 +1438,10 @@ const handlers: Record<string, (input: RequestInput) => unknown> = {
     if (status === 'OFFLINE' || status === 'PRIVATE') await units.seal(id);
     return result;
   },
-  statusHistory: async ({ id, from, to, buckets }) =>
-    await readStatusHistory(db, id, from, to, buckets),
+  statusHistory: async ({ id, from, to, buckets }) => {
+    if (!(await one('SELECT 1 FROM subjects WHERE id=?', id))) throw Error('SUBJECT_NOT_FOUND');
+    return readStatusHistory(db, id, from, to, buckets);
+  },
   snapshotPages: async ({ id, at, page, limit, window, followLive, unitId }) =>
     await snapshotPages(id, at, page, limit, window, followLive, unitId),
   snapshotUnit: async ({ id, at, unitId }) => await snapshotUnit(id, at, unitId),
@@ -1599,7 +1501,25 @@ const handlers: Record<string, (input: RequestInput) => unknown> = {
   },
   head: async ({ id }) => await head(id),
   heads: async () => await db.prepare('SELECT subject,revision FROM journal_heads').all(),
-  apply: async ({ record, recovery }) => await apply(record, recovery),
+  apply: async ({ record, recovery, retentionDays }) => {
+    // Both apply and settingSet run in the worker's ordered mutation queue.
+    // A saved policy must win even when the old batch already selected its rows.
+    if (retentionDays !== undefined) {
+      const stored = await privateSettings.get('runtime.settings');
+      // No saved row means the monitor's validated startup policy is authoritative.
+      if (stored !== null) {
+        const settings = JSON.parse(stored) as { retentionDays?: unknown } | null;
+        if (settings?.retentionDays !== retentionDays) return false;
+      }
+    }
+    await apply(record, recovery);
+    return true;
+  },
+  applyQueuedDeletion: async ({ record }) => {
+    if (record.kind !== 'delete') throw Error('INVALID_DELETION_RECORD');
+    await apply(record);
+    return true;
+  },
   beginSession: async () => {
     const clean =
       (
@@ -1629,34 +1549,10 @@ const handlers: Record<string, (input: RequestInput) => unknown> = {
         } satisfies SourceCheckpoint)
       : null;
   },
-  coverage: async ({ id, from, to, buckets, includeProtection }) => {
-    const result = await coverage(id, from, to, buckets);
-    const hasCoverage = result.buckets.some((bucket) => bucket.coveredMs > 0);
-    const viewing = hasCoverage
-      ? await personalStore.seenCoverage(id, from, to, buckets)
-      : { seenSpans: [] };
-    const favorites = hasCoverage
-      ? await personalStore.favoriteCoverage(id, from, to, buckets)
-      : [];
-    return {
-      ...result,
-      ...viewing,
-      ...(favorites.length ? { favoriteSpans: favorites } : {}),
-      ...(includeProtection
-        ? {
-            protectedSpans: await personalStore.protectedCoverage(
-              id,
-              from,
-              to,
-              buckets,
-              await snapshotLayoutVersion(id),
-            ),
-          }
-        : {}),
-    };
-  },
+  coverage: readCoverage,
+  workbenchRow: (input) => readWorkbenchHistory(db, readCoverage, input, input.ranges),
   source: async ({ subjectId, epoch, sequence }) => {
-    const row = await one<Pick<SegmentRow, 'json' | 'deleted'>>(
+    const row = await one<{ json: string; deleted: number }>(
       `SELECT s.json,(s.deleted<>0 OR NOT EXISTS(SELECT 1 FROM visible_segments v WHERE v.id=s.id))::integer deleted FROM segments s WHERE s.subject=? AND s.epoch=? AND s.sequence=?`,
       subjectId,
       epoch,
@@ -1705,13 +1601,39 @@ const handlers: Record<string, (input: RequestInput) => unknown> = {
   verified: async ({ id }) => {
     await db.prepare('UPDATE objects SET needs_verify=0 WHERE id=?').run(id);
   },
-  pendingGc: async ({ id }) =>
-    (
-      await many<ObjectRow>(
-        'SELECT * FROM objects WHERE subject=? AND deleted=1 AND gc_done=0 ORDER BY id LIMIT 128',
+  pendingGc: async ({ id, segmentIds }) => {
+    if (segmentIds) {
+      const rows = await many<ObjectRow>(
+        `WITH batch AS MATERIALIZED (
+           SELECT media,init FROM segments WHERE subject=? AND deleted=1
+           AND id IN(SELECT value FROM json_array_elements_text(?::json))
+         ), matched AS (SELECT media AS id FROM batch UNION SELECT init FROM batch)
+         SELECT o.* FROM matched m JOIN objects o ON o.id=m.id
+         WHERE o.subject=? AND o.deleted=1 AND o.gc_done=0 ORDER BY o.id`,
         id,
-      )
-    ).map(objectRow),
+        JSON.stringify(segmentIds),
+        id,
+      );
+      return rows.map(objectRow);
+    }
+    // Keep the next manual batch's tombstones with their durable receipt,
+    // including after a restart. Generic GC can remove any unrelated backlog.
+    const rows = await many<ObjectRow>(
+      `WITH batch AS MATERIALIZED (
+         SELECT s.media,s.init FROM media_deletions d
+         JOIN deletion_items i ON i.job=d.id AND i.ordinal>d.processed AND i.ordinal<=d.processed+?
+         JOIN segments s ON s.id=i.segment AND s.deleted=1
+         WHERE d.subject=? AND d.state IN (${activeDeletionStates})
+       ), reserved AS (SELECT media AS id FROM batch UNION SELECT init FROM batch)
+       SELECT o.* FROM objects o WHERE o.subject=? AND o.deleted=1 AND o.gc_done=0
+       AND NOT EXISTS(SELECT 1 FROM reserved r WHERE r.id=o.id) ORDER BY o.id LIMIT ?`,
+      deletionBatchSize,
+      id,
+      id,
+      deletionBatchSize,
+    );
+    return rows.map(objectRow);
+  },
   gcDone: async ({ segmentIds }) =>
     await db
       .prepare(
@@ -1799,31 +1721,42 @@ const handlers: Record<string, (input: RequestInput) => unknown> = {
       );
     return row ? (await readSegments([row]))[0] : null;
   },
-  deleteBatch: async ({ id, from, to, unlocated, cutoff, segmentIds }) => {
-    await requireSubject(id);
-    const candidates = (sql: string, ...args: SQLInputValue[]) =>
+  deleteBatch: async ({ id, from, to, unlocated, cutoff, segmentIds, personalRevision }) => {
+    const journal = await one<Pick<Subject, 'id' | 'providerId' | 'handle'> & { revision: number }>(
+      `SELECT s.id,s.provider_id AS "providerId",s.handle,COALESCE(h.revision,0)+1 AS revision
+       FROM subjects s LEFT JOIN journal_heads h ON h.subject=s.id WHERE s.id=?`,
+      id,
+    );
+    if (!journal) throw new Error('SUBJECT_NOT_FOUND');
+    if (personalRevision !== undefined && personalRevision !== (await personalStore.revision()))
+      throw new Error('STALE_DELETE_PLAN');
+    const { revision, ...subject } = journal;
+    const read = (sql: string, ...args: SQLInputValue[]) =>
       many<{ id: string; start: number | null; end: number | null }>(sql, id, ...args);
+    let candidates;
     if (segmentIds)
-      return await candidates(
+      candidates = await read(
         `SELECT id,start,"end" FROM segments WHERE subject=? AND deleted=0
-          AND id IN (SELECT value FROM json_array_elements_text(?::json)) ORDER BY start,id LIMIT 128`,
+          AND id IN (SELECT value FROM json_array_elements_text(?::json)) ORDER BY start,id LIMIT ${deletionBatchSize}`,
         JSON.stringify(segmentIds),
       );
-    if (unlocated)
-      return await candidates(
-        'SELECT id,start,"end" FROM segments WHERE subject=? AND deleted=0 AND start IS NULL ORDER BY id LIMIT 128',
+    else if (unlocated)
+      candidates = await read(
+        `SELECT id,start,"end" FROM segments WHERE subject=? AND deleted=0 AND start IS NULL ORDER BY id LIMIT ${deletionBatchSize}`,
       );
-    if (cutoff !== undefined)
-      return await candidates(
-        'SELECT s.id,u.start,u."end" FROM segments s JOIN unit_segments m ON m.segment=s.id JOIN recording_units u ON u.id=m.unit WHERE s.subject=? AND s.deleted=0 AND u."end"<=? AND NOT EXISTS(SELECT 1 FROM effective_unit_favorites f WHERE f.unit=u.id) ORDER BY s."end",s.id LIMIT 128',
+    else if (cutoff !== undefined)
+      candidates = await read(
+        `SELECT s.id,u.start,u."end" FROM segments s JOIN unit_segments m ON m.segment=s.id JOIN recording_units u ON u.id=m.unit WHERE s.subject=? AND s.deleted=0 AND u."end"<=? AND NOT EXISTS(SELECT 1 FROM effective_unit_favorites f WHERE f.unit=u.id) ORDER BY s."end",s.id LIMIT ${deletionBatchSize}`,
         cutoff,
       );
-    return await candidates(
-      'SELECT s.id,u.start,u."end" FROM segments s JOIN unit_segments m ON m.segment=s.id JOIN recording_units u ON u.id=m.unit WHERE s.subject=? AND s.deleted=0 AND u.start>? AND u.start<? AND u."end">? ORDER BY s.start,s.id LIMIT 128',
-      from - 86400000,
-      to,
-      from,
-    );
+    else
+      candidates = await read(
+        `SELECT s.id,u.start,u."end" FROM segments s JOIN unit_segments m ON m.segment=s.id JOIN recording_units u ON u.id=m.unit WHERE s.subject=? AND s.deleted=0 AND u.start>? AND u.start<? AND u."end">? ORDER BY s.start,s.id LIMIT ${deletionBatchSize}`,
+        from - 86400000,
+        to,
+        from,
+      );
+    return { subject, revision, candidates };
   },
   close: async ({ clean }) => {
     await snapshotLayouts.close();

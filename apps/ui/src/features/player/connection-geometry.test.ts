@@ -21,7 +21,7 @@ it('routes stacked views around the outer edge instead of through the video', ()
   expect(value.bendX).toBe(362);
   expect(value.endY).toBe(130);
 });
-it('extends the rail to the recording button on the cover', () => {
+it('extends the rail to the selected row boundary', () => {
   const value = connectionGeometry(
     { left: 430, top: 60, width: 28, height: 830 },
     { right: 418, top: 72, height: 0 },
@@ -30,4 +30,14 @@ it('extends the rail to the recording button on the cover', () => {
   );
   expect(value.endX).toBe(35);
   expect(value.route).toBe('M -12 12 H 14 V 120 H 35');
+});
+
+it('keeps a visible row midpoint at the exact boundary even near the rail bottom', () => {
+  const value = connectionGeometry(
+    { left: 430, top: 60, width: 28, height: 300 },
+    { right: 418, top: 72, height: 0 },
+    355,
+    458,
+  );
+  expect(value.route).toBe('M -12 12 H 14 V 295 H 28');
 });

@@ -65,7 +65,7 @@ async function fixture(count: number) {
         false,
       );
     while (await selections.build(subject, id)) {}
-    await commands.accept(subject, id, liked, revision);
+    await commands.accept(subject, [{ selectionId: id, liked }], revision);
   };
   return {
     db,

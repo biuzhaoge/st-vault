@@ -266,6 +266,9 @@ function memoryArchive(subjects: Subject[]): {
     async coverage() {
       throw new Error('unused-fixture');
     },
+    async workbenchRow() {
+      throw new Error('unused-fixture');
+    },
     async deleteUnlocated() {
       throw new Error('unused-fixture');
     },

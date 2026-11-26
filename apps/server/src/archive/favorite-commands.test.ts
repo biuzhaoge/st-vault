@@ -4,7 +4,7 @@ import type { TestPostgresServer } from '../database/postgres.test-support.js';
 import { beforeAll, afterAll } from 'vitest';
 import { describe, expect, it } from 'vitest';
 import { MediaSelectionStore } from './media-selection-store.js';
-import { FavoriteCommands } from './favorite-commands.js';
+import { FavoriteCommands, type FavoriteSelectionChange } from './favorite-commands.js';
 import { initializeUnitVisibility } from './unit-visibility.js';
 
 let postgres: TestPostgresServer;
@@ -55,12 +55,12 @@ describe('bounded durable selection and favorite commands', () => {
         "INSERT INTO subjects VALUES('stripchat:2',0);INSERT INTO recording_units VALUES('other','stripchat:2',0,1000,0,1);INSERT INTO segments(id,\"end\",deleted,created_revision) VALUES('other',1000,0,1);INSERT INTO unit_segments VALUES('other','other')",
       );
       const a = await f.select();
-      await f.favorites.accept('stripchat:1', a, true, 0);
+      await f.favorites.accept('stripchat:1', [{ selectionId: a, liked: true }], 0);
       const later = await f.select();
-      await f.favorites.accept('stripchat:1', later, false, 1);
+      await f.favorites.accept('stripchat:1', [{ selectionId: later, liked: false }], 1);
       const b = await f.selections.begin('stripchat:2', { fromMs: 0, toMs: 1000 }, 'all');
       while (await f.selections.build('stripchat:2', b)) {}
-      await f.favorites.accept('stripchat:2', b, true, 2);
+      await f.favorites.accept('stripchat:2', [{ selectionId: b, liked: true }], 2);
       await f.favorites.step('stripchat:2');
       expect(
         await f.db.prepare("SELECT unit FROM unit_favorites WHERE unit='other'").all(),
@@ -112,7 +112,7 @@ describe('bounded durable selection and favorite commands', () => {
     const f = await fixture();
     try {
       const selection = await f.select();
-      await f.favorites.accept('stripchat:1', selection, true, 0);
+      await f.favorites.accept('stripchat:1', [{ selectionId: selection, liked: true }], 0);
       expect(await f.size('unit_favorites')).toBe(0);
       expect(await f.size('effective_unit_favorites')).toBe(1025);
       await f.db.prepare('UPDATE media_selections SET created=0').run();
@@ -126,7 +126,7 @@ describe('bounded durable selection and favorite commands', () => {
         includeUnitIds: ['00000000'],
       });
       while (await f.selections.build('stripchat:1', later)) {}
-      await resumed.accept('stripchat:1', later, false, 1);
+      await resumed.accept('stripchat:1', [{ selectionId: later, liked: false }], 1);
       expect(await f.size('effective_unit_favorites')).toBe(1024);
       while (await resumed.step()) {}
       expect(await f.size('unit_favorites')).toBe(1024);
@@ -140,7 +140,7 @@ describe('bounded durable selection and favorite commands', () => {
   it('hides pending-deletion favorites before any physical unlink', async () => {
     const f = await fixture(2);
     try {
-      await f.favorites.accept('stripchat:1', await f.select(), true, 0);
+      await f.favorites.accept('stripchat:1', [{ selectionId: await f.select(), liked: true }], 0);
       expect(await f.size('effective_unit_favorites')).toBe(2);
       await f.db.exec(
         "INSERT INTO media_deletions VALUES('delete','queued',0); INSERT INTO deletion_units VALUES('delete','00000000')",
@@ -149,6 +149,44 @@ describe('bounded durable selection and favorite commands', () => {
       while (await f.favorites.step()) {}
       expect(await f.size('unit_favorites')).toBe(2);
       expect(await f.size('effective_unit_favorites')).toBe(1);
+    } finally {
+      await f.db.close();
+    }
+  });
+  it('publishes both inverse groups together and rolls back both on admission failure', async () => {
+    const f = await fixture(3);
+    const subject = 'stripchat:1';
+    try {
+      await f.db.exec("INSERT INTO unit_favorites VALUES('00000000', 1)");
+      const source = await f.select();
+      const changes: FavoriteSelectionChange[] = [];
+      for (const liked of [false, true]) {
+        const selectionId = await f.selections.begin(subject, { fromMs: 0, toMs: 1 }, 'explicit', {
+          baseSelectionId: source,
+        });
+        while (await f.selections.build(subject, selectionId, !liked)) {}
+        changes.push({ selectionId, liked });
+      }
+      const result = () => f.db.transaction(() => f.favorites.accept(subject, changes, 0));
+      const visible = () =>
+        f.db.prepare('SELECT unit FROM effective_unit_favorites ORDER BY unit').all();
+      await f.db.exec(`
+        CREATE FUNCTION reject_second_favorite() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+          IF NEW.liked=1 THEN RAISE EXCEPTION 'SECOND_COMMAND_FAILED'; END IF;
+          RETURN NEW;
+        END $$;
+        CREATE TRIGGER reject_second BEFORE INSERT ON favorite_commands
+          FOR EACH ROW EXECUTE FUNCTION reject_second_favorite();
+      `);
+      await expect(result()).rejects.toThrow('SECOND_COMMAND_FAILED');
+      expect(await f.size('favorite_commands')).toBe(0);
+      expect(await visible()).toEqual([{ unit: '00000000' }]);
+      await f.db.exec('DROP TRIGGER reject_second ON favorite_commands');
+      expect(await result()).toMatchObject({ revision: 2, count: 3 });
+      expect(await visible()).toEqual([{ unit: '00000001' }, { unit: '00000002' }]);
+      while (await f.favorites.step()) {}
+      expect(await visible()).toEqual([{ unit: '00000001' }, { unit: '00000002' }]);
     } finally {
       await f.db.close();
     }

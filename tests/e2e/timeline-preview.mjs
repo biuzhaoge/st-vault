@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import { chromium } from 'playwright-core';
 import { startFixture } from './support/fixture.mjs';
+import { showRecordedTimeline } from './support/recorded-timeline.mjs';
 
-const fixture = await startFixture();
+const fixture = await startFixture({ archiveBeforeMidnight: true });
 let browser;
 let releaseMetadata;
 try {
@@ -22,8 +23,7 @@ try {
   await page.goto('http://127.0.0.1:10085');
   await page.getByLabel('6 位 PIN', { exact: true }).fill('012345');
   const row = page.locator(`.track-row[data-subject-id="${fixture.info.subjectId}"]`);
-  const lane = row.locator('.track-lane');
-  await lane.locator('.track-clip').first().waitFor();
+  const lane = await showRecordedTimeline(page, row, fixture.info);
   const dimensions = await lane.evaluate((node) => ({
     height: node.querySelector('.timeline-content').getBoundingClientRect().height,
     status: node.querySelector('.status-line').getBoundingClientRect().height,
@@ -97,8 +97,57 @@ try {
   await preview.waitFor({ state: 'detached' });
   await page.mouse.move(20, 20);
   assert.equal(await preview.count(), 0);
+  const draft = page.locator('.range-selection.is-drawing');
+  const lower = draft.getByRole('slider', { name: '选区起点' });
+  const upper = draft.getByRole('slider', { name: '选区终点' });
+  const focused = (element) => element.evaluate((node) => document.activeElement === node);
+  await lane.focus();
+  await page.keyboard.down('Enter');
+  await lower.waitFor({ timeout: 2500 });
+  await page.keyboard.down('Enter');
+  await page.keyboard.up('Enter');
+  assert(await focused(lower));
+  await page.keyboard.press('Escape');
+  await draft.waitFor({ state: 'detached' });
+  assert(await focused(lane));
+  await page.keyboard.press('Enter');
+  const initialStart = Number(await lower.getAttribute('aria-valuenow'));
+  await page.keyboard.press('ArrowRight');
+  assert.equal(Number(await lower.getAttribute('aria-valuenow')), initialStart + 1000);
+  await page.keyboard.press('Tab');
+  assert(await focused(upper));
+  const initialEnd = Number(await upper.getAttribute('aria-valuenow'));
+  await page.keyboard.press('Shift+ArrowLeft');
+  assert.equal(Number(await upper.getAttribute('aria-valuenow')), initialEnd - 60000);
+  const waitForBounds = () =>
+    page.waitForResponse((response) =>
+      response
+        .url()
+        .includes('/' + encodeURIComponent(fixture.info.subjectId) + '/recording-bounds?'),
+    );
+  const bounds = waitForBounds();
+  await page.keyboard.press('Enter');
+  const response = await bounds;
+  const { searchParams } = new URL(response.url());
+  assert.equal(Number(searchParams.get('from')), initialStart + 1000);
+  assert.equal(Number(searchParams.get('to')), initialEnd - 60000);
+  const range = await response.json();
+  assert(range.toMs > range.fromMs);
+  const fixed = page.locator(
+    `.range-selection:not(.is-drawing)[data-from="${range.fromMs}"][data-to="${range.toMs}"]`,
+  );
+  await fixed.waitFor();
+  await lane.focus();
+  await page.keyboard.press('Enter');
+  await page.keyboard.press('Tab');
+  await page.keyboard.press('Home');
+  assert.equal(Number(await upper.getAttribute('aria-valuenow')), initialStart + 1);
+  const empty = waitForBounds();
+  await page.keyboard.press('Enter');
+  assert.equal((await (await empty).json()).fromMs, null);
+  await fixed.waitFor();
   console.log(
-    '[qa] Timeline 1/6 status height, screenshot hover, pointer tracking and gesture cleanup passed',
+    '[qa] Timeline hover and gestures passed. Keyboard-only range creation, adjustments, cancel, archive bounds, and empty interval passed.',
   );
 } finally {
   releaseMetadata?.();

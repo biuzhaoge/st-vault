@@ -19,7 +19,7 @@ const entries: Record<StatusHelpId, { description: string; setting?: Setting }> 
   },
   'auto-recording': {
     description:
-      '统计已开启自动录制的主播。可用封面上的开关单独调整，也可在设置中使用「全部主播录制」。',
+      '统计已开启自动录制的主播。可用序号下方的开关单独调整，也可在设置中使用「全部主播录制」。',
   },
   'recording-start': {
     description: '统计正在排队或获取直播流的主播。收到并写入首个分片后计入录制中。',
@@ -85,6 +85,10 @@ const entries: Record<StatusHelpId, { description: string; setting?: Setting }> 
   retention: {
     description: '按录像保留天数清理过期媒体，收藏的录像受保护。设为 0 天可永久保留。',
     setting: 'retentionDays',
+  },
+  'empty-day-cleanup': {
+    description:
+      '启动后补扫，在本地午夜过一分钟及每小时检查全库无录像的历史日期。当天数据始终保留。',
   },
   'integrity-scan': {
     description: '按计划分批读取归档文件，核验文件与索引记录是否一致。出现错误时可按需重试。',

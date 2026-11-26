@@ -48,18 +48,26 @@ export function attributes(value: string): Record<string, string> {
 export function parseMaster(text: string, base: string): Master {
   const lines = linesOf(text),
     variants: Variant[] = [],
-    keys: Master['keys'] = [];
+    keys: Master['keys'] = [],
+    seenKeys = new Set<string>();
+  let uriIndex = 0;
   for (let index = 0; index < lines.length; index++) {
     const line = lines[index];
     if (line.startsWith('#EXT-X-MOUFLON:PSCH:')) {
       const fields = line.slice(20).split(':');
       const name = fields.at(-1),
         psch = fields.at(-2);
-      if (name && psch && !keys.some((key) => key.name === name && key.psch === psch))
+      const pair = `${psch}:${name}`;
+      if (name && psch && !seenKeys.has(pair)) {
+        seenKeys.add(pair);
         keys.push({ name, psch });
+      }
     } else if (line.startsWith('#EXT-X-STREAM-INF:')) {
       const attrs = attributes(line.slice(18));
-      const next = lines.slice(index + 1).find((value) => value && !value.startsWith('#'));
+      uriIndex = Math.max(uriIndex, index + 1);
+      while (uriIndex < lines.length && (!lines[uriIndex] || lines[uriIndex].startsWith('#')))
+        uriIndex++;
+      const next = lines[uriIndex];
       if (!next) bad();
       const resolution = /^(\d+)x(\d+)$/.exec(attrs.RESOLUTION ?? '');
       const bandwidth = Number(attrs.BANDWIDTH ?? 0);

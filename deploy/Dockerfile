@@ -1,4 +1,4 @@
-ARG NODE_IMAGE=node:24.22.1-bookworm-slim
+ARG NODE_IMAGE=node:24.22.3-bookworm-slim
 FROM ${NODE_IMAGE} AS node-runtime
 FROM node-runtime AS build
 WORKDIR /work
@@ -26,12 +26,20 @@ RUN mkdir -p /out/usr/lib/postgresql /out/usr/share/postgresql /out/usr/share/do
 
 # Build only the local MP4 -> JPEG and JPEG verification pipeline. Recording and
 # HLS transport are implemented by Node; no device/network stack is needed here.
-FROM ${NODE_IMAGE} AS media-build
-RUN sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/debian.sources \
-    && apt-get update && apt-get install -y --no-install-recommends build-essential nasm pkg-config libdav1d-dev \
-    && mkdir /source && cd /source && apt-get source ffmpeg
-COPY deploy/build-ffmpeg.sh /build-ffmpeg.sh
-RUN sh /build-ffmpeg.sh
+FROM scratch AS ffmpeg-source
+ADD --checksum=sha256:392306d6fc45dab0e9e0ea55381e071842e83a2fb31d320aeda40477a7766293 https://ffmpeg.org/releases/ffmpeg-5.1.10.tar.xz /ffmpeg.tar.xz
+
+FROM ${NODE_IMAGE} AS media-build-tools
+RUN apt-get update && apt-get install -y --no-install-recommends build-essential nasm pkg-config libdav1d-dev gpgv xz-utils
+
+FROM media-build-tools AS media-build
+COPY deploy/ffmpeg-release-key.gpg deploy/ffmpeg-5.1.10.tar.xz.asc /
+RUN --network=none --mount=from=ffmpeg-source,source=/ffmpeg.tar.xz,target=/tmp/ffmpeg.tar.xz \
+    gpgv --keyring /ffmpeg-release-key.gpg /ffmpeg-5.1.10.tar.xz.asc /tmp/ffmpeg.tar.xz \
+    && mkdir /source && tar -xJf /tmp/ffmpeg.tar.xz -C /source
+COPY deploy/build-ffmpeg.sh deploy/check-ffmpeg-elf.sh /
+COPY deploy/ffmpeg-debian-rangecoder.patch deploy/ffmpeg-encryption-info.patch deploy/ffmpeg-raw-stride.patch /
+RUN --network=none sh /build-ffmpeg.sh
 
 FROM debian:bookworm-slim AS postgres-system
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -91,6 +99,8 @@ COPY --from=build --chown=1000:1000 /work/ ./
 RUN chown 1000:1000 /work
 ENV STV_QA_BROWSER_EXECUTABLE=/usr/bin/chromium STV_QA_FFMPEG=ffmpeg STV_TEST_POSTGRES=1 HOME=/tmp
 USER 1000:1000
+RUN node --input-type=module -e "import { linkWorkspaceDependencies } from './scripts/lib/workspace-dependencies.mjs'; \
+    await linkWorkspaceDependencies('/work', '/work/build', ['apps/server', 'packages/api-schema'])"
 ENTRYPOINT ["node", "scripts/run-with-postgres.mjs"]
 CMD ["npm", "run", "test:browser"]
 

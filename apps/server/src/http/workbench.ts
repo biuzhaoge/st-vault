@@ -9,6 +9,11 @@ import type {
 import type { ArchivePort } from '../ports.js';
 import { ProviderError } from '../provider/http.js';
 import { MediaBudget } from '../provider/media-budget.js';
+import {
+  archiveWindows,
+  WORKBENCH_WINDOW_MS,
+  type CalendarArchive,
+} from '../archive/calendar-window.js';
 
 export interface WorkbenchOptions {
   maxRequests?: number;
@@ -16,7 +21,7 @@ export interface WorkbenchOptions {
   totalRowConcurrency?: number;
 }
 
-type WorkbenchArchive = Pick<ArchivePort, 'coverage' | 'statusHistory'>;
+type WorkbenchArchive = Pick<ArchivePort, 'workbenchRow'> & CalendarArchive;
 interface Row {
   subjectId: string;
   coverage: CoverageResponse;
@@ -50,7 +55,7 @@ const querySchema = z
       .optional(),
   })
   .strict()
-  .refine((value) => value.to > value.from && value.to - value.from <= 8 * 86400000);
+  .refine((value) => value.to > value.from);
 function dominant(bucket: StatusHistoryBucket): PublicStatus {
   return statuses.reduce(
     (best, status) => (bucket.durationsMs[status] > bucket.durationsMs[best] ? status : best),
@@ -138,6 +143,8 @@ export function registerWorkbench(
     reply.raw.once('close', disconnected);
     if (request.raw.aborted || reply.raw.destroyed) cancel();
     const done = (async () => {
+      if (query.to - query.from > WORKBENCH_WINDOW_MS)
+        await archiveWindows(archive, query.from, query.to, WORKBENCH_WINDOW_MS);
       const rows: Row[] = new Array<Row>(query.ids.length);
       let index = 0;
       const read = <T>(start: () => Promise<T>): Promise<T | null> =>
@@ -167,34 +174,27 @@ export function registerWorkbench(
           if (signal.aborted) return null;
           rowsAdmitted++;
           const admittedAt = performance.now();
-          // Both submitted calls must settle, including after a sibling fails.
-          const [coverage, status] = await Promise.allSettled([
-            read(() =>
-              archive.coverage(
-                subjectId,
-                query.from,
-                query.to,
-                query.buckets,
-                query.protection?.includes(subjectId) ?? false,
-                signal,
-              ),
+          const result = await read(() =>
+            archive.workbenchRow(
+              subjectId,
+              query.from,
+              query.to,
+              query.buckets,
+              query.protection?.includes(subjectId) ?? false,
+              signal,
             ),
-            read(() =>
-              archive.statusHistory(subjectId, query.from, query.to, query.buckets, signal),
-            ),
-          ]);
-          maxArchiveReadMs = Math.max(maxArchiveReadMs, performance.now() - admittedAt);
-          if (coverage.status === 'rejected') throw coverage.reason;
-          if (status.status === 'rejected') throw status.reason;
-          if (signal.aborted || !coverage.value || !status.value) return null;
+          ).finally(() => {
+            maxArchiveReadMs = Math.max(maxArchiveReadMs, performance.now() - admittedAt);
+          });
+          if (signal.aborted || !result) return null;
           rowsBuilt++;
           return {
             subjectId,
             coverage: {
-              ...coverage.value,
-              buckets: coverage.value.buckets.filter((bucket) => bucket.coveredMs > 0),
+              ...result.coverage,
+              buckets: result.coverage.buckets.filter((bucket) => bucket.coveredMs > 0),
             },
-            status: compactStatus(status.value),
+            status: compactStatus(result.status),
           };
         } finally {
           release();

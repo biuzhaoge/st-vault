@@ -16,6 +16,15 @@ const job: MediaDeletionJob = {
   error: null,
 };
 
+it('reports confirmed jobs awaiting a processing slot beyond the visible sample', () => {
+  const waiting = { ...job, state: 'waiting', phase: 'units' } as const;
+  expect(deletionStatus([waiting], [], 24)?.text).toContain('等待删除名额');
+  const active = { ...job, id: 'active' };
+  const mixed = deletionStatus([active, waiting], [], 24);
+  expect(mixed?.text).toContain('正在删除');
+  expect(mixed?.note).toBe('24 项已确认，等有名额后自动处理。');
+});
+
 it('reports an active deletion using real fragment counts and reports preparation as units', () => {
   expect(deletionStatus([job], [])).toEqual({
     text: '正在删除 · stripchat:42 · 已处理 128 / 1,000 个分片',
@@ -28,6 +37,11 @@ it('reports an active deletion using real fragment counts and reports preparatio
     scannedUnits: 256,
   };
   expect(deletionStatus([preparation], [])?.text).toContain('已检查 256 个单元');
+  const planning = { ...preparation, phase: 'plan' as const, total: 512 };
+  expect(deletionStatus([{ ...planning, processed: 0 }], [])?.text).toContain('正在生成删除清单');
+  expect(deletionStatus([planning], [])?.text).toContain(
+    '正在生成清单并回收空间 · stripchat:42 · 已处理 128 个分片',
+  );
   expect(deletionStatus([{ ...job, total: 0 }], [])?.text).not.toContain('已处理');
 });
 

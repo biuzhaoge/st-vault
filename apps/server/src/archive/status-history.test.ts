@@ -37,6 +37,56 @@ afterEach(async () => {
   for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
 });
 describe('durable bounded status history', () => {
+  it('returns both tracks and accepted personal masks in one workbench read', async () => {
+    const { root, archive } = await create();
+    await expect(archive.workbenchRow('stripchat:99', 0, 60000, 30, false)).rejects.toThrow(
+      'SUBJECT_NOT_FOUND',
+    );
+    const empty = await archive.workbenchRow(id, 0, 60000, 30, false);
+    expect(empty.coverage.buckets.every((bucket) => !bucket.coveredMs)).toBe(true);
+    await archive.commit({
+      subjectId: id,
+      sourceEpoch: 'row',
+      sourceSequence: '1',
+      init: null,
+      bytes: new Uint8Array([1]),
+      durationSeconds: 5,
+      wallStartMs: 2000,
+      timeBasis: 'source-pdt',
+      uncertaintyMs: 0,
+      discontinuity: false,
+    });
+    await archive.setObservation(id, 'PUBLIC', 1000, 15000);
+    const [unit] = (await archive.snapshotUnits!(id, undefined, 1)).items;
+    await archive.markUnitsSeen!(id, [{ unitId: unit.unitId, toMs: 4000 }]);
+    const selection = await archive.prepareMediaSelection!(
+      id,
+      { fromMs: 0, toMs: 60000 },
+      'explicit',
+      undefined,
+      { includeUnitIds: [unit.unitId] },
+    );
+    const db = await openTestDatabase(libraryIndexPath(root));
+    try {
+      // Isolate the accepted-but-unmaterialized state before the first favorite exists.
+      await db
+        .prepare(
+          'INSERT INTO favorite_commands(id,seq,subject,selection,liked,total,created) VALUES(?,?,?,?,1,1,?)',
+        )
+        .run('first-like', 1, id, selection.id, 1);
+      expect(await db.prepare('SELECT count(*) n FROM unit_favorites').get()).toEqual({ n: 0 });
+      const row = await archive.workbenchRow(id, 0, 60000, 30, true);
+      expect(row.coverage.favoriteSpans).toEqual([{ fromMs: 2000, toMs: 7000 }]);
+      expect(row.coverage.seenSpans).toEqual([{ fromMs: 2000, toMs: 4000 }]);
+      expect(row.coverage.protectedSpans?.length).toBeGreaterThan(0);
+      expect(row).toEqual({
+        coverage: await archive.coverage(id, 0, 60000, 30, true),
+        status: await archive.statusHistory(id, 0, 60000, 30),
+      });
+    } finally {
+      await db.close();
+    }
+  });
   it('seeks by interval end and reads the first bounded range through an index', async () => {
     const { archive, root } = await create();
     await archive.setObservation(id, 'PUBLIC', 1000, 10000);
@@ -119,6 +169,29 @@ describe('durable bounded status history', () => {
         ?.occurredAtMs,
     ).toBe(2000);
   });
+  it('reports the latest continuous online start without moving it on public/private transitions', async () => {
+    const { archive } = await create();
+    await archive.setObservation(id, 'OFFLINE', 1000, 1000);
+    await archive.setObservation(id, 'PUBLIC', 2000, 1000);
+    await archive.setObservation(id, 'PRIVATE', 3000, 1000);
+    await archive.setObservation(id, 'PUBLIC', 4000, 1000);
+    expect((await archive.listSubjects())[0]).toMatchObject({
+      lastKnownStatus: 'PUBLIC',
+      lastOnlineAtMs: 4000,
+      onlineSinceMs: 2000,
+    });
+    expect((await archive.listSubjects({ activity: false }))[0]).not.toHaveProperty(
+      'onlineSinceMs',
+    );
+
+    await archive.setObservation(id, 'OFFLINE', 5000, 1000);
+    expect((await archive.listSubjects())[0]).not.toHaveProperty('onlineSinceMs');
+    await archive.setObservation(id, 'PUBLIC', 6000, 1000);
+    expect((await archive.listSubjects())[0]).toMatchObject({ onlineSinceMs: 6000 });
+
+    await archive.setObservation(id, 'PRIVATE', 8000, 1000);
+    expect((await archive.listSubjects())[0]).toMatchObject({ onlineSinceMs: 8000 });
+  });
   it('clips transitions and expired leases, preserving disconnected and never-observed time as UNKNOWN', async () => {
     const { archive } = await create();
     await archive.setObservation(id, 'PUBLIC', 1000, 5000);
@@ -154,6 +227,7 @@ describe('durable bounded status history', () => {
       UNKNOWN: 20000,
     });
   });
+  // All 200 observations cross the durable archive boundary before checking coalescing.
   it('coalesces equal observations and stops accepting late writes while monitoring is disabled', async () => {
     const { archive, root } = await create();
     for (let index = 0; index < 200; index++)
@@ -173,7 +247,7 @@ describe('durable bounded status history', () => {
     } finally {
       await db.close();
     }
-  });
+  }, 15000);
   it('persists committed observations across abrupt process exit and leaves a restart gap', async () => {
     const root = await mkdtemp(path.join(tmpdir(), 'stv-status-crash-'));
     roots.push(root);

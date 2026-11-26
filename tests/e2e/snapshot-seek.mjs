@@ -86,21 +86,28 @@ try {
       const cards = () => [...document.querySelectorAll('.snapshot-cell')];
       const layout = () => cards().map((node) => [node.dataset.key, node.dataset.slot]);
       const initialLayout = JSON.stringify(layout());
+      const initialKeys = [
+        ...document.querySelectorAll('.snapshot-cell button[aria-current="time"]'),
+      ].map((node) => node.dataset.key);
       window.__seekFeedback.initialLayout = {
         count: cards().length,
         first: layout()[0],
         last: layout().at(-1),
       };
       const initialNodes = new Map(cards().map((node) => [node.dataset.key, node]));
-      document
-        .querySelector(`.snapshot-cell button[data-key="${CSS.escape(key)}"]`)
-        .addEventListener(
-          'click',
-          () => {
-            window.__seekFeedback.clickedAt = performance.now();
-          },
-          { once: true, capture: true },
-        );
+      const recordClick = (event) => {
+        if (
+          !event.isTrusted ||
+          event.detail !== 1 ||
+          event.button !== 0 ||
+          event.target.closest('.snapshot-grid .snapshot-cell button[data-key]')?.dataset.key !==
+            key
+        )
+          return;
+        window.__seekFeedback.clickedAt = performance.now();
+        document.removeEventListener('click', recordClick, true);
+      };
+      document.addEventListener('click', recordClick, true);
       const sample = () => {
         const trace = window.__seekFeedback;
         if (
@@ -120,7 +127,12 @@ try {
           ...document.querySelectorAll('.snapshot-cell button[aria-current="time"]'),
         ].map((node) => node.dataset.key);
         if (trace.firstAt === null && keys.includes(trace.key)) trace.firstAt = performance.now();
-        if (trace.clickedAt) trace.samples.push(keys);
+        if (trace.clickedAt) {
+          // Before the double-click window closes, the previous playback position remains valid.
+          // Once the new unit appears, every frame must keep its exact identity.
+          if (trace.firstAt !== null || JSON.stringify(keys) !== JSON.stringify(initialKeys))
+            trace.samples.push(keys);
+        }
         if (trace.firstAt !== null && document.querySelector('.snapshot-ghost button.selected'))
           trace.samples.push(['stale-exit-highlight']);
         if (trace.firstAt !== null && !keys.includes(trace.key) && trace.misses.length < 3)
@@ -162,6 +174,7 @@ try {
     'time',
     'The clicked card must remain highlighted while both APIs are held',
   );
+  await page.waitForFunction(() => window.__seekFeedback.samples.length >= 4);
   release();
   await page.waitForFunction(() => {
     const video = document.querySelector('video[data-media-slot="active"]');

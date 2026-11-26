@@ -25,7 +25,7 @@ afterEach(async () => {
   await Promise.all(hubs.splice(0).map((hub) => hub.close()));
   await Promise.all(evidenceServices.splice(0).map((evidence) => evidence.close()));
 });
-function fixture(extra: Partial<Parameters<typeof createIngressHub>[0]> = {}) {
+function fixture(extra: Partial<Parameters<typeof createIngressHub>[0]> = {}, fragmentBytes = 64) {
   let sequence = 1,
     state = 'PUBLIC';
   const requests: string[] = [];
@@ -41,7 +41,9 @@ function fixture(extra: Partial<Parameters<typeof createIngressHub>[0]> = {}) {
       return new Response(
         `#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:${sequence}\n#EXT-X-MAP:URI="init.mp4"\n#EXT-X-PROGRAM-DATE-TIME:${new Date(1700000000000 + sequence * 2000).toISOString()}\n#EXTINF:2,\nsegment-${sequence}.mp4\n`,
       );
-    return new Response(new Uint8Array(64), { headers: { 'content-type': 'video/mp4' } });
+    return new Response(new Uint8Array(url.endsWith('init.mp4') ? 64 : fragmentBytes), {
+      headers: { 'content-type': 'video/mp4' },
+    });
   });
   const hub = createIngressHub({
     provider,
@@ -68,9 +70,88 @@ function fixture(extra: Partial<Parameters<typeof createIngressHub>[0]> = {}) {
   };
 }
 describe('shared live ingress', () => {
-  it.each([false, true])(
-    'reclaims the oldest published ring head fairly while preserving recording ownership (%s)',
-    async (protectedRecording) => {
+  it('releases frame protection when recording is cancelled before the first frame', async () => {
+    let reportPublic!: () => void;
+    const ready = new Promise<Subject['providerStatus']>((resolve) => {
+      reportPublic = () => resolve('PUBLIC');
+    });
+    const mib = 1024 ** 2;
+    const f = fixture(
+      { provider: { status: () => ready }, maxBytes: 18 * mib, ringBytes: 18 * mib },
+      3 * mib,
+    );
+    const viewer = f.hub.acquire(subject);
+    const stop = new AbortController();
+    const commit = vi.fn();
+    const capture = f.hub.capture(subject, { commit }, stop.signal);
+    try {
+      stop.abort();
+      await expect(capture).rejects.toThrow('cancelled');
+      reportPublic();
+      const lease = await viewer;
+      f.advance();
+      await vi.waitFor(() => expect(lease.snapshot().playlist.segments.at(-1)?.sequence).toBe('2'));
+      expect(commit).not.toHaveBeenCalled();
+    } finally {
+      reportPublic();
+      (await viewer).release();
+      await f.hub.close();
+      expect(f.hub.stats().retainedBytes).toBe(0);
+    }
+  });
+  it('keeps a viewer advancing under memory pressure after recording stops and restarts', async () => {
+    const mib = 1024 ** 2;
+    const f = fixture({ maxBytes: 18 * mib, ringBytes: 18 * mib }, 3 * mib);
+    const viewer = await f.hub.acquire(subject);
+    const recorded: string[] = [];
+    const record = (signal: AbortSignal) =>
+      f.hub.capture(
+        subject,
+        {
+          commit: async (input) => {
+            recorded.push(input.sourceSequence);
+            return {
+              ...input,
+              id: 'synthetic',
+              mediaObjectId: 'synthetic',
+              initObjectId: null,
+              wallEndMs: input.wallStartMs! + 2000,
+            };
+          },
+        },
+        signal,
+      );
+    try {
+      for (const first of [1, 3]) {
+        const stop = new AbortController();
+        const capture = record(stop.signal);
+        try {
+          await vi.waitFor(() => expect(recorded).toContain(String(first)));
+        } finally {
+          stop.abort();
+          await expect(capture).rejects.toThrow('cancelled');
+        }
+        for (const sequence of [first + 1, first + 2]) {
+          f.advance();
+          await vi.waitFor(() =>
+            expect(viewer.snapshot().playlist.segments.at(-1)?.sequence).toBe(String(sequence)),
+          );
+        }
+      }
+      expect(recorded).toEqual(['1', '3']);
+    } finally {
+      viewer.release();
+      await f.hub.close();
+      expect(f.hub.stats().retainedBytes).toBe(0);
+    }
+  });
+  it.each([
+    { protectedRecording: false, detachOther: false },
+    { protectedRecording: true, detachOther: false },
+    { protectedRecording: true, detachOther: true },
+  ])(
+    'reclaims the oldest published head with recorder=$protectedRecording and a second recorder detached=$detachOther',
+    async ({ protectedRecording, detachOther }) => {
       const versions = new Map<number, number>();
       const hub = createIngressHub({
         provider: { status: () => Promise.resolve('PUBLIC') },
@@ -136,6 +217,14 @@ describe('shared live ingress', () => {
             )
             .catch((error: unknown) => error);
           await vi.waitFor(() => expect(releaseCommit).toBeTypeOf('function'));
+          if (detachOther)
+            await expect(
+              hub.capture(
+                bSubject,
+                { commit: () => Promise.reject(Error('second-recorder-stopped')) },
+                new AbortController().signal,
+              ),
+            ).rejects.toThrow('second-recorder-stopped');
         }
         b = await hub.acquire(bSubject);
         versions.set(42, 2);

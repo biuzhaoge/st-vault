@@ -6,6 +6,8 @@
 
 参与修改时请附复现、相关测试及风险说明，行为变更同步修改对应文档。安全问题按 [SECURITY.md](SECURITY.md)私密反馈。两份文件集中在 docs，并沿用 [GitHub 支持的标准命名和位置](https://docs.github.com/en/communities/setting-up-your-project-for-healthy-contributions/creating-a-default-community-health-file)，不在根目录保留重复入口。
 
+本轮全项目审查的源码证据、回归结果和回滚说明见[项目审查报告](audit/REPORT.md)。
+
 ## 仓库结构
 
 | 路径                      | 内容                                                                                     |
@@ -30,7 +32,7 @@
 docker build --target qa -t st-vault:qa -f deploy/Dockerfile .
 docker run --rm st-vault:qa npm run check
 docker run --rm --entrypoint npm st-vault:qa audit --omit=dev --audit-level=high
-docker run --rm st-vault:qa sh -ec 'npm run build && npm run test:browser'
+docker run --rm --network none --shm-size=1g st-vault:qa npm run test:browser
 ```
 
 `check` 包括格式、lint、文档链接与源码依赖边界、类型、工具/工作区测试和发布构建。QA 镜像内置临时 PostgreSQL，启用真实数据库集成测试；runtime 不带 npm、编译器或 Chromium。定向测试：
@@ -38,7 +40,7 @@ docker run --rm st-vault:qa sh -ec 'npm run build && npm run test:browser'
 ```sh
 docker run --rm st-vault:qa npm test --workspace @st-vault/ui -- src/features/timeline/track-loader.test.ts
 docker run --rm st-vault:qa npm test --workspace @st-vault/server -- src/database/postgres.test.ts
-docker run --rm st-vault:qa sh -ec 'npm run build && node scripts/run-browser-tests.mjs sync-request-budget display-clock deletion-intent'
+docker run --rm --network none --shm-size=1g st-vault:qa npm run test:browser -- sync-request-budget display-clock deletion-intent
 ```
 
 浏览器 fixture 在独立端口生成合成 HLS/JPEG，禁止外部网站请求；产物在 `.local/qa/`，临时状态正常结束后清理。`STV_QA_KEEP_STATE=1` 仅用于显式保留排障状态。不要将私人数据库、Cookies 或录像放进测试。UI、删除、媒体和持久层变更须覆盖相关浏览器、取消、迟到响应、中断及重启场景。
@@ -70,17 +72,24 @@ docker compose -f compose.yml -f deploy/compose.build.yml up -d --build
 
 ## 验证与发布
 
-每次推送 `main` 或提交面向 `main` 的 PR 都只运行 CI。检查覆盖格式、类型、测试、构建、依赖审计和 Compose 配置。浏览器回归可按上文在本地运行。
+每次推送 `main` 或提交面向 `main` 的 PR 都运行 CI。检查覆盖格式、类型、测试、构建、依赖审计、Compose 配置和完整 Chromium 回归。浏览器使用 QA 镜像中已编译的服务与页面。发布工作流复用相同门槛。
 
 1. 准备发版时，同步更新根目录与三个工作区 `package.json` 的版本和 `package-lock.json`，并在[更新日志](CHANGELOG.md)顶部添加对应的 `## X.Y.Z`，写明中英文用户可见变更和必要的升级说明。推送 `main`，等待 CI 通过。
 2. 在 GitHub 打开 [Actions → Publish release](https://github.com/biuzhaoge/st-vault/actions/workflows/dockerhub.yml)，点击 **Run workflow**，选择 `main`。工作流以触发时的提交为准，从根目录 `package.json` 读取版本，并复用 CI。
-3. 两个原生架构分别完成启动、关闭及数据库恢复测试后，工作流创建 `vX.Y.Z` 源码标签、`X.Y.Z` 双架构镜像和带更新日志的 GitHub Release。当前 `main` 的发布会更新 Docker Hub 的 `latest` 及 Overview。若 `main` 在构建期间前进，仍可通过固定版本取得结果。
+3. 发布前，两个原生架构分别从 Debian 获取当前发行版签名的 `*-security/main` 软件包索引，并对比成品中的已安装二进制包。索引不可用或镜像包版本低于安全仓库时，发布会停止。该检查覆盖安全仓库当前列出的包。已并入基础发行库的历史修订需另查，独立复制的 Node.js、PostgreSQL 和自编 FFmpeg 也需分别核验。
+4. 两个原生架构分别完成启动、关闭及数据库恢复测试后，工作流创建 `vX.Y.Z` 源码标签、`X.Y.Z` 双架构镜像和带更新日志的 GitHub Release。当前 `main` 的发布会更新 Docker Hub 的 `latest` 及 Overview。若 `main` 在构建期间前进，仍可通过固定版本取得结果。
 
 同一版本的正式标签固定到对应源码和镜像，发布失败后可重跑原工作流。已成功发布的版本有新改动时递增版本号。`DOCKERHUB_TOKEN` 需有推送、更新 Overview 和删除临时标签的权限。GitHub Actions 日志保留 7 天，镜像由 [Docker Hub](https://hub.docker.com/r/biuzhaoge/st-vault) 提供。
 
 ## 旧部署升级
 
+旧 PostgreSQL 热索引首次升级时，若媒体库当前或上一份检查点仍保留序号 0 的原始基线，即使热索引已出现后续写入，也要核实初始数据和对应日志。恢复已有可疑热库所需的材料不全时，会停止恢复并保留现有热数据。补回匹配的检查点和日志后，可在原热索引重试。成功验证的热库会保存标记。若原始基线已经轮换掉，应从早期备份核对当时的录像数量。
+
+若旧版已经把录像移入 `.orphaned`，先停写，完整复制数据卷与媒体卷。在副本上恢复索引，按每条有效对象记录的主播、规范文件名、长度和 SHA-256 比对隔离文件。仅在规范路径为空且内容完全匹配时复制，保留隔离原件，再重启副本验证实际播放。遇到文件冲突、缺少可信索引或哈希不符时，保留现场供进一步恢复。
+
 当前支持格式 1、业务元数据格式 5 的双目录 SQLite 库一次性导入 PostgreSQL。先正常停止旧应用，备份完整 data、media 和旧镜像；新镜像首次启动恢复已确认日志、冻结源库、导入校验并发布格式 2 检查点。冻结副本位于 `data/backups/postgresql-<库UUID>/<代际>/`，不能代替视频备份。需为旧库、副本、新集群、暂存表和 WAL 留足空间，不要在大库首次导入时反复强制重启。
+
+迁移截图队列时，导入事务会按任务实际状态重建统计。早先已经升级到 PostgreSQL 的队列会在首次使用修正版启动时自动核对一次，包括曾出现 `job_statistics_running_check` 错误的队列。核对期间队列写入需要等待，耗时随历史任务量增长。完成后常规启动直接读取计数，中断的截图任务会重新排队。
 
 旧单目录布局必须先使用匹配历史镜像中的 [migrate-library.mjs](../scripts/maintenance/migrate-library.mjs) 转成两个独立目录；不要直接用当前 latest 操作不匹配的旧库。工具要求正常关闭的格式 5 源，目标彼此独立且不在源内；同盘硬链接、跨盘复制校验，中断可重跑，保留源用于回退。
 
@@ -90,11 +99,13 @@ docker compose -f compose.yml -f deploy/compose.build.yml up -d --build
 
 使用 `scripts/benchmarks` 的合成数据，记录 CPU/内存、存储、样本量、预热与测量范围。日志将数据库池等待、SQL 执行和 RPC 往返分开，不能把所有等待归因于 SQL。真实网络诊断在 `scripts/diagnostics`，需显式启用，独立于默认离线测试。
 
+- `http_completed` 包含最终状态码、路由模板、请求 ID 和耗时。5xx 以 error 级别记录，即使处理程序直接返回错误响应；恢复后的成功响应以 info 记录。
 - `capture_polling` 将 `admission`、`upstream`、`persist`、`sweep`、`tail` 和 `rotation` 分开汇总。`p95UpperMs` 是固定桶的上界，先核对样本数，再用 `deadlineLimitedSweeps`、`capacityLimitedSweeps` 和 `skippedClockRuns` 判断拥塞阶段。上游超时后仍未返回的物理请求继续占用原容量。
 - `workbench_batch_timing` 记录取消或耗时至少 500 ms 的批次，每 10 秒最多一条，包含请求跨度（`spanHours`）、每行桶数（`buckets`）、请求行数、准入行数、等待取消数和排空耗时。按同一请求 ID 关联 `metadata_rpc_slow`、`database_pool_wait` 和 `database_query_slow`，分别看 RPC、池等待和 SQL。等池与已发送语句仍可能延长排空。
 - [录制启动基准](../scripts/benchmarks/recording-start.mjs) 测量已有新鲜 `PUBLIC` 状态时的定向启动。`statusCalls` 显示是否实际调用上游。[轮询基准](../scripts/benchmarks/capture-sweep.mjs) 用 203 个合成主播和 180 秒虚拟时间，比较快慢请求混合、观看占用及串行落库下的确认间隔、租约余量和上游调用量。
 - [工作台成本基准](../scripts/benchmarks/workbench-cost.mjs) 通过真实 HTTP 路由、归档 Worker 和临时 PostgreSQL 测量空覆盖、密集覆盖和有已看记录的窗口。分别查看覆盖与状态历史的 RPC 次数、Worker 时长和表访问。命令末尾可加采样次数与跨度小时数，例如 `8 168` 测量一周。浏览器 `list-scroll` 场景默认用一周密集数据，记录缓存命中时的帧间隔、详细轨道挂载数与网格绘制高度，设 `STV_QA_SCROLL_DAYS=1` 可对照一天。
 - [录制与回看混合基准](../scripts/benchmarks/recording-workbench.mjs) 在两个固定运行镜像中重放同一计划。归档层接收 21 路合成分片和 194 个目标的状态观测，回环 HTTP 发起工作台、播放、媒体读取和针对合成历史的删除。该基准测量持久化和接口，真实上游、录制调度和浏览器解码需要独立验证。
+- [删除回收基准](../scripts/benchmarks/deletion-workload.mjs) 用新建的 PostgreSQL 实例和容器内的合成文件，先提交大任务，紧接着提交同主播的小任务。报告入队、开始准备、首次持久确认回收和总耗时，并核对回收字节及历史文件。默认任务为 12,692 和 342 个片段，每个片段 4 KiB。对比运行镜像时，容器只挂载只读脚本，设置 `STV_BENCH_APP_ROOT=/app`，用相同的资源限制和存储类型串行测试。
 - [截图空闲基准](../scripts/benchmarks/screenshot-idle.mjs) 用 1,000 个合成主播和真实 PostgreSQL，在完成首次轮转后统计 10 秒内的目录、录像单元分页、统计与领取查询。构建后在同一 QA 容器执行 `node scripts/benchmarks/screenshot-idle.mjs`。
 
 [运行时性能汇总](../scripts/diagnostics/runtime-performance.mjs) 从标准输入读取一段 JSONL。它输出采样时段、事件计数、各阶段观测值的最大值和按请求 ID 的关联数量，报告中只保留预先列明的诊断字段。用 `input.firstAt` 和 `input.lastAt` 确认实际覆盖范围。`highestWindowP95UpperMs` 是已收集窗口中最高的 P95 上界，跨窗口的 P95 需要原始分桶计数。
@@ -103,6 +114,7 @@ docker compose -f compose.yml -f deploy/compose.build.yml up -d --build
 docker compose logs --since 30m --tail 20000 --no-color --no-log-prefix app 2>&1 | docker run --rm -i --network none --entrypoint node st-vault:qa scripts/diagnostics/runtime-performance.mjs
 docker run --rm --network none st-vault:qa sh -ec 'npm run build && node scripts/benchmarks/recording-start.mjs && node scripts/benchmarks/capture-sweep.mjs'
 docker run --rm --network none --entrypoint sh st-vault:qa -ec 'npm run build && node scripts/benchmarks/workbench-cost.mjs'
+docker run --rm --network none --entrypoint sh st-vault:qa -ec 'npm run build && node scripts/benchmarks/deletion-workload.mjs'
 ```
 
 运行混合基准时，每版使用新的空白 `/audit-scratch`，把脚本只读挂载为 `/audit/recording-workbench.mjs`，以 `STV_BENCH_SCRATCH=/audit-scratch` 和 `node /audit/recording-workbench.mjs 1080` 启动。可将同一份合成 fMP4 目录只读挂载到 `/audit-fixture`，并设置 `STV_BENCH_FIXTURE=/audit-fixture`。目录包含 `stream.m3u8`、`init.mp4` 和 `seg<数字>.m4s`。两版串行运行，固定镜像 SHA、存储类型、资源上限及媒体文件哈希。

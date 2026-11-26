@@ -1,5 +1,6 @@
 import type { SqlDatabase } from '../database/sql.js';
 import type { Segment, MediaTimeRange, SnapshotItem } from '@st-vault/api-schema';
+import { deletionItemStates } from './deletion-store.js';
 import { initializeUnitVisibility } from './unit-visibility.js';
 export interface RecordingUnit {
   id: string;
@@ -132,7 +133,7 @@ export class RecordingUnits {
     }>())!;
     const rows = await this.db
       .prepare(
-        `SELECT s.id,s.json,s.created_revision,CASE WHEN s.deleted<>0 OR EXISTS(SELECT 1 FROM deletion_items i JOIN media_deletions d ON d.id=i.job WHERE i.segment=s.id AND d.state IN ('queued','running','retry')) THEN 1 ELSE 0 END deleted FROM segments s WHERE (s.created_revision,s.id)>(?,?) ORDER BY s.created_revision,s.id LIMIT ?`,
+        `SELECT s.id,s.json,s.created_revision,CASE WHEN s.deleted<>0 OR EXISTS(SELECT 1 FROM deletion_items i JOIN media_deletions d ON d.id=i.job WHERE i.segment=s.id AND d.state IN (${deletionItemStates})) THEN 1 ELSE 0 END deleted FROM segments s WHERE (s.created_revision,s.id)>(?,?) ORDER BY s.created_revision,s.id LIMIT ?`,
       )
       .all<{
         id: string;
@@ -166,22 +167,21 @@ export class RecordingUnits {
       .run(subject);
     if (Number(result.changes)) this.changed(subject, affected.start!, affected.end!);
   }
-  async deleted(segmentId: string, notify = true): Promise<void> {
-    const subject = await this.db
+  async retireSegments(segments: readonly { id: string; visible: boolean }[]): Promise<void> {
+    const units = await this.db
       .prepare(
-        'SELECT u.subject,u.start,u."end" FROM recording_units u JOIN unit_segments m ON m.unit=u.id WHERE m.segment=?',
+        `UPDATE recording_units u SET deleted=1,closed=1 FROM (
+          SELECT m.unit,bool_or(s.visible) AS visible
+          FROM json_to_recordset(?::json) AS s(id text,visible boolean)
+          JOIN unit_segments m ON m.segment=s.id GROUP BY m.unit
+        ) affected WHERE u.id=affected.unit AND (u.deleted=0 OR u.closed=0)
+        RETURNING u.subject,u.start,u."end",affected.visible`,
       )
-      .get<{
-        subject: string;
-        start: number;
-        end: number;
-      }>(segmentId);
-    await this.db
-      .prepare(
-        'UPDATE recording_units SET deleted=1,closed=1 WHERE id=(SELECT unit FROM unit_segments WHERE segment=?)',
-      )
-      .run(segmentId);
-    if (subject && notify) this.changed(subject.subject, subject.start, subject.end, true);
+      .all<{ subject: string; start: number; end: number; visible: boolean }>(
+        JSON.stringify(segments.map(({ id, visible }) => ({ id, visible }))),
+      );
+    for (const unit of units)
+      if (unit.visible) this.changed(unit.subject, unit.start, unit.end, true);
   }
   async page(
     subject: string,

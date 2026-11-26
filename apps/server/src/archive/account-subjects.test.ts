@@ -4,6 +4,45 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { expect, it } from 'vitest';
 import { openArchive } from './index.js';
+import { SqlDatabase } from '../database/sql.js';
+import { libraryIndexPath } from '../library/paths.js';
+
+it('leaves unchanged membership rows untouched and inherits recording policy only on re-follow', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'stv-account-diff-'));
+  const archive = await openArchive({ root });
+  const db = await SqlDatabase.open(libraryIndexPath(root));
+  const alice = { id: 'stripchat:1', providerId: 1, handle: 'one' };
+  const bob = { id: 'stripchat:2', providerId: 2, handle: 'two' };
+  const versions = () =>
+    db.prepare('SELECT subject,xmin::text AS version FROM account_subjects ORDER BY subject').all();
+  const activate = async (members: (typeof alice)[]) => {
+    const generation = randomUUID();
+    await archive.prepareAccountSubjects(members, generation);
+    await archive.activateAccountSubjects(generation);
+  };
+  try {
+    await archive.setGlobalRecording(true);
+    await activate([alice, bob]);
+    await archive.setPolicy(alice.id, { autoRecord: false });
+    const before = await versions();
+    await activate([bob, alice, alice]);
+    expect(await versions()).toEqual(before);
+    expect(await archive.getSubject(alice.id)).toMatchObject({
+      archived: false,
+      autoRecord: false,
+    });
+    await activate([bob]);
+    expect((await versions())[1]).toEqual(before[1]);
+    expect(await archive.getSubject(alice.id)).toMatchObject({ archived: true, autoRecord: false });
+    await activate([alice, bob]);
+    expect((await versions())[1]).toEqual(before[1]);
+    expect(await archive.getSubject(alice.id)).toMatchObject({ archived: false, autoRecord: true });
+  } finally {
+    await db.close();
+    await archive.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 it('stages a public list without changing membership and activates it idempotently after reopening', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'stv-account-stage-'));

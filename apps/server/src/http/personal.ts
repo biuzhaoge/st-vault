@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import type { ArchivePort } from '../ports.js';
+import { archiveWindows } from '../archive/calendar-window.js';
 
 const subject = z
   .string()
@@ -16,13 +17,13 @@ const query = z
     from: z.coerce.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
     to: z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER),
   })
-  .strict()
-  .refine((value) => value.to > value.from && value.to - value.from <= 9 * 86400000);
+  .strict();
 
 /** Parent scope authenticates all routes; no client-supplied user identity is accepted. */
 export function registerPersonal(app: FastifyInstance, archive: ArchivePort): void {
-  app.get('/api/me/favorites', (request) => {
+  app.get('/api/me/favorites', async (request) => {
     const input = query.parse(request.query);
+    await archiveWindows(archive, input.from, input.to);
     return archive.personal(input.subjectId, input.from, input.to);
   });
   app.delete('/api/me/favorites/:id', async (request, reply) => {

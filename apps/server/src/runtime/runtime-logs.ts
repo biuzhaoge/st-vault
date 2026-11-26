@@ -8,9 +8,10 @@ import { format } from 'node:util';
 export const logContext = new AsyncLocalStorage<{ requestId: string }>();
 export let runtimeLogDestination: Writable | undefined;
 const secretField =
-  /password|cookie|authorization|secret|token|psch|pkey|signature|captcha|passcode|verificationCode|^(?:keys|key|headers|body|otp|totp|otpCode|totpCode|oneTimeCode|pin|confirmPin|stv_setup)$/i;
+  /password|cookie|authorization|secret|token|psch|pkey|signature|captcha|passcode|verificationCode|^(?:keys|key|headers|body|otp|totp|otpCode|totpCode|oneTimeCode|pin|confirmPin|stv_next|stv_setup|cf_clearance)$/i;
 function cleanText(value: string): string {
   return value
+    .replace(/\b((?:set-cookie|cookie|(?:proxy-)?authorization):[ \t]*)[^\r\n]*/gi, '$1[redacted]')
     .replace(/https?:\/\/[^\s"'<>]+/g, (address) => {
       try {
         return `${new URL(address).origin}/[redacted]`;

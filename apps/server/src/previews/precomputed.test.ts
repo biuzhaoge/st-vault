@@ -167,7 +167,9 @@ it('generates on recorded commits before requests, then serves persistent images
     await archive.close();
     await rm(root, { recursive: true, force: true });
   }
-});
+}, 15000);
+// The job intentionally uses the production retry delay. Its own wait bounds
+// the retry; the enclosing timeout also covers database startup and shutdown.
 it('does not recycle an unvalidated encoded image when full JPEG validation rejects it', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'stv-validation-retry-')),
     archive = await openArchive({ root: path.join(root, 'archive') });
@@ -213,4 +215,4 @@ it('does not recycle an unvalidated encoded image when full JPEG validation reje
     await archive.close();
     await rm(root, { recursive: true, force: true });
   }
-});
+}, 15000);

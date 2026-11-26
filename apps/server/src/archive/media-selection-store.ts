@@ -132,11 +132,12 @@ export class MediaSelectionStore {
       throw Error('MEDIA_SELECTION_STALE');
     return row;
   }
-  async build(subject: string, id: string): Promise<boolean> {
+  async build(subject: string, id: string, favoriteFilter?: boolean): Promise<boolean> {
     const p = await this.get(subject, id);
     if (p.ready) return false;
     let inserted = 0;
     if (p.base) {
+      const filter = favoriteFilter === undefined ? null : Number(favoriteFilter);
       const rows = await this.db
         .prepare(
           'SELECT unit FROM selection_units WHERE selection=? AND unit>? ORDER BY unit LIMIT 256',
@@ -150,9 +151,12 @@ export class MediaSelectionStore {
             `INSERT INTO selection_units(selection,unit) SELECT ?,value
          FROM json_array_elements_text(?::json) AS candidate(value)
          WHERE NOT EXISTS(SELECT 1 FROM selection_edits e WHERE e.selection=? AND e.unit=candidate.value AND e.include=0)
+         AND (?::int IS NULL OR ?::int = (EXISTS(
+           SELECT 1 FROM effective_unit_favorites f WHERE f.unit=candidate.value
+         ))::int)
          ON CONFLICT DO NOTHING`,
           )
-          .run(id, JSON.stringify(rows.map((row) => row.unit)), id)
+          .run(id, JSON.stringify(rows.map((row) => row.unit)), id, filter, filter)
       ).changes;
       await this.db
         .prepare('UPDATE media_selections SET count=count+?,copy_cursor=?,base=? WHERE id=?')

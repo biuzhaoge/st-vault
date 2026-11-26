@@ -13,16 +13,23 @@ function changes(added: 'NEW' | null, removed: 'OLD' | null): string {
     )
     .join(',');
 }
+/** The queue installer and bulk importer both hold the jobs write lock until commit. */
+export async function recountJobStatistics(db: SqlDatabase): Promise<void> {
+  const columns = states.map(([column]) => column);
+  await db.exec(`INSERT INTO job_statistics(id,${columns.join(',')},reconciled)
+    SELECT 1,${states.map(([, state]) => `COUNT(*) FILTER (WHERE state='${state}')`).join(',')},true FROM jobs
+    ON CONFLICT(id) DO UPDATE SET ${columns.map((column) => `${column}=excluded.${column}`).join(',')},reconciled=true`);
+}
 /** Counts change in the jobs transaction; old completed history is scanned only once. */
 export async function initializeJobStatistics(db: SqlDatabase): Promise<void> {
   await db.transaction(async () => {
     await db.exec(`LOCK TABLE jobs IN SHARE ROW EXCLUSIVE MODE;
       CREATE TABLE IF NOT EXISTS job_statistics(id BIGINT PRIMARY KEY CHECK(id=1),${states.map(([column]) => `${column} BIGINT NOT NULL CHECK(${column}>=0)`).join(',')});
+      ALTER TABLE job_statistics ADD COLUMN IF NOT EXISTS reconciled BOOLEAN NOT NULL DEFAULT false;
       CREATE INDEX IF NOT EXISTS jobs_oldest ON jobs(created) WHERE state IN ('pending','running')`);
-    if (!(await db.prepare('SELECT id FROM job_statistics WHERE id=1').get()))
-      await db.exec(
-        `INSERT INTO job_statistics SELECT 1,${states.map(([, state]) => `COUNT(*) FILTER (WHERE state='${state}')`).join(',')} FROM jobs`,
-      );
+    // Earlier SQLite imports populated jobs with the counting triggers disabled.
+    if (!(await db.prepare('SELECT id FROM job_statistics WHERE id=1 AND reconciled').get()))
+      await recountJobStatistics(db);
     await db.exec(`CREATE OR REPLACE FUNCTION maintain_job_statistics() RETURNS trigger LANGUAGE plpgsql AS $$
       BEGIN
         IF TG_OP='INSERT' THEN UPDATE job_statistics SET ${changes('NEW', null)} WHERE id=1;

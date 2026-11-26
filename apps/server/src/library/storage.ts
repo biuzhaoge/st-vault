@@ -5,6 +5,7 @@ import { directory, regularFile, atomicJson, libraryIdPattern } from './files.js
 import type { SqlDatabase } from '../database/sql.js';
 import { PortableTransactions } from '../database/portable-transactions.js';
 export interface Checkpoint {
+  baselineVerified?: true;
   file: string;
   sequence: number;
   hash: string;

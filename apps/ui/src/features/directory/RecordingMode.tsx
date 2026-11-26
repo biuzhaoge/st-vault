@@ -1,14 +1,24 @@
 import { tr } from '../../shared/lib/i18n';
-import { useRef, useState } from 'react';
+import { useRef, useState, type CSSProperties } from 'react';
 import type { CaptureState, PublicStatus } from '@st-vault/api-schema';
 import { messageFor } from '../../shared/lib/errors';
 import { ProgressRing } from '../../shared/ui/ProgressRing';
+
+export function DirectoryRowNumber({ number }: { number: number }): JSX.Element {
+  return (
+    <span className="directory-row-number" aria-hidden="true">
+      <span style={{ '--row-number-digits': String(number).length } as CSSProperties}>
+        {number}
+      </span>
+    </span>
+  );
+}
 
 export function RecordingMode({
   value,
   label,
   disabled = false,
-  appearance = 'switch',
+  rowNumber,
   onChange,
   captureState,
   providerStatus,
@@ -16,7 +26,7 @@ export function RecordingMode({
   value: boolean;
   label: string;
   disabled?: boolean;
-  appearance?: 'switch' | 'record';
+  rowNumber?: number;
   onChange: (record: boolean) => Promise<void>;
   captureState?: CaptureState;
   providerStatus?: PublicStatus;
@@ -27,41 +37,37 @@ export function RecordingMode({
   const pointer = useRef<{ x: number; moved: boolean } | null>(null);
   const dragged = useRef(false);
   const current = pending ?? value;
-  const recording =
-    appearance === 'record'
-      ? value === true && pending !== false && captureState === 'CAPTURING'
-      : current === true;
+  const numbered = rowNumber !== undefined;
+  const recording = numbered ? value && pending !== false && captureState === 'CAPTURING' : current;
   const starting =
-    appearance === 'record' &&
+    numbered &&
     !recording &&
     (pending === true ||
       (current === true && ['QUEUED', 'RESOLVING'].includes(captureState ?? '')));
+  const busy = starting || pending !== null;
   const text =
-    appearance === 'record' && recording
+    numbered && recording
       ? tr('录制中')
       : pending !== null
-        ? appearance === 'record'
+        ? numbered
           ? tr(pending ? '启动中' : '停止中')
           : tr('保存中')
-        : appearance === 'record' && current === true
-          ? recording
-            ? tr('录制中')
-            : starting
-              ? tr(captureState === 'QUEUED' ? '等待录制名额' : '启动中')
-              : tr(
-                  captureState === 'BACKOFF'
-                    ? '等待重试'
-                    : providerStatus === 'PUBLIC'
-                      ? '等待启动'
-                      : '等待公开直播',
-                )
+        : numbered && current
+          ? starting
+            ? tr(captureState === 'QUEUED' ? '等待录制名额' : '启动中')
+            : tr(
+                captureState === 'BACKOFF'
+                  ? '等待重试'
+                  : providerStatus === 'PUBLIC'
+                    ? '等待启动'
+                    : '等待公开直播',
+              )
           : current
             ? tr('已开启')
             : tr('已关闭');
-  const description =
-    appearance === 'record'
-      ? `${tr(current ? '自动录制已开启' : '自动录制已关闭')} · ${text}`
-      : text;
+  const description = numbered
+    ? `${tr(current ? '自动录制已开启' : '自动录制已关闭')} · ${text}`
+    : text;
   async function save(record: boolean): Promise<void> {
     if (lock.current || disabled || record === value) return;
     lock.current = true;
@@ -77,19 +83,19 @@ export function RecordingMode({
     }
   }
   return (
-    <span className={`recording-mode${appearance === 'record' ? ' recording-icon' : ''}`}>
+    <span className={`recording-mode${numbered ? ' recording-number' : ''}`}>
       <button
         type="button"
         role="switch"
-        className={`recording-toggle${appearance === 'record' ? ' record-button' : ''}${recording ? ' is-recording' : ''}${starting ? ' is-starting' : ''}`}
+        className={`recording-toggle${numbered ? ' record-button' : ''}${recording ? ' is-recording' : ''}`}
         disabled={disabled || pending !== null}
         aria-checked={current === true}
-        aria-busy={starting || pending !== null}
+        aria-busy={busy}
         aria-label={label}
         aria-description={error || description}
         onPointerDown={(event) => {
           event.stopPropagation();
-          if (appearance === 'record') return;
+          if (numbered) return;
           if (event.button !== 0) return;
           pointer.current = { x: event.clientX, moved: false };
           dragged.current = false;
@@ -134,7 +140,14 @@ export function RecordingMode({
           }
         }}
       >
-        {starting || (appearance === 'record' && pending === false) ? <ProgressRing /> : <i />}
+        {numbered ? (
+          <>
+            <DirectoryRowNumber number={rowNumber} />
+            {busy ? <ProgressRing /> : <span className="record-action" aria-hidden="true" />}
+          </>
+        ) : (
+          <i />
+        )}
       </button>
       {error && (
         <span className="mode-error" role="alert" aria-label={error}>

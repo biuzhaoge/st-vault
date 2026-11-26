@@ -51,12 +51,12 @@ describe.skipIf(process.env.STV_TEST_POSTGRES !== '1')('portable PostgreSQL chec
         INSERT INTO private_config VALUES('secret','SOURCE_PRIVATE');`);
       return db;
     };
-    const journal = async (db: SqlDatabase) => {
+    const journal = async (db: SqlDatabase, published = manifest) => {
       const journal = await PortableTransactions.open(db.postgres, {
         mediaRoot: media,
         libraryId,
         tables: ['children', 'parents'],
-        ...manifest,
+        ...published,
         fault: (point) => fault?.(point),
         publishCheckpoint: (checkpoint, previous) => {
           manifest = { checkpoint, previous };
@@ -68,6 +68,7 @@ describe.skipIf(process.env.STV_TEST_POSTGRES !== '1')('portable PostgreSQL chec
     };
     return {
       media,
+      libraryId,
       database,
       journal,
       setFault(callback?: typeof fault) {
@@ -78,6 +79,156 @@ describe.skipIf(process.env.STV_TEST_POSTGRES !== '1')('portable PostgreSQL chec
       },
     };
   }
+
+  it('retries an interrupted zero-sequence cold restore, including an old unmarked hot database', async () => {
+    const f = await fixture();
+    const source = await f.database();
+    await source.exec("INSERT INTO parents VALUES('p','migrated')");
+    const journal = await f.journal(source);
+    await journal.checkpoint();
+    await journal.close();
+    expect(f.manifest.checkpoint?.sequence).toBe(0);
+    const file = path.join(f.media, f.manifest.checkpoint!.file);
+    const original = await readFile(file);
+    for (const legacy of [false, true]) {
+      const cold = await f.database();
+      if (legacy) {
+        await cold.exec(
+          'CREATE TABLE stv_library_state(id SMALLINT PRIMARY KEY CHECK(id=1),library UUID NOT NULL,sequence BIGINT NOT NULL)',
+        );
+        await cold.prepare('INSERT INTO stv_library_state VALUES(1,?,0)').run(f.libraryId);
+      }
+      await writeFile(file, 'temporarily unreadable checkpoint');
+      await expect(f.journal(cold)).rejects.toThrow('PORTABLE_CHECKPOINT_CORRUPT');
+      await writeFile(file, original);
+      const restored = await f.journal(cold);
+      expect(await cold.prepare('SELECT value FROM parents').get()).toEqual({ value: 'migrated' });
+      await restored.close();
+      // Once restored, an ordinary hot restart at the same sequence can use its projection.
+      await writeFile(file, 'temporarily unreadable checkpoint');
+      await (await f.journal(cold)).close();
+      await writeFile(file, original);
+    }
+  }, 30000);
+
+  it('repairs an unmarked positive hot sequence from checkpoint zero and its complete journal, preserving the hot data on failure', async () => {
+    const f = await fixture(),
+      source = await f.database();
+    await source.exec(
+      "INSERT INTO parents VALUES('base','from old library'); INSERT INTO children(id,parent,value) VALUES(100,'base','historical child')",
+    );
+    const journal = await f.journal(source);
+    await journal.checkpoint();
+    await journal.transaction(() =>
+      source.exec(
+        "INSERT INTO parents VALUES('later','after cutover'); INSERT INTO children(id,parent,value) VALUES(101,'later','new child')",
+      ),
+    );
+    await journal.close();
+    const hot = await f.database();
+    // Older builds could admit new writes after skipping the missing baseline.
+    await hot.exec(`CREATE TABLE stv_library_state(id SMALLINT PRIMARY KEY,library UUID NOT NULL,sequence BIGINT NOT NULL);
+      INSERT INTO parents VALUES('later','after cutover'); INSERT INTO children(id,parent,value) VALUES(101,'later','new child');`);
+    await hot.prepare('INSERT INTO stv_library_state VALUES(1,?,1)').run(f.libraryId);
+    const read = () => hot.prepare('SELECT id,value FROM parents ORDER BY id').all();
+    const log = path.join(f.media, 'postgres-journal', 'active.log');
+    const tail = await readFile(log);
+    const checkpoint = path.join(f.media, f.manifest.checkpoint!.file);
+    const base = await readFile(checkpoint);
+    await writeFile(checkpoint, 'unavailable');
+    await expect(f.journal(hot)).rejects.toThrow('PORTABLE_CHECKPOINT_CORRUPT');
+    expect(await read()).toEqual([{ id: 'later', value: 'after cutover' }]);
+    await writeFile(checkpoint, base);
+    await writeFile(log, tail.subarray(0, 20));
+    await expect(f.journal(hot)).rejects.toThrow('PORTABLE_JOURNAL_BEHIND_DATABASE');
+    expect(await read()).toEqual([{ id: 'later', value: 'after cutover' }]);
+    expect(await readFile(log)).toEqual(tail.subarray(0, 20));
+    expect(await hot.prepare('SELECT sequence FROM stv_library_state').get()).toEqual({
+      sequence: 1,
+    });
+    await writeFile(log, tail);
+    const fixed = await f.journal(hot);
+    expect(await read()).toEqual([
+      { id: 'base', value: 'from old library' },
+      { id: 'later', value: 'after cutover' },
+    ]);
+    expect(fixed.status()).toMatchObject({ sequence: 1, replayed: 1 });
+    await fixed.close();
+    await writeFile(checkpoint, 'temporarily unavailable');
+    const healthy = await f.journal(hot);
+    expect(healthy.status()).toMatchObject({ sequence: 1, replayed: 0 });
+    expect(
+      await healthy.transaction(() =>
+        hot.prepare("INSERT INTO children(parent,value) VALUES('later','next') RETURNING id").get(),
+      ),
+    ).toEqual({ id: 102 });
+  }, 30000);
+
+  it('rebuilds an old incomplete first positive checkpoint from its retained zero ancestor and sealed frames', async () => {
+    const f = await fixture(),
+      hot = await f.database();
+    await hot.exec("INSERT INTO parents VALUES('base','legacy')");
+    const writer = await f.journal(hot);
+    await writer.checkpoint();
+    await writer.transaction(() => hot.exec("INSERT INTO parents VALUES('later','post-upgrade')"));
+    // Reproduce the old projection that skipped the initial checkpoint while keeping its actual tail.
+    await hot.transaction(async () => {
+      await hot.exec("SET LOCAL stv.replay='on'");
+      await hot.exec("DELETE FROM parents WHERE id='base'");
+    });
+    await writer.checkpoint();
+    await writer.close();
+    expect(f.manifest).toMatchObject({ checkpoint: { sequence: 1 }, previous: { sequence: 0 } });
+    // Historical manifests had no provenance marker on the newly published checkpoint.
+    delete f.manifest.checkpoint!.baselineVerified;
+    atomicJson(path.join(f.media, 'manifest.json'), f.manifest);
+    const historical = JSON.parse(
+      await readFile(path.join(f.media, 'manifest.json'), 'utf8'),
+    ) as typeof f.manifest;
+    const firstPositive = f.manifest.checkpoint!.file;
+    expect(await readFile(path.join(f.media, firstPositive), 'utf8')).not.toContain('legacy');
+    await hot.exec('ALTER TABLE stv_library_state DROP COLUMN recovered');
+    const sealed = path.join(f.media, 'postgres-journal', '1-1.log');
+    const frame = await readFile(sealed);
+    await rm(sealed);
+    await expect(f.journal(hot)).rejects.toThrow('PORTABLE_JOURNAL_BEHIND_DATABASE');
+    expect(await hot.prepare('SELECT id FROM parents ORDER BY id').all()).toEqual([
+      { id: 'later' },
+    ]);
+    await writeFile(sealed, frame);
+    const restored = await f.journal(hot);
+    expect(await hot.prepare('SELECT id FROM parents ORDER BY id').all()).toEqual([
+      { id: 'base' },
+      { id: 'later' },
+    ]);
+    expect(restored.status()).toMatchObject({ sequence: 1, replayed: 1 });
+    expect(restored.needsCheckpoint()).toBe(false);
+    expect(f.manifest.checkpoint!.file).not.toBe(firstPositive);
+    expect(f.manifest.checkpoint!.baselineVerified).toBe(true);
+    expect(await readFile(path.join(f.media, f.manifest.checkpoint!.file), 'utf8')).toContain(
+      'legacy',
+    );
+    await restored.close();
+    const cold = await f.database();
+    await (await f.journal(cold, historical)).close();
+    expect(await cold.prepare('SELECT id FROM parents ORDER BY id').all()).toEqual([
+      { id: 'base' },
+      { id: 'later' },
+    ]);
+    const verified = JSON.parse(
+      await readFile(path.join(f.media, 'manifest.json'), 'utf8'),
+    ) as typeof f.manifest;
+    expect(verified.checkpoint?.baselineVerified).toBe(true);
+    // A current, self-contained repaired checkpoint remains usable by a new database
+    // after the fallback file is lost. No existing hot data is at risk in this path.
+    await rm(path.join(f.media, f.manifest.previous!.file));
+    const standalone = await f.database();
+    await (await f.journal(standalone, verified)).close();
+    expect(await standalone.prepare('SELECT id FROM parents ORDER BY id').all()).toEqual([
+      { id: 'base' },
+      { id: 'later' },
+    ]);
+  }, 30000);
 
   it('streams foreign-key rows, retains fallback logs, restores a cold database and advances identity sequences', async () => {
     const f = await fixture(),

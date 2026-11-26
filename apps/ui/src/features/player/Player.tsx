@@ -8,21 +8,24 @@ import {
   useState,
   type ReactNode,
 } from 'react';
-import type {
-  LivePlaybackResponse,
-  LiveProgress,
-  PlaybackResponse,
-  Subject,
-} from '@st-vault/api-schema';
+import type { LiveProgress, Subject } from '@st-vault/api-schema';
 import { CoverImage } from '../directory/CoverImage';
 import { displayStatus } from '../directory/subjects';
 import { liveNotice, mediaNotice, type MediaPhase, type PlaybackNotice } from './player-status';
 import { Preparation, shouldPrepareNext } from './playback-continuation';
-import { closeSource, MediaSlot, sourceKey, type MediaSlotHandle } from './MediaSlot';
+import {
+  closeSource,
+  MediaSlot,
+  sourceKey,
+  type ArchivePlayerSource,
+  type MediaSlotHandle,
+  type PlayerSource,
+} from './MediaSlot';
 import './player-controls.css';
 import { Icon } from '../../design/Icon';
 import { mediaTimeToUtc, mediaTimePosition } from '../timeline/timeline';
 import type { ViewWindow } from '../timeline/range-control';
+import { fullCalendar, type ArchiveCalendar } from '../timeline/archive-calendar';
 import { PlayerHeading } from './PlayerHeading';
 import { PlaybackNoticeContent } from './PlaybackNoticeContent';
 import { SelectionSummary } from './SelectionSummary';
@@ -31,10 +34,7 @@ import { bindPlayerKeyboard, PLAYER_SEEK_SECONDS } from './player-keyboard';
 import { usePressVisibility } from '../../shared/lib/use-press-visibility';
 import { useNoticeStage } from './use-notice-stage';
 
-export type PlayerSource =
-  | { kind: 'live'; stream: LivePlaybackResponse; subject: Subject }
-  | { kind: 'archive'; playback: PlaybackResponse; subject: Subject; unitId?: string };
-export type ArchivePlayerSource = Extract<PlayerSource, { kind: 'archive' }>;
+export type { ArchivePlayerSource, PlayerSource } from './MediaSlot';
 export interface PlayerHandle {
   stop: () => void;
   seek: (utc: number, resume?: boolean, unitId?: string) => boolean;
@@ -43,6 +43,7 @@ export interface PlayerHandle {
 interface Props {
   siteOrigin?: string | null;
   range?: ViewWindow | null;
+  calendar?: ArchiveCalendar;
   controlsPinned?: boolean;
   tools?: ReactNode;
   source: PlayerSource | null;
@@ -75,6 +76,7 @@ export const Player = forwardRef<PlayerHandle, Props>(function Player(
     siteOrigin,
     tools,
     range = null,
+    calendar = fullCalendar,
     controlsPinned = false,
     source,
     busy,
@@ -461,7 +463,7 @@ export const Player = forwardRef<PlayerHandle, Props>(function Player(
         activeSource.playback.rangeFromMs ?? 0,
         Math.min(
           (activeSource.playback.rangeToMs ?? Number.MAX_SAFE_INTEGER) - 1,
-          (heldSeek.current ?? at) + offset * 1000,
+          calendar.shift(heldSeek.current ?? at, offset * 1000),
         ),
       );
       onSeek(heldSeek.current);

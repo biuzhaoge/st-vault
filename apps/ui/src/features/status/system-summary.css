@@ -93,7 +93,7 @@
 }
 .system-summary .panel-badge.is-busy,
 .system-summary .panel-status.is-checking .panel-badge {
-  color: var(--orange);
+  color: var(--ink);
 }
 .system-summary .panel-badge.is-busy::before {
   display: none;

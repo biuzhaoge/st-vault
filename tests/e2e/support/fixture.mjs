@@ -80,7 +80,15 @@ export async function startFixture(options = {}) {
     };
     archive = await openArchive(archiveOptions);
     const started = Date.now();
-    await archive.setSetting('timeline.deployed-at', String(started - 14 * 86400000));
+    // The deployment calendar honors TZ and defaults to Shanghai when Node itself runs in UTC.
+    const shanghaiOffset = 8 * 3600000;
+    const midnight = process.env.TZ
+      ? new Date(started).setHours(0, 0, 0, 0)
+      : Math.floor((started + shanghaiOffset) / 86400000) * 86400000 - shanghaiOffset;
+    await archive.setSetting(
+      'timeline.deployed-at',
+      String(options.calendarGap ? midnight - 110 * 86400000 : started - 14 * 86400000),
+    );
     // Read the same persisted deployment boundary as an ordinary recovered archive.
     await archive.close();
     archive = await openArchive(archiveOptions);
@@ -127,7 +135,8 @@ export async function startFixture(options = {}) {
       { syncAccount: true },
     );
     await archive.upsertSubjects(following, { syncAccount: true });
-    const archiveStart = Math.floor(started / 60000) * 60000 - 180000,
+    const reference = options.archiveBeforeMidnight ? midnight : started;
+    const archiveStart = Math.floor(reference / 60000) * 60000 - 180000,
       liveStart = Math.floor(started / 2000) * 2000 - 60000;
     for (let index = 0; index < 60; index++) {
       const segment = media.segments[index % media.segments.length];
@@ -143,6 +152,29 @@ export async function startFixture(options = {}) {
         uncertaintyMs: 0,
         discontinuity: index % media.segments.length === 0,
       });
+    }
+    // Keep the normal navigation fixture continuous with a real fragment per
+    // date on the archived row. Sparse scenarios supply their own date layout.
+    if (options.calendarGap) {
+      const day = midnight - 3 * 86400000;
+      await archive.setObservation('stripchat:42', 'PUBLIC', day + 1000, 600000);
+      await archive.setObservation('stripchat:42', 'PRIVATE', day + 2000, 600000);
+      await archive.setObservation('stripchat:42', 'PUBLIC', day + 86401000, 600000);
+    } else {
+      const segment = media.segments[0];
+      for (let days = 1; days <= 14; days++)
+        await archive.commit({
+          subjectId: subjects.at(-1).id,
+          sourceEpoch: 'synthetic-calendar',
+          sourceSequence: String(15 - days),
+          init: read('init.mp4'),
+          bytes: read(segment.name),
+          durationSeconds: segment.durationSeconds,
+          wallStartMs: midnight - days * 86400000 + 12 * 3600000,
+          timeBasis: 'source-pdt',
+          uncertaintyMs: 0,
+          discontinuity: days === 14,
+        });
     }
     for (const subject of subjects)
       await archive.setObservation(
@@ -276,6 +308,7 @@ export async function startFixture(options = {}) {
       port: 10085,
       archiveStart,
       archiveEnd: archiveStart + 120000,
+      midnight,
       subjectId: 'stripchat:42',
       subjectCount: 300,
       root,
@@ -321,6 +354,7 @@ export async function startFixture(options = {}) {
       info,
       legacyToken,
       renewPublicObservation: (id) => archive.setObservation(id, 'PUBLIC', Date.now(), 600000),
+      pruneEmptyDays: () => archive.pruneEmptyDays(Date.now()),
       appendSnapshotUnit: (atMs, sourceEpoch = `snapshot-append-${atMs}`) =>
         archive.commit({
           subjectId: info.subjectId,
@@ -376,7 +410,7 @@ export async function startFixture(options = {}) {
       navigationEvents: async () => {
         const at = Date.now();
         for (const [id, from, to] of [
-          [299, 'OFFLINE', 'PUBLIC'],
+          [299, 'PRIVATE', 'PUBLIC'],
           [297, 'PUBLIC', 'OFFLINE'],
         ]) {
           await archive.setObservation(`stripchat:${id}`, from, at, 600000);

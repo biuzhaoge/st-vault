@@ -1,6 +1,6 @@
 {
   "name": "@st-vault/server",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "scripts": {
@@ -25,7 +25,7 @@
     "vitest": "^5.1.0"
   },
   "engines": {
-    "node": ">=24.22.1"
+    "node": ">=24.22.3"
   },
   "license": "Apache-2.0"
 }

@@ -2,7 +2,7 @@ import { openTestDatabase, planNodes } from './postgres.test-support.js';
 import { startTestPostgres } from '../database/postgres.test-support.js';
 import type { TestPostgresServer } from '../database/postgres.test-support.js';
 import { afterAll, beforeAll, expect, it, vi } from 'vitest';
-import { DeletionStore } from './deletion-store.js';
+import { DeletionStore, pendingDeletionSql } from './deletion-store.js';
 
 let postgres: TestPostgresServer;
 beforeAll(async () => {
@@ -12,7 +12,7 @@ afterAll(async () => {
   await postgres.close();
 });
 
-it('checks active jobs and residual footage for only the requested subject in one query', async () => {
+it('checks confirmed jobs and residual footage for only the requested subject in one query', async () => {
   const db = await openTestDatabase();
   try {
     await db.exec(`
@@ -20,7 +20,7 @@ it('checks active jobs and residual footage for only the requested subject in on
       CREATE TABLE segments(id TEXT PRIMARY KEY,deleted BIGINT NOT NULL);
       CREATE TABLE recording_units(id TEXT PRIMARY KEY,subject TEXT REFERENCES subjects(id),deleted BIGINT NOT NULL);
       CREATE TABLE unit_segments(segment TEXT PRIMARY KEY REFERENCES segments(id),unit TEXT REFERENCES recording_units(id));
-      INSERT INTO subjects SELECT 'stripchat:'||id FROM generate_series(1,6) AS ids(id);
+      INSERT INTO subjects SELECT 'stripchat:'||id FROM generate_series(1,7) AS ids(id);
       INSERT INTO recording_units VALUES
         ('visible','stripchat:1',0),('removed','stripchat:1',1),('residual','stripchat:6',1);
       INSERT INTO segments VALUES ('visible',0),('removed',1),('residual',0);
@@ -33,16 +33,20 @@ it('checks active jobs and residual footage for only the requested subject in on
         ('planned','stripchat:1','planned',0,0,0),('completed','stripchat:1','completed',0,0,0),
         ('discarding','stripchat:1','discarding',0,0,0),('failed','stripchat:1','failed',0,0,0),
         ('preparing','stripchat:2','preparing',0,0,0),('queued','stripchat:3','queued',0,0,0),
-        ('running','stripchat:4','running',0,0,0),('retry','stripchat:5','retry',0,0,0);
+        ('running','stripchat:4','running',0,0,0),('retry','stripchat:5','retry',0,0,0),
+        ('waiting','stripchat:7','waiting',0,0,0);
     `);
     const statements = vi.spyOn(db.postgres, 'execute');
     const expectPending = async (subject: string, expected: boolean): Promise<void> => {
       statements.mockClear();
-      expect(await store.pending(subject), subject).toBe(expected);
+      expect(
+        await db.prepare(`SELECT ${pendingDeletionSql} AS pending`).get(subject, subject),
+        subject,
+      ).toEqual({ pending: expected });
       expect(statements, subject).toHaveBeenCalledTimes(1);
     };
     await expectPending('stripchat:1', false);
-    for (const id of [2, 3, 4, 5, 6]) await expectPending(`stripchat:${id}`, true);
+    for (const id of [2, 3, 4, 5, 6, 7]) await expectPending(`stripchat:${id}`, true);
     await db.exec("UPDATE segments SET deleted=1 WHERE id='residual'");
     await expectPending('stripchat:6', false);
   } finally {
@@ -118,9 +122,30 @@ it('freezes more than 4096 files in bounded pages and accepts without materializ
     await db.exec(`WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<63)
       INSERT INTO media_deletions(id,subject,state,total,created,updated)
       SELECT 'queued-'||i,'stripchat:1','queued',0,0,0 FROM n;`);
-    await expect((async () => await store.accept('stripchat:1', second, 0))()).rejects.toThrow(
-      'MEDIA_DELETION_QUEUE_FULL',
-    );
+    const accepted = await store.accept('stripchat:1', second, 0);
+    expect(accepted).toMatchObject({ state: 'waiting' });
+    expect(await store.accept('stripchat:1', second, 0)).toEqual(accepted);
+    expect(
+      await db.prepare('SELECT count(*) n FROM visible_segments WHERE deleted=0').get(),
+    ).toEqual({ n: 0 });
+    await db
+      .prepare(
+        `INSERT INTO media_deletions(id,subject,state,total,created,updated)
+        SELECT 'waiting-'||i,'stripchat:1','waiting',0,0,?::bigint+i FROM generate_series(1,22) AS n(i)`,
+      )
+      .run(accepted!.updatedAtMs);
+    const inventory = await store.list();
+    expect(inventory.waiting).toBe(23);
+    expect(inventory.jobs.filter(({ state }) => state === 'waiting')).toHaveLength(20);
+    expect(
+      inventory.jobs.filter(({ state }) => state === 'queued' || state === 'running'),
+    ).toHaveLength(64);
+    await store.advance('queued-1', 0, 0);
+    expect(await store.get(second)).toMatchObject({ state: 'queued' });
+    expect((await store.list()).waiting).toBe(22);
+    await store.advance('queued-2', 0, 0);
+    expect(await store.get('waiting-1')).toMatchObject({ state: 'preparing' });
+    expect(await store.get('waiting-2')).toMatchObject({ state: 'waiting' });
   } finally {
     await db.close();
   }

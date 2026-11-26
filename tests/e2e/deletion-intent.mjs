@@ -38,16 +38,19 @@ try {
   await page.mouse.move(lane.x + lane.width - 1, lane.y + 40, { steps: 6 });
   await page.mouse.up();
   await page.waitForFunction(() => {
-    const heart = document.querySelector('.snapshot-favorite');
+    const card = document.querySelector('.snapshot-grid button[data-unit-index][data-liked]');
     return (
-      heart &&
-      !heart.disabled &&
+      card &&
+      card?.dataset.favoriteReady === 'true' &&
       Number(document.querySelector('.snapshot-total').textContent.match(/\d+/)?.[0]) > 30
     );
   });
   // Clear favorites across pages without entering a selection mode.
   assert.equal(await page.locator('.snapshot-actions button').count(), 2);
-  await page.locator('.snapshot-favorite').first().click();
+  await page
+    .locator('.snapshot-grid button[data-unit-index][data-favorite-ready="true"]')
+    .first()
+    .dblclick();
   await page.waitForFunction(
     () => document.querySelector('.snapshot-pages')?.getAttribute('aria-busy') === 'false',
   );
@@ -55,30 +58,45 @@ try {
   await page.waitForFunction(
     () =>
       document.querySelector('.snapshot-pages output')?.textContent === '2 / 3' &&
-      !document.querySelector('.snapshot-favorite')?.disabled,
+      document.querySelector('.snapshot-grid button[data-unit-index]')?.dataset.favoriteReady ===
+        'true',
   );
-  await page.locator('.snapshot-favorite').first().click();
+  await page
+    .locator('.snapshot-grid button[data-unit-index][data-favorite-ready="true"]')
+    .first()
+    .dblclick();
   await page.waitForFunction(
     () => document.querySelector('.snapshot-pages')?.getAttribute('aria-busy') === 'false',
   );
   await page.getByRole('button', { name: '取消所有喜欢', exact: true }).click();
   await page.waitForFunction(
     () =>
-      !document.querySelector('.snapshot-favorite[aria-pressed="true"]') &&
+      !document.querySelector('.snapshot-grid button[data-unit-index][data-liked="true"]') &&
       document.querySelector('.snapshot-pages')?.getAttribute('aria-busy') === 'false',
   );
   await page.getByRole('button', { name: '上一页', exact: true }).click();
   await page.waitForFunction(
     () =>
       document.querySelector('.snapshot-pages output')?.textContent === '1 / 3' &&
-      !document.querySelector('.snapshot-favorite')?.disabled,
+      document.querySelector('.snapshot-grid button[data-unit-index]')?.dataset.favoriteReady ===
+        'true',
   );
-  assert.equal(await page.locator('.snapshot-favorite[aria-pressed="true"]').count(), 0);
+  assert.equal(
+    await page.locator('.snapshot-grid button[data-unit-index][data-liked="true"]').count(),
+    0,
+  );
   // Preserve a favorite while deleting the entire unliked range across pages.
-  await page.locator('.snapshot-favorite').first().click();
+  await page
+    .locator('.snapshot-grid button[data-unit-index][data-favorite-ready="true"]')
+    .first()
+    .dblclick();
   await page.waitForFunction(() => {
-    const heart = document.querySelector('.snapshot-favorite');
-    return heart?.getAttribute('aria-pressed') === 'true' && !heart.disabled;
+    const card = document.querySelector('.snapshot-grid button[data-unit-index][data-liked]');
+    return (
+      card?.getAttribute('data-liked') === 'true' &&
+      card.dataset.favoriteReady === 'true' &&
+      card.getAttribute('aria-busy') !== 'true'
+    );
   });
   const favoriteId = await page.locator('.snapshot-cell').first().getAttribute('data-key');
   const selected = await page

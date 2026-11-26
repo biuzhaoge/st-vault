@@ -182,7 +182,7 @@
   color: white;
 }
 .player-actions .player-control--primary:hover:enabled {
-  background: var(--accent-hover);
+  background: var(--accent-fill-hover);
   color: white;
 }
 .player-actions .player-audio {

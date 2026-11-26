@@ -13,6 +13,8 @@ export interface PortableTable {
   keys: string[];
 }
 export interface PortableCheckpoint {
+  /** Set by writers that verified the initial library checkpoint before publication. */
+  baselineVerified?: true;
   file: string;
   hash: string;
   sequence: number;

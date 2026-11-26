@@ -55,6 +55,8 @@ export async function initializeBaseSchema(db: SqlDatabase, origin = Date.now())
     DROP INDEX IF EXISTS segment_snapshot;
     CREATE INDEX IF NOT EXISTS segment_finish ON segments(subject,deleted,"end",id,start);
     CREATE INDEX IF NOT EXISTS segment_origin ON segments(subject,start,id,"end");
+    CREATE INDEX IF NOT EXISTS segment_calendar_start ON segments(start,"end") WHERE deleted=0 AND start IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS segment_calendar_long ON segments("end",start) WHERE deleted=0 AND "end"-start>60000;
     DROP INDEX IF EXISTS segment_end;
     CREATE INDEX IF NOT EXISTS segment_init ON segments(init,deleted);
     ${longSegmentIndexSql};
@@ -62,9 +64,11 @@ export async function initializeBaseSchema(db: SqlDatabase, origin = Date.now())
     CREATE TABLE IF NOT EXISTS source_checkpoints(subject TEXT PRIMARY KEY,epoch TEXT NOT NULL,sequence TEXT NOT NULL,wall DOUBLE PRECISION);
 
     CREATE TABLE IF NOT EXISTS coverage_minutes(subject TEXT NOT NULL,minute BIGINT NOT NULL,spans TEXT NOT NULL,starts TEXT NOT NULL,ends TEXT NOT NULL,count BIGINT NOT NULL,covered_ms BIGINT NOT NULL DEFAULT 0,start_count BIGINT NOT NULL DEFAULT 0,end_count BIGINT NOT NULL DEFAULT 0,PRIMARY KEY(subject,minute));
+    CREATE INDEX IF NOT EXISTS coverage_calendar ON coverage_minutes(minute,subject);
     CREATE INDEX IF NOT EXISTS object_verify ON objects(deleted,needs_verify,id);
     CREATE TABLE IF NOT EXISTS status_intervals(subject TEXT NOT NULL,start BIGINT NOT NULL,"end" BIGINT NOT NULL,status TEXT NOT NULL,PRIMARY KEY(subject,start));
     CREATE INDEX IF NOT EXISTS status_interval_end ON status_intervals(subject,"end",start);
+    CREATE INDEX IF NOT EXISTS status_empty_day ON status_intervals("end",start,subject) WHERE "end">start;
     CREATE INDEX IF NOT EXISTS status_interval_window ON status_intervals(subject,start,"end",status);
     CREATE INDEX IF NOT EXISTS status_interval_activity ON status_intervals(subject,start DESC,status) WHERE status IN ('PUBLIC','PRIVATE');
     DROP INDEX IF EXISTS status_interval_online;

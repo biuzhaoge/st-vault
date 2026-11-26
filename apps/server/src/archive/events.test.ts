@@ -338,12 +338,9 @@ describe('durable event history', () => {
   it('bounds run windows at 500 rows and uses the partial expiry index instead of scanning expired history', async () => {
     const { db, events } = await memory();
     try {
-      await db.transaction(async () => {
-        for (let i = 0; i < 501; i++) {
-          const id = await events.start(i * 10);
-          await events.stop(id, 'normal', i * 10 + 1);
-        }
-      });
+      // This checks the read window. The lifecycle tests above exercise the start/stop writes.
+      await db.exec(`INSERT INTO program_runs(id,started,heartbeat,ended,outcome,detected)
+        SELECT 'run-'||n,n*10,n*10,n*10+1,'normal',NULL FROM generate_series(0,500)n`);
       const history = await events.runs(0, 10000);
       expect(history.runs).toHaveLength(500);
       expect(history.truncated).toBe(true);

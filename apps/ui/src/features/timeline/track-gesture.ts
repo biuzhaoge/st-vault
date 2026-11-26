@@ -1,5 +1,6 @@
 import type { ViewWindow } from './range-control';
 import { dragRange } from './selection-range';
+import { fullCalendar, type TimelineScale } from './archive-calendar';
 export type TrackGesture = 'selection' | 'scroll';
 /** Lock direction only after intent is clear; vertical movement always scrolls rows. */
 export function trackGesture(dx: number, dy: number): TrackGesture | null {
@@ -20,6 +21,7 @@ interface Start {
   selection: ViewWindow;
   edge: string | null;
   timelineStartMs: number;
+  scale?: TimelineScale;
 }
 type Motion =
   | { kind: 'idle' }
@@ -32,8 +34,10 @@ export class TrackGestureSession {
   private direction: TrackGesture | null = null;
   private active = true;
   private scrollTop: number;
+  private readonly scale: TimelineScale;
   constructor(private readonly start: Start) {
     this.scrollTop = start.scrollTop;
+    this.scale = start.scale ?? fullCalendar.scale(start.window.fromMs, start.window.toMs);
   }
   get id(): string {
     return this.start.id;
@@ -50,14 +54,14 @@ export class TrackGestureSession {
   private rangeAt(x: number, now: number): ViewWindow | null {
     const start = this.start;
     if (start.width <= 0) return null;
-    const delta = ((x - start.x) / start.width) * (start.window.toMs - start.window.fromMs);
+    const delta = ((x - start.x) / start.width) * this.scale.duration;
     return dragRange(
       start.edge === 'from'
         ? start.selection.toMs
         : start.edge === 'to'
           ? start.selection.fromMs
           : start.at,
-      start.at + delta,
+      delta === 0 ? start.at : this.scale.shift(start.at, delta),
       {
         fromMs: Math.max(start.timelineStartMs, start.window.fromMs),
         toMs: Math.min(now, start.window.toMs),

@@ -5,6 +5,7 @@ import { ARCHIVE_MEDIA_BATCH_LIMIT, type ArchivePort } from '../ports.js';
 import type { SyncClock } from '../runtime/sync-clock.js';
 import { recordingRange } from './recording-range.js';
 import { waitUnitTail } from './unit-tail.js';
+import { archiveWindows } from '../archive/calendar-window.js';
 
 interface PlaybackSession {
   owner: string;
@@ -43,6 +44,7 @@ export function registerPlayback(app: FastifyInstance, options: PlaybackOptions)
       } = playbackSchema.parse(request.body);
       let { fromMs, toMs } = requested;
       let openUnitId = requested.openUnitId;
+      if (fromMs !== undefined && toMs !== undefined) await archiveWindows(archive, fromMs, toMs);
       if (openUnitId && archive.unitRange) {
         const range = await waitUnitTail(
           archive,

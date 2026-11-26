@@ -13,11 +13,13 @@
   --panel: #252525;
   --panel-raised: #393939;
   --input: #171717;
-  --accent: #df2c41;
-  --accent-hover: #ff7888;
-  --favorite: #f58ac7;
+  /* Use the illuminated red in the mark for solid accents and a tint for small text. */
+  --accent: #df1926;
+  --accent-hover: color-mix(in srgb, var(--accent) 60%, white);
+  --accent-fill-hover: color-mix(in srgb, var(--accent), black 10%);
+  --favorite: #ff9eb8;
   --success: #72dab3;
-  --orange: #ff995c;
+  --warning: #ff995c;
   --private: #e9d779;
   --mono: ui-monospace, 'Cascadia Code', monospace;
   --glass-fill: #2a2a2aeb;

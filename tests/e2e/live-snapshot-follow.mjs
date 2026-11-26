@@ -215,14 +215,14 @@ try {
   });
   await page.locator('video[data-media-slot="active"]').evaluate((video) => video.pause());
   const likedNeighbor = page.locator(
-    `.snapshot-cell[data-key="${newer.unitId}"] .snapshot-favorite`,
+    `.snapshot-cell[data-key="${newer.unitId}"] button[data-unit-index][data-liked]`,
   );
-  await likedNeighbor.click();
+  await likedNeighbor.dblclick();
   await page.waitForFunction(
     (id) =>
       document
-        .querySelector(`.snapshot-cell[data-key="${id}"] .snapshot-favorite`)
-        ?.getAttribute('aria-pressed') === 'true',
+        .querySelector(`.snapshot-cell[data-key="${id}"] button[data-unit-index][data-liked]`)
+        ?.getAttribute('data-liked') === 'true',
     newer.unitId,
   );
   await page.evaluate((id) => {
@@ -250,7 +250,7 @@ try {
     afterDelete.items.map((item) => item.unitId),
     [newer.unitId],
   );
-  if ((await likedNeighbor.getAttribute('aria-pressed')) !== 'true')
+  if ((await likedNeighbor.getAttribute('data-liked')) !== 'true')
     console.error(
       '[qa] Surviving favorite state',
       await page.evaluate(
@@ -272,7 +272,7 @@ try {
         { subjectId: fixture.info.subjectId, unitId: newer.unitId },
       ),
     );
-  assert.equal(await likedNeighbor.getAttribute('aria-pressed'), 'true');
+  assert.equal(await likedNeighbor.getAttribute('data-liked'), 'true');
   // Reload restores media position and the independent rolling presentation.
   const restored = page.waitForResponse(
     (response) =>
@@ -329,6 +329,7 @@ try {
   }, fixedWindow);
   // Offline selection has the same rolling window, even without a recording session.
   await page.locator('.subject-filters').getByRole('button', { name: '离线', exact: true }).click();
+  await page.locator('.subject-filters').getByRole('button', { name: '在线', exact: true }).click();
   await page.locator('.track-row[data-subject-id="stripchat:3"] .subject-preview').click();
   await page
     .locator('.snapshot-status strong')

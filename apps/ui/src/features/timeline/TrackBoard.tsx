@@ -35,27 +35,33 @@ import type { ListPosition } from '../../shared/lib/workspace-state';
 import { CoverImage } from '../directory/CoverImage';
 import { useRowMotion } from '../directory/use-row-motion';
 import { displayStatus } from '../directory/subjects';
-import { RecordingMode } from '../directory/RecordingMode';
+import { DirectoryRowNumber, RecordingMode } from '../directory/RecordingMode';
 import { useSyncClock } from '../../shared/lib/sync';
 import { TimeRangeControl } from './TimeRangeControl';
 import { indicateRow, panTimeline, joinTimelinePan } from '../../design/motion';
 import { TimelineBands, TimelineRails, type TrackData } from './TimelineBands';
-import { dragRange, snapCoverageRange } from './selection-range';
+import { snapCoverageRange } from './selection-range';
 import { calendarDivisions } from './ruler';
 import { TrackGestureSession, type TrackGesture } from './track-gesture';
 import { useLayoutMotion } from '../../design/use-layout-motion';
 import { TimelineHoverPreview, type TimelineHoverHandle } from './TimelineHoverPreview';
 import { hoverMediaTime } from './hover-preview';
+import { fullCalendar, type ArchiveCalendar, type TimelineScale } from './archive-calendar';
 
 import type { RowAnchor } from '../player/row-anchor';
 export type { RowAnchor } from '../player/row-anchor';
 const PAN_LAYERS =
   '.track-lane > .timeline-scene, .timeline-grid > .timeline-scene, .time-ruler-row .timeline-ruler > .timeline-scene, .selection-timeline > .timeline-scene';
 const SCROLL_SETTLE_MS = 120;
-const TrackGrid = memo(function TrackGrid({ fromMs, toMs, nowMs }: ViewWindow & { nowMs: number }) {
+const TrackGrid = memo(function TrackGrid({
+  fromMs,
+  toMs,
+  nowMs,
+  scale,
+}: ViewWindow & { nowMs: number; scale: TimelineScale }) {
   const divisions = useMemo(
     () =>
-      calendarDivisions(fromMs, toMs, DAY_MS).map((tick) => (
+      calendarDivisions(fromMs, toMs, DAY_MS, scale).map((tick) => (
         <i
           key={tick.atMs}
           className={`division-${tick.level}`}
@@ -63,16 +69,16 @@ const TrackGrid = memo(function TrackGrid({ fromMs, toMs, nowMs }: ViewWindow & 
           style={{ left: `${tick.position * 100}%` }}
         />
       )),
-    [fromMs, toMs],
+    [fromMs, toMs, scale],
   );
   return (
     <div className="timeline-grid-anchor" aria-hidden="true">
       <div className="timeline-grid">
         <div className="timeline-scene">
-          {nowMs >= fromMs - DAY_MS && nowMs < toMs + DAY_MS && (
+          {scale.duration > 0 && nowMs >= fromMs - DAY_MS && nowMs < toMs + DAY_MS && (
             <div
               className="live-now-line"
-              style={{ left: `${(100 * (nowMs - fromMs)) / (toMs - fromMs)}%` }}
+              style={{ left: `${100 * scale.position(nowMs)}%` }}
               data-at={nowMs}
             />
           )}
@@ -85,6 +91,7 @@ const TrackGrid = memo(function TrackGrid({ fromMs, toMs, nowMs }: ViewWindow & 
 interface SelectionDraft {
   id: string;
   range: ViewWindow;
+  keyboardOrigin?: HTMLElement;
 }
 interface SelectionOverlayHandle {
   update: (draft: SelectionDraft | null) => void;
@@ -102,8 +109,10 @@ const SelectionOverlay = forwardRef<
     count: number;
     timelineStartMs: number;
     nowMs: number;
+    scale: TimelineScale;
     selectionGeneration: number;
     onCommit: (subject: Subject, range: ViewWindow) => void;
+    onDraft: (draft: SelectionDraft | null) => void;
   }
 >(function SelectionOverlay(
   {
@@ -115,8 +124,10 @@ const SelectionOverlay = forwardRef<
     count,
     timelineStartMs,
     nowMs,
+    scale,
     selectionGeneration,
     onCommit,
+    onDraft,
   },
   ref,
 ) {
@@ -124,9 +135,8 @@ const SelectionOverlay = forwardRef<
   useImperativeHandle(ref, () => ({ update: setDraft }), []);
   const shownSelection = draft?.range ?? selection,
     shownId = draft?.id ?? selectedId;
-  const duration = toMs - fromMs;
-  const selectionLeft = (100 * (shownSelection.fromMs - fromMs)) / duration,
-    selectionRight = (100 * (shownSelection.toMs - fromMs)) / duration;
+  const selectionLeft = 100 * scale.position(shownSelection.fromMs),
+    selectionRight = 100 * scale.position(shownSelection.toMs);
   const selectedIndex = subjects.findIndex((subject) => subject.id === (shownId ?? selectedId));
   const selectionVisible =
     shownId !== null &&
@@ -136,6 +146,9 @@ const SelectionOverlay = forwardRef<
     shownSelection.toMs > fromMs - DAY_MS &&
     shownSelection.fromMs < toMs + DAY_MS;
   const selectionInView = selectionVisible && selectionRight > 0 && selectionLeft < 100;
+  const limits = draft?.keyboardOrigin
+    ? { fromMs: Math.max(fromMs, timelineStartMs), toMs: Math.min(toMs, nowMs) }
+    : { fromMs: timelineStartMs, toMs: nowMs };
   const root = useRef<HTMLDivElement>(null);
   useLayoutMotion(
     root,
@@ -156,6 +169,10 @@ const SelectionOverlay = forwardRef<
             data-from={shownSelection.fromMs}
             data-to={shownSelection.toMs}
             aria-hidden={!selectionInView}
+            onBlur={(event) => {
+              if (draft?.keyboardOrigin && !event.currentTarget.contains(event.relatedTarget))
+                onDraft(null);
+            }}
             style={{
               top: Math.max(0, Math.min(count - 1, selectedIndex)) * SUBJECT_ROW_HEIGHT,
               height: SUBJECT_ROW_HEIGHT,
@@ -164,7 +181,7 @@ const SelectionOverlay = forwardRef<
               width: `${Math.max(0, selectionRight - selectionLeft)}%`,
             }}
           >
-            {!draft &&
+            {(!draft || draft.keyboardOrigin) &&
               selectionVisible &&
               (['from', 'to'] as const).map((edge) => (
                 <button
@@ -174,26 +191,55 @@ const SelectionOverlay = forwardRef<
                   role="slider"
                   tabIndex={selectionInView ? 0 : -1}
                   aria-label={edge === 'from' ? tr('选区起点') : tr('选区终点')}
-                  aria-valuemin={timelineStartMs}
-                  aria-valuemax={nowMs}
-                  aria-valuenow={edge === 'from' ? selection.fromMs : selection.toMs}
+                  aria-valuemin={edge === 'from' ? limits.fromMs : shownSelection.fromMs + 1}
+                  aria-valuemax={edge === 'from' ? shownSelection.toMs - 1 : limits.toMs}
+                  aria-valuenow={edge === 'from' ? shownSelection.fromMs : shownSelection.toMs}
                   aria-valuetext={formatDateTime(
-                    edge === 'from' ? selection.fromMs : selection.toMs,
+                    edge === 'from' ? shownSelection.fromMs : shownSelection.toMs,
                   )}
                   onKeyDown={(event) => {
-                    if (!['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
+                    if (event.altKey || event.ctrlKey || event.metaKey) return;
+                    const subject = subjects[selectedIndex];
+                    if (draft?.keyboardOrigin && ['Escape', 'Enter'].includes(event.key)) {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      if (event.repeat) return;
+                      onDraft(null);
+                      const origin = draft.keyboardOrigin.isConnected
+                        ? draft.keyboardOrigin
+                        : event.currentTarget.closest<HTMLElement>('.track-table-scroll');
+                      origin?.focus({ preventScroll: true });
+                      if (event.key === 'Enter') onCommit(subject, shownSelection);
+                      return;
+                    }
+                    const isStart = edge === 'from';
+                    const value = isStart ? shownSelection.fromMs : shownSelection.toMs;
+                    const min = isStart ? limits.fromMs : shownSelection.fromMs + 1;
+                    const max = isStart ? shownSelection.toMs - 1 : limits.toMs;
+                    const step = event.shiftKey ? 60000 : 1000;
+                    const keys: Record<string, number> = {
+                      ArrowLeft: value - step,
+                      ArrowRight: value + step,
+                      ArrowDown: value - step,
+                      ArrowUp: value + step,
+                      Home: min,
+                      End: max,
+                      PageDown: value - 3600000,
+                      PageUp: value + 3600000,
+                    };
+                    if (!Object.hasOwn(keys, event.key)) return;
                     event.preventDefault();
                     event.stopPropagation();
-                    const subject = subjects.find((s) => s.id === selectedId);
-                    if (!subject) return;
-                    const delta =
-                        (event.key === 'ArrowLeft' ? -1 : 1) * (event.shiftKey ? 60000 : 1000),
-                      next = dragRange(
-                        edge === 'from' ? selection.toMs : selection.fromMs,
-                        (edge === 'from' ? selection.fromMs : selection.toMs) + delta,
-                        { fromMs: timelineStartMs, toMs: Date.now() },
-                      );
-                    if (next) onCommit(subject, next);
+                    const target = keys[event.key];
+                    const shifted =
+                      event.key === 'Home' || event.key === 'End'
+                        ? scale.restore(scale.coordinate(target), isStart ? 'later' : 'earlier')
+                        : scale.shift(value, target - value);
+                    const next = Math.max(min, Math.min(max, shifted));
+                    if (next === value) return;
+                    const range = { ...shownSelection, [isStart ? 'fromMs' : 'toMs']: next };
+                    if (draft?.keyboardOrigin) onDraft({ ...draft, range });
+                    else onCommit(subject, range);
                   }}
                 >
                   <i />
@@ -207,6 +253,7 @@ const SelectionOverlay = forwardRef<
 });
 const TrackRow = memo(function TrackRow({
   subject,
+  rowNumber,
   data,
   trackState,
   selected,
@@ -218,10 +265,12 @@ const TrackRow = memo(function TrackRow({
   widthPx,
   fromMs,
   toMs,
+  scale,
   onChoose,
   onRecordingChange,
 }: {
   subject: Subject;
+  rowNumber: number;
   data: TrackData | undefined;
   trackState: 'ready' | 'idle' | 'failed' | 'loading';
   selected: boolean;
@@ -233,6 +282,7 @@ const TrackRow = memo(function TrackRow({
   widthPx: number;
   fromMs: number;
   toMs: number;
+  scale: TimelineScale;
   onChoose: (subject: Subject, utc?: number) => void;
   onRecordingChange: (subject: Subject, record: boolean) => Promise<void>;
 }) {
@@ -243,39 +293,40 @@ const TrackRow = memo(function TrackRow({
       data-subject-id={subject.id}
     >
       <div className={`track-label status-cell-${displayStatus(subject).toLowerCase()}`}>
-        <button
-          className="subject-preview"
-          onClick={(event) => {
-            if (event.detail === 0) onChoose(subject);
-          }}
-          aria-label={subject.handle}
-          aria-current={selected ? 'true' : undefined}
-          title={[subject.handle, subject.formerNames?.join(' / '), subject.id]
-            .filter(Boolean)
-            .join(' · ')}
-        >
-          <CoverImage
-            id={subject.id}
-            revision={coverRevision}
-            status={displayStatus(subject)}
-            priority={priority}
+        <div className="directory-row-index">
+          {subject.archived ? (
+            <DirectoryRowNumber number={rowNumber} />
+          ) : (
+            <RecordingMode
+              rowNumber={rowNumber}
+              value={subject.autoRecord}
+              captureState={subject.captureState}
+              providerStatus={subject.providerStatus}
+              label={tr('{{v0}} 是否录制', { v0: subject.handle })}
+              onChange={(record) => onRecordingChange(subject, record)}
+            />
+          )}
+        </div>
+        <div className="track-cover-cell">
+          <button
+            className="subject-preview"
+            onClick={(event) => {
+              if (event.detail === 0) onChoose(subject);
+            }}
+            aria-label={subject.handle}
+            aria-current={selected ? 'true' : undefined}
+            title={`${subject.handle} · ${subject.id}`}
           >
-            <strong className="subject-name">
-              {subject.handle}
-              {!!subject.formerNames?.length && <small>{subject.formerNames.join(' / ')}</small>}
-            </strong>
-          </CoverImage>
-        </button>
-        {!subject.archived && (
-          <RecordingMode
-            appearance="record"
-            value={subject.autoRecord}
-            captureState={subject.captureState}
-            providerStatus={subject.providerStatus}
-            label={tr('{{v0}} 是否录制', { v0: subject.handle })}
-            onChange={(record) => onRecordingChange(subject, record)}
-          />
-        )}
+            <CoverImage
+              id={subject.id}
+              revision={coverRevision}
+              status={displayStatus(subject)}
+              priority={priority}
+            >
+              <strong className="subject-name">{subject.handle}</strong>
+            </CoverImage>
+          </button>
+        </div>
       </div>
       <div
         aria-busy={priority === 'visible' && (trackState === 'idle' || trackState === 'loading')}
@@ -286,6 +337,7 @@ const TrackRow = memo(function TrackRow({
         }
         role="group"
         tabIndex={0}
+        aria-keyshortcuts="Enter"
         aria-label={tr('{{v0}} 录制时间线', { v0: subject.handle })}
         data-from={fromMs}
         data-to={toMs}
@@ -300,6 +352,7 @@ const TrackRow = memo(function TrackRow({
               data={data}
               fromMs={fromMs}
               toMs={toMs}
+              scale={scale}
             />
           ) : (
             <TimelineRails />
@@ -320,6 +373,7 @@ export function TrackBoard({
   selection,
   timelineStartMs,
   nowMs,
+  calendar = fullCalendar,
   account,
   filters,
   onChoose,
@@ -343,6 +397,7 @@ export function TrackBoard({
   selection: ViewWindow;
   timelineStartMs: number;
   nowMs: number;
+  calendar?: ArchiveCalendar;
   onChoose: (subject: Subject, utc?: number, range?: ViewWindow) => void;
   onRangeChoose: (
     subject: Subject,
@@ -356,6 +411,7 @@ export function TrackBoard({
   filters?: ReactNode;
   onRecordingChange: (subject: Subject, record: boolean) => Promise<void>;
 }): JSX.Element {
+  const scale = useMemo(() => calendar.scale(fromMs, toMs), [calendar, fromMs, toMs]);
   const [viewport, setViewport] = useState({ top: 0, height: 500 });
   const [scrolling, setScrolling] = useState(false);
   const scrollPace = useRef({ active: false, settle: undefined as number | undefined });
@@ -383,17 +439,23 @@ export function TrackBoard({
   const pendingUpdate = useRef<(() => void) | null>(null);
   const scroller = useRef<HTMLDivElement | null>(null);
   const board = useRef<HTMLElement | null>(null);
-  const previousView = useRef({ fromMs, toMs });
+  const previousView = useRef({ fromMs, toMs, calendar });
   const animations = useRef<Animation[]>([]);
   const headerViewport = useRef<HTMLDivElement | null>(null);
   const scrollDirection = useRef(1);
   useLayoutEffect(() => {
-    const ratio = viewPanRatio(previousView.current, { fromMs, toMs });
-    previousView.current = { fromMs, toMs };
+    const old = previousView.current;
+    const lo = Math.min(old.fromMs, fromMs),
+      hi = Math.max(old.toMs, toMs);
+    const ratio =
+      old.calendar === calendar && calendar.scale(lo, hi).duration === hi - lo
+        ? viewPanRatio(old, { fromMs, toMs })
+        : 0;
+    previousView.current = { fromMs, toMs, calendar };
     const nodes = Array.from(board.current?.querySelectorAll<HTMLElement>(PAN_LAYERS) ?? []);
     const width = board.current?.querySelector('.track-lane')?.clientWidth ?? rulerWidth;
     animations.current = panTimeline(nodes, ratio * width, animations.current);
-  }, [fromMs, toMs]);
+  }, [fromMs, toMs, calendar]);
   useEffect(() => () => animations.current.forEach((animation) => animation.cancel()), []);
   useEffect(() => () => window.clearTimeout(scrollPace.current.settle), []);
 
@@ -536,12 +598,11 @@ export function TrackBoard({
   useSyncClock(() => {
     if (!scrollPace.current.active) setCoverRevision((n) => n + 1);
   });
-  const rows = subjects.slice(start, end),
-    duration = toMs - fromMs;
+  const rows = subjects.slice(start, end);
   const targetAt = (element: HTMLElement, clientX: number): number => {
     const box = element.getBoundingClientRect();
     return Math.round(
-      fromMs + Math.max(0, Math.min(1, (clientX - box.left) / box.width)) * duration,
+      scale.at(Math.max(0, Math.min(1, (clientX - box.left) / Math.max(1, box.width)))),
     );
   };
   const cancelGesture = (keepDraft = false): void => {
@@ -560,6 +621,13 @@ export function TrackBoard({
     commitRequest.current = null;
     setDraft(null);
   }, [selectedId]);
+  useLayoutEffect(() => {
+    if (draft.current?.keyboardOrigin) setDraft(null);
+  }, [fromMs, toMs, filterKey]);
+  useLayoutEffect(() => {
+    if (gesture.current) cancelGesture();
+    hoverPreview.current?.show(null);
+  }, [calendar]);
   useEffect(
     () => () => {
       window.cancelAnimationFrame(selectionFrame.current ?? 0);
@@ -630,6 +698,7 @@ export function TrackBoard({
             toMs={toMs}
             timelineStartMs={timelineStartMs}
             nowMs={nowMs}
+            calendar={calendar}
             filters={filters}
             onChange={onViewChange}
             onMove={onMove}
@@ -657,6 +726,7 @@ export function TrackBoard({
             '.time-range-control .timeline-ruler',
           );
           if (!id || !ruler) return;
+          const currentSelection = draft.current?.keyboardOrigin ? draft.current.range : selection;
           const nativeScroll = event.pointerType === 'touch' || event.pointerType === 'pen';
           if (!nativeScroll) {
             event.preventDefault();
@@ -665,9 +735,9 @@ export function TrackBoard({
           const edge = target.closest<HTMLElement>('[data-edge]')?.dataset.edge ?? null;
           const at =
             edge === 'from'
-              ? selection.fromMs
+              ? currentSelection.fromMs
               : edge === 'to'
-                ? selection.toMs
+                ? currentSelection.toMs
                 : targetAt(ruler, event.clientX);
           const currentWindow = { fromMs, toMs };
           gesture.current = new TrackGestureSession({
@@ -680,7 +750,8 @@ export function TrackBoard({
             scrollTop: event.currentTarget.scrollTop,
             nativeScroll,
             window: currentWindow,
-            selection,
+            scale,
+            selection: currentSelection,
             edge,
             timelineStartMs,
           });
@@ -724,11 +795,12 @@ export function TrackBoard({
               bounds &&
               event.clientY >= bounds.top &&
               event.clientY < bounds.bottom &&
-              coverage
+              coverage &&
+              scale.duration > 0
                 ? hoverMediaTime(
                     coverage.buckets,
                     targetAt(ruler, event.clientX),
-                    duration / ruler.getBoundingClientRect().width,
+                    scale.duration / ruler.getBoundingClientRect().width,
                   )
                 : null;
             hoverPreview.current?.show(
@@ -787,6 +859,31 @@ export function TrackBoard({
         }}
         onAuxClick={(event) => event.preventDefault()}
         onKeyDown={(event) => {
+          if (
+            event.key === 'Enter' &&
+            !event.repeat &&
+            !event.altKey &&
+            !event.ctrlKey &&
+            !event.metaKey
+          ) {
+            const lane = event.target as HTMLElement;
+            if (!lane.matches('.track-lane')) return;
+            const id = lane.closest<HTMLElement>('[data-subject-id]')?.dataset.subjectId;
+            const range = {
+              fromMs: Math.max(fromMs, timelineStartMs),
+              toMs: Math.min(toMs, nowMs),
+            };
+            if (!id || range.fromMs >= range.toMs) return;
+            event.preventDefault();
+            event.stopPropagation();
+            cancelGesture();
+            commitRequest.current?.abort();
+            hoverPreview.current?.show(null);
+            flushSync(() => setDraft({ id, range, keyboardOrigin: lane }));
+            event.currentTarget
+              .querySelector<HTMLElement>('.selection-edge.from')
+              ?.focus({ preventScroll: true });
+          }
           if (event.key === 'Escape') {
             commitRequest.current?.abort();
             cancelGesture(true);
@@ -850,7 +947,7 @@ export function TrackBoard({
         }}
       >
         <div className="track-table">
-          <TrackGrid fromMs={fromMs} toMs={toMs} nowMs={nowMs} />
+          <TrackGrid fromMs={fromMs} toMs={toMs} nowMs={nowMs} scale={scale} />
           <SelectionOverlay
             ref={overlay}
             subjects={subjects}
@@ -858,10 +955,12 @@ export function TrackBoard({
             selection={selection}
             fromMs={fromMs}
             toMs={toMs}
+            scale={scale}
             count={count}
             timelineStartMs={timelineStartMs}
             nowMs={nowMs}
             onCommit={commitRange}
+            onDraft={setDraft}
             selectionGeneration={selectionGeneration.current}
           />
           <div
@@ -870,12 +969,14 @@ export function TrackBoard({
             style={{ height: start * SUBJECT_ROW_HEIGHT }}
           />
           {rows.map((subject, index) => {
-            const visible = start + index >= visibleStart && start + index < visibleEnd;
+            const rowIndex = start + index;
+            const visible = rowIndex >= visibleStart && rowIndex < visibleEnd;
             const track = presentation.rows.get(subject.id);
             return (
               <TrackRow
                 key={subject.id}
                 subject={subject}
+                rowNumber={rowIndex + 1}
                 data={track?.data}
                 trackState={
                   track
@@ -895,6 +996,7 @@ export function TrackBoard({
                 priority={visible ? 'visible' : 'prefetch'}
                 fromMs={fromMs}
                 toMs={toMs}
+                scale={scale}
                 onChoose={chooseRow}
                 onRecordingChange={recordRow}
               />

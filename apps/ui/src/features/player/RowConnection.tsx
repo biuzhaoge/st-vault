@@ -68,14 +68,13 @@ export function RowConnection({
       const row =
         scroller?.querySelector('.track-row-motion-ghost.selected') ??
         scroller?.querySelector('.track-row.selected');
-      const node = row?.querySelector('.record-button') ?? row?.querySelector('.track-cover-wrap');
-      const coverPort = node?.getBoundingClientRect();
-      const targetY = coverPort ? coverPort.top + coverPort.height / 2 : anchor.y;
+      const rowPort = row?.getBoundingClientRect();
+      const targetY = rowPort ? rowPort.top + rowPort.height / 2 : anchor.y;
       let offscreen = anchor.offscreen;
-      if (coverPort && viewport && offscreen !== 'filtered') {
+      if (rowPort && viewport && offscreen !== 'filtered') {
         offscreen = targetY < viewport.top ? 'above' : targetY >= viewportBottom ? 'below' : null;
       }
-      const attached = !offscreen && !!coverPort;
+      const attached = !offscreen && !!rowPort;
       let y = targetY;
       if (viewport && offscreen) y = offscreen === 'below' ? viewportBottom - 7 : viewport.top + 7;
       const next = {
@@ -83,7 +82,7 @@ export function RowConnection({
           box,
           { right: frame.right - 16, top: frame.top + 16, height: 0 },
           y,
-          attached ? coverPort?.left : undefined,
+          attached ? rowPort?.left : undefined,
         ),
         offscreen,
         attached,
@@ -138,9 +137,13 @@ export function RowConnection({
             data-offscreen={geometry.offscreen ?? 'visible'}
           >
             <title>{name}</title>
+            <path className="connection-halo" d={geometry.route} />
             <path className="connection-bus" d={geometry.route} />
             <path className="connection-signal" d={geometry.route} />
-            {!geometry.attached && <circle cx={geometry.endX} cy={geometry.endY} r="2" />}
+            {geometry.attached && (
+              <circle className="connection-node" cx={geometry.endX} cy={geometry.endY} r="4.5" />
+            )}
+            <circle cx={geometry.endX} cy={geometry.endY} r={geometry.attached ? 1.7 : 2.5} />
             {(geometry.offscreen === 'above' || geometry.offscreen === 'below') && (
               <path
                 className="connection-arrow"

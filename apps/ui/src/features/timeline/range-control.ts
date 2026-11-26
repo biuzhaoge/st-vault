@@ -1,11 +1,5 @@
-import {
-  DAY_MS,
-  calendarSlot,
-  calendarSpan,
-  slotTime,
-  dayStart,
-  type ViewWindow,
-} from '../../shared/lib/time';
+import { DAY_MS, calendarSlot, slotTime, dayStart, type ViewWindow } from '../../shared/lib/time';
+import { fullCalendar, type ArchiveCalendar } from './archive-calendar';
 export { DAY_MS, dayStart, type ViewWindow } from '../../shared/lib/time';
 export const VIEW_STEP_MS = DAY_MS / 2;
 export const DEFAULT_RANGE_MS = DAY_MS;
@@ -53,28 +47,41 @@ export function calendarWindow(
   durationMs: number,
   timelineStartMs = 0,
   nowMs = Date.now(),
+  calendar = fullCalendar,
 ): ViewWindow {
   const safeFrom = isValidViewPosition(fromMs) ? fromMs : nowMs;
-  const end = calendarEndSlot(nowMs);
-  const first = Math.min(Math.floor(calendarSlot(timelineStartMs) / 2) * 2, end - 2);
+  const last = calendarEndSlot(nowMs);
+  const end = calendar.slot(last);
+  const first = Math.min(calendar.slot(calendarSlot(dayStart(timelineStartMs))), end - 2);
   const slots = Math.min(snapSpan(durationMs) / VIEW_STEP_MS, end - first);
-  const start = Math.max(first, Math.min(calendarSlot(safeFrom), end - slots));
-  return { fromMs: slotTime(start), toMs: slotTime(start + slots) };
+  const target = Math.max(first, Math.min(calendar.slot(calendarSlot(safeFrom)), end - 1));
+  const start = Math.min(target, end - slots);
+  return {
+    fromMs: slotTime(calendar.restoreSlot(start, 'later')),
+    toMs: slotTime(calendar.restoreSlot(start + slots, 'earlier')),
+  };
 }
 export function restoreViewWindow(
   viewToMs: number | null | undefined,
   durationMs: number,
   nowMs: number,
   timelineStartMs: number,
+  calendar = fullCalendar,
 ): ViewWindow {
   const duration = snapSpan(durationMs);
   return calendarWindow(
     isValidViewPosition(viewToMs)
-      ? slotTime(calendarSlot(viewToMs) - duration / VIEW_STEP_MS)
+      ? slotTime(
+          calendar.restoreSlot(
+            calendar.slot(calendarSlot(viewToMs)) - duration / VIEW_STEP_MS,
+            'later',
+          ),
+        )
       : nowMs,
     duration,
     timelineStartMs,
     nowMs,
+    calendar,
   );
 }
 export function moveWindow(
@@ -82,14 +89,21 @@ export function moveWindow(
   direction: number,
   timelineStartMs = 0,
   nowMs = Date.now(),
-  spanMs = calendarSpan(window.fromMs, window.toMs),
+  spanMs?: number,
+  calendar: ArchiveCalendar = fullCalendar,
 ): ViewWindow {
   if (!Number.isFinite(direction)) return window;
   return calendarWindow(
-    slotTime(calendarSlot(window.fromMs) + Math.round(direction)),
-    spanMs,
+    slotTime(
+      calendar.restoreSlot(
+        calendar.slot(calendarSlot(window.fromMs)) + Math.round(direction),
+        'later',
+      ),
+    ),
+    spanMs ?? calendar.visibleSpan(window.fromMs, window.toMs),
     timelineStartMs,
     nowMs,
+    calendar,
   );
 }
 
@@ -100,21 +114,33 @@ export function resizeCalendarWindow(
   deltaDays: number,
   timelineStartMs: number,
   nowMs = Date.now(),
+  calendar = fullCalendar,
 ): ViewWindow {
   if (!Number.isFinite(deltaDays)) return window;
   const delta = Math.round(deltaDays * 2);
-  const first = calendarSlot(dayStart(timelineStartMs)),
-    last = calendarEndSlot(nowMs);
-  const from = calendarSlot(window.fromMs),
-    to = calendarSlot(window.toMs);
+  const first = calendar.slot(calendarSlot(dayStart(timelineStartMs))),
+    last = calendar.slot(calendarEndSlot(nowMs));
+  const from = calendar.slot(calendarSlot(window.fromMs)),
+    to = calendar.slot(calendarSlot(window.toMs));
+  const maximum = MAX_RANGE_MS / VIEW_STEP_MS;
   return edge === 'from'
     ? {
-        fromMs: slotTime(Math.max(first, to - 14, Math.min(to - 1, from + delta))),
+        fromMs: slotTime(
+          calendar.restoreSlot(
+            Math.max(first, to - maximum, Math.min(to - 1, from + delta)),
+            'later',
+          ),
+        ),
         toMs: window.toMs,
       }
     : {
         fromMs: window.fromMs,
-        toMs: slotTime(Math.min(last, from + 14, Math.max(from + 1, to + delta))),
+        toMs: slotTime(
+          calendar.restoreSlot(
+            Math.min(last, from + maximum, Math.max(from + 1, to + delta)),
+            'earlier',
+          ),
+        ),
       };
 }
 

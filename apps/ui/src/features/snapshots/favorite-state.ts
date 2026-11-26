@@ -18,7 +18,6 @@ export function mergeFavoriteResult(
 export interface FavoritePreview {
   owner: number;
   scope: string;
-  ids: Set<string>;
-  liked: boolean;
+  likedById: ReadonlyMap<string, boolean>;
   revision?: number;
 }

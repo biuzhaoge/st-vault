@@ -19,7 +19,7 @@ it('links only the avatar and keeps current/former names as text', () => {
   );
   expect(html).toContain('subject-avatar');
   expect(html).toContain('Current');
-  expect(html).toContain('Before');
+  expect(html).toContain('<p class="subject-former-names" title="Before">曾用名：Before</p>');
   expect(html).toContain('href="https://stripchatcam.com/Current"');
   expect(html).toMatch(/<a class="player-avatar-link"[^>]+>[\s\S]*subject-avatar[\s\S]*<\/a>/);
   expect(html).toContain('<h2 title="Current">Current</h2>');

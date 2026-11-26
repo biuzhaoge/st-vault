@@ -14,7 +14,7 @@ interface StatusInterval {
   status: PublicStatus;
 }
 
-/** Run inside the worker's repeatable-read transaction so pages share a snapshot. */
+/** The caller has checked the subject inside the same repeatable-read transaction. */
 export async function readStatusHistory(
   db: Pick<SqlDatabase, 'prepare'>,
   subjectId: string,
@@ -22,8 +22,6 @@ export async function readStatusHistory(
   toMs: number,
   count: number,
 ): Promise<StatusHistoryResponse> {
-  if (!(await db.prepare('SELECT 1 FROM subjects WHERE id=?').get(subjectId)))
-    throw new Error('SUBJECT_NOT_FOUND');
   const duration = toMs - fromMs;
   const buckets = Array.from({ length: count }, (_, index) => {
     const from = fromMs + Math.floor((duration * index) / count),

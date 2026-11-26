@@ -5,13 +5,19 @@ import type {
   MediaSelectionOptions,
   MediaSelectionPatch,
   MediaSelectionResult,
+  FavoriteChange,
 } from '@st-vault/api-schema';
-import type { BackgroundTask, MediaDeletionJob, MediaDeletionTarget } from '@st-vault/api-schema';
+import type { FavoriteSelectionChange } from './favorite-commands.js';
+import type {
+  BackgroundTask,
+  MediaDeletionJob,
+  MediaDeletionQueue,
+  MediaDeletionTarget,
+} from '@st-vault/api-schema';
 import type { PendingDeletion } from './deletion-store.js';
-import { createHash, randomUUID, webcrypto } from 'node:crypto';
-import { addAbortListener } from 'node:events';
-import { constants } from 'node:fs';
-import { lstat, mkdir, open, opendir, realpath, rename, stat, unlink } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { RecordingUnitIndex } from './unit-index.js';
+import { lstat, mkdir, realpath, rename } from 'node:fs/promises';
 import path from 'node:path';
 import { Metadata } from './metadata.js';
 import { orphanCandidates } from './orphan-candidates.js';
@@ -40,19 +46,24 @@ import type {
 import type { ArchivePort, CommitInput, MediaChange, MediaObject, SubjectInput } from '../ports.js';
 import { ARCHIVE_MEDIA_BATCH_LIMIT } from '../ports.js';
 import { MAX_SNAPSHOT_SELECTION, MAX_SNAPSHOT_PAGE_SIZE } from '@st-vault/api-schema';
+import {
+  archiveWindows,
+  EMPTY_DAY_SETTLE_MS,
+  MEDIA_WINDOW_MS,
+  WORKBENCH_WINDOW_MS,
+} from './calendar-window.js';
 
-export type ArchiveFaultPoint =
-  | 'after-object-rename'
-  | 'after-journal-sync'
-  | 'after-index-commit'
-  | 'after-tombstone-sync'
-  | 'after-tombstone-commit'
-  | 'after-unlink'
-  | 'before-object-write'
-  | 'before-journal-write'
-  | 'before-unlink'
-  | 'before-deletion-prepare'
-  | 'before-orphan-batch';
+import { MediaObjectStore, fileErrorCode, syncDirectory } from './object-store.js';
+import {
+  UUID,
+  MAX_BYTES,
+  subjectId,
+  type ArchiveFaultPoint,
+  type JournalRecord,
+  type ObjectRecord,
+} from './records.js';
+
+export type { ArchiveFaultPoint, JournalRecord, ObjectRecord } from './records.js';
 export interface ArchiveOptions {
   root: string;
   mediaRoot?: string;
@@ -77,43 +88,8 @@ export interface ArchiveHandle extends ArchivePort {
     objectsVerified: number;
   };
 }
-export interface ObjectRecord {
-  id: string;
-  subjectId: string;
-  filename: string;
-  bytes: number;
-  hash: string;
-  kind: 'init' | 'fragment';
-}
-interface BaseRecord {
-  version: 1;
-  revision: number;
-  subject: SubjectInput;
-}
-export type JournalRecord = BaseRecord &
-  (
-    | { kind: 'commit'; segment: Segment; objects: ObjectRecord[] }
-    | { kind: 'delete'; segmentIds: string[] }
-  );
-const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-const MAX_BYTES = 16 * 1024 * 1024;
-const MAX_WINDOW = 9 * 86400000;
 function failure(code: string): never {
   throw new Error(code);
-}
-function code(error: unknown): string | undefined {
-  return typeof error === 'object' &&
-    error !== null &&
-    'code' in error &&
-    typeof error.code === 'string'
-    ? error.code
-    : undefined;
-}
-function subjectId(id: string): number {
-  if (!/^stripchat:[1-9]\d*$/.test(id)) failure('INVALID_SUBJECT_ID');
-  const value = Number(id.slice(10));
-  if (!Number.isSafeInteger(value)) failure('INVALID_SUBJECT_ID');
-  return value;
 }
 function inputSubject(s: SubjectInput): void {
   if (
@@ -136,34 +112,9 @@ function windowRange(from: number, to: number, bounded = true): void {
     from < 0 ||
     !Number.isSafeInteger(to) ||
     to <= from ||
-    (bounded && to - from > MAX_WINDOW)
+    (bounded && to - from > MEDIA_WINDOW_MS)
   )
     failure('INVALID_TIME_WINDOW');
-}
-function plain(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-function validObject(value: unknown, id: string): value is ObjectRecord {
-  if (!plain(value)) return false;
-  return (
-    typeof value.id === 'string' &&
-    UUID.test(value.id) &&
-    value.subjectId === id &&
-    (value.kind === 'init' || value.kind === 'fragment') &&
-    typeof value.filename === 'string' &&
-    /^(?:\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01])\/(?:[01]\d|2[0-3])|unlocated)\/$/.test(
-      value.filename.slice(0, value.filename.lastIndexOf('/') + 1),
-    ) &&
-    path.posix.basename(value.filename) ===
-      `${value.kind === 'init' ? 'init' : 'seg'}-${value.id}.${value.kind === 'init' ? 'mp4' : 'm4s'}` &&
-    value.filename.split('/').every((part: string) => part !== '..' && !part.includes('\\')) &&
-    typeof value.bytes === 'number' &&
-    Number.isSafeInteger(value.bytes) &&
-    value.bytes > 0 &&
-    value.bytes <= MAX_BYTES &&
-    typeof value.hash === 'string' &&
-    /^[0-9a-f]{64}$/.test(value.hash)
-  );
 }
 /** Files, journals and the database belong exclusively to this independent data root. */
 export async function openArchive(options: ArchiveOptions): Promise<ArchiveHandle> {
@@ -175,7 +126,7 @@ export async function openArchive(options: ArchiveOptions): Promise<ArchiveHandl
     await lstat(path.join(root, 'metadata.sqlite'));
     failure('LIBRARY_MIGRATION_REQUIRED');
   } catch (error) {
-    if (code(error) !== 'ENOENT') throw error;
+    if (fileErrorCode(error) !== 'ENOENT') throw error;
   }
   const configuredMedia = path.resolve(options.mediaRoot ?? path.join(root, 'media'));
   await mkdir(configuredMedia, { recursive: true });
@@ -199,8 +150,23 @@ interface DeleteFilter {
   to?: number;
   unlocated?: boolean;
   cutoff?: number;
+  retentionDays?: number;
   segmentIds?: string[];
   personalRevision?: number;
+}
+
+interface RemovalResult {
+  deletedSegments: number;
+  reclaimedBytes: number;
+  retentionChanged?: true;
+}
+
+interface DeferredRemovalResult extends RemovalResult {
+  gcObjectIds: string[];
+  tombstoneMs: number;
+  reclaimMs: number;
+  unlinkMs: number;
+  directorySyncMs: number;
 }
 
 class Archive implements ArchiveHandle {
@@ -209,27 +175,20 @@ class Archive implements ArchiveHandle {
   }
   private favoriteWork: Promise<void> | undefined;
   private directoryRead: Promise<Subject[]> | undefined;
-  private deletionRead: Promise<MediaDeletionJob[]> | undefined;
+  private deletionRead: Promise<MediaDeletionQueue> | undefined;
   private favoriteError: Error | undefined;
   private deletionWork: Promise<void> | undefined;
+  private readonly deletionCompleteListeners = new Set<() => void>();
   private readonly deletionWakeup = new TaskWakeup();
   private orphanWork: Promise<void> | undefined;
-  private unitWork: Promise<void> | undefined;
-  private readonly unitIndexWaiters = new Set<(error?: Error) => void>();
-  private unitReady = false;
-  private unitIndexError: Error | undefined;
+  private readonly unitIndex: RecordingUnitIndex;
   private orphanTotal = 0;
   private orphanDone = 0;
   private orphanStartedAt: number | null = null;
   private orphanFinishedAt: number | null = null;
   backgroundTasks(): Promise<BackgroundTask[]> {
     return this.run(async () => {
-      const index = await this.db.read<{
-        ready: boolean;
-        processed: number;
-        lastRunAtMs: number | null;
-        lastSuccessAtMs: number | null;
-      }>('unitIndexStatus');
+      const index = await this.unitIndex.status();
       const library = await this.db.read<{
         checkpointing: boolean;
         checkpointFailed: boolean;
@@ -270,22 +229,7 @@ class Archive implements ArchiveHandle {
               ? 'library_checkpoint_failed'
               : null,
         },
-        {
-          id: 'archive-index',
-          group: 'processing',
-          state: this.unitIndexError
-            ? 'retrying'
-            : index.ready
-              ? 'idle'
-              : this.unitWork
-                ? 'running'
-                : 'waiting',
-          processed: index.processed,
-          detail: 'index-batches',
-          lastRunAtMs: index.lastRunAtMs,
-          lastSuccessAtMs: index.lastSuccessAtMs,
-          error: this.unitIndexError ? 'recording_unit_index_failed' : null,
-        },
+        index,
         {
           id: 'orphan-sweep',
           group: 'processing',
@@ -306,54 +250,6 @@ class Archive implements ArchiveHandle {
       ];
     });
   }
-  private startUnitIndex(): void {
-    if (this.unitReady || this.unitWork || this.closing) return;
-    this.unitIndexError = undefined;
-    this.unitWork = (async () => {
-      // Recovery can defer the index only before this instance starts serving;
-      // subsequent commits append synchronously to an already-ready index.
-      while (!this.closing) {
-        if (!(await this.db.call<boolean>('buildRecordingUnits', { limit: 32 }))) {
-          this.unitReady = true;
-          break;
-        }
-        await new Promise<void>((resolve) => setTimeout(resolve, 15));
-      }
-    })()
-      .catch((error) => {
-        this.unitIndexError =
-          error instanceof Error ? error : new Error('UNIT_INDEX_FAILED', { cause: error });
-        console.error('recording_unit_index_failed', error);
-      })
-      .finally(() => {
-        this.unitWork = undefined;
-        for (const settle of this.unitIndexWaiters) settle(this.unitIndexError);
-        this.unitIndexWaiters.clear();
-      });
-  }
-  private async readyUnits(signal?: AbortSignal): Promise<void> {
-    signal?.throwIfAborted();
-    this.startUnitIndex();
-    if (this.unitWork) {
-      // Abandoned reads must detach while the archive's shared backfill continues.
-      await new Promise<void>((resolve, reject) => {
-        const settle = (error?: Error): void => {
-          listener?.[Symbol.dispose]();
-          if (error) reject(error);
-          else resolve();
-        };
-        const listener = signal
-          ? addAbortListener(signal, () => {
-              this.unitIndexWaiters.delete(settle);
-              resolve();
-            })
-          : undefined;
-        this.unitIndexWaiters.add(settle);
-      });
-    }
-    signal?.throwIfAborted();
-    if (this.unitIndexError) throw this.unitIndexError;
-  }
   private orphanSubjects: string[] = [];
   private orphanError: Error | undefined;
   private closing = false;
@@ -362,11 +258,13 @@ class Archive implements ArchiveHandle {
   private readonly operations = new Set<Promise<unknown>>();
   private readonly queues = new Map<string, Promise<unknown>>();
   private readonly gcWork = new Map<string, Promise<number>>();
+  private readonly gcRetries = new Map<string, { at: number; attempt: number }>();
+  private gcRetryTimer: NodeJS.Timeout | undefined;
+  private gcRetryRunning = false;
   private readonly gcIo: TaskPool;
   private readonly backgroundPool: TaskPool;
-  private readonly hashPool: TaskPool;
+  private readonly files: MediaObjectStore;
   private readonly backgroundConcurrency: number;
-  private readonly verified = new Map<string, string>();
   private readonly mediaListeners = new Set<(change: MediaChange) => void>();
   subscribeMedia(listener: (change: MediaChange) => void): () => void {
     this.mediaListeners.add(listener);
@@ -397,10 +295,11 @@ class Archive implements ArchiveHandle {
     objectsVerified: 0,
   };
   constructor(
-    private readonly root: string,
+    root: string,
     private readonly db: Metadata,
     private readonly options: ArchiveOptions,
   ) {
+    this.unitIndex = new RecordingUnitIndex(db);
     this.backgroundConcurrency = options.backgroundConcurrency ?? 1;
     if (
       !Number.isSafeInteger(this.backgroundConcurrency) ||
@@ -410,23 +309,13 @@ class Archive implements ArchiveHandle {
       failure('INVALID_ARCHIVE_CONCURRENCY');
     this.gcIo = new TaskPool(options.gcConcurrency ?? 1);
     this.backgroundPool = new TaskPool(this.backgroundConcurrency);
-    this.hashPool = new TaskPool(options.hashConcurrency ?? 1);
+    this.files = new MediaObjectStore(root, options.hashConcurrency ?? 1, (point) =>
+      this.fault?.(point),
+    );
   }
   private get fault(): ArchiveOptions['fault'] {
     return this.options.fault;
   }
-  private hash(bytes: Uint8Array): Promise<string> {
-    // WebCrypto copies the input into bounded native work; never detach the
-    // immutable buffer that the live and recording consumers still share.
-    return this.hashPool.run(async () => {
-      const source =
-        bytes.buffer instanceof ArrayBuffer
-          ? new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength)
-          : new Uint8Array(bytes);
-      return Buffer.from(await webcrypto.subtle.digest('SHA-256', source)).toString('hex');
-    });
-  }
-
   private run<T>(action: () => Promise<T>): Promise<T> {
     if (this.closing) return Promise.reject(new Error('ARCHIVE_CLOSED'));
     if (this.poisoned) return Promise.reject(new Error('ARCHIVE_REQUIRES_RECOVERY'));
@@ -456,91 +345,6 @@ class Archive implements ArchiveHandle {
     };
     return accepted ? schedule() : this.run(schedule);
   }
-  private async directory(id: string): Promise<string> {
-    const subject = path.join(this.root, 'subjects', `stripchat-${subjectId(id)}`);
-    const dir = path.join(subject, 'recordings');
-    for (const candidate of [path.join(this.root, 'subjects'), subject, dir]) {
-      const created = await mkdir(candidate, { recursive: true });
-      if ((await lstat(candidate)).isSymbolicLink() || !(await lstat(candidate)).isDirectory())
-        failure('UNSAFE_ARCHIVE_PATH');
-      if (created !== undefined) await this.syncDirectory(path.dirname(candidate));
-    }
-    return dir;
-  }
-  private async syncDirectory(dir: string): Promise<void> {
-    // Windows does not expose POSIX directory fsync through Node. File fsync is
-    // still enforced; power-loss rename durability is explicitly a platform limit.
-    if (process.platform === 'win32') return;
-    const file = await open(dir, constants.O_RDONLY);
-    try {
-      await file.sync();
-    } finally {
-      await file.close();
-    }
-  }
-  private async objectPath(object: ObjectRecord): Promise<string> {
-    if (!validObject(object, object.subjectId)) failure('INVALID_OBJECT_REFERENCE');
-    const dir = await this.objectDirectory(object.subjectId, object.filename);
-    const file = path.join(dir, path.posix.basename(object.filename));
-    const info = await lstat(file);
-    if (!info.isFile() || info.isSymbolicLink() || (await realpath(file)) !== file)
-      failure('UNSAFE_MEDIA_PATH');
-    return file;
-  }
-  private async objectDirectory(id: string, filename: string, create = false): Promise<string> {
-    let dir = await this.directory(id);
-    for (const part of filename.split('/').slice(0, -1)) {
-      const parent = dir;
-      dir = path.join(dir, part);
-      if (create) {
-        const created = await mkdir(dir, { recursive: false }).then(
-          () => true,
-          (error: unknown) => {
-            if (code(error) !== 'EEXIST') throw error;
-            return false;
-          },
-        );
-        if (created) await this.syncDirectory(parent);
-      }
-      const info = await lstat(dir);
-      if (!info.isDirectory() || info.isSymbolicLink()) failure('UNSAFE_ARCHIVE_PATH');
-    }
-    return dir;
-  }
-  private async writeObject(
-    id: string,
-    bytes: Uint8Array,
-    kind: ObjectRecord['kind'],
-    bucket: string,
-  ): Promise<ObjectRecord> {
-    await this.fault?.('before-object-write');
-    const objectId = randomUUID();
-    const object: ObjectRecord = {
-      id: objectId,
-      subjectId: id,
-      filename: `${bucket}/${kind === 'init' ? 'init' : 'seg'}-${objectId}.${kind === 'init' ? 'mp4' : 'm4s'}`,
-      bytes: bytes.byteLength,
-      hash: await this.hash(bytes),
-      kind,
-    };
-    const dir = await this.directory(id);
-    const destination = await this.objectDirectory(id, object.filename, true);
-    const staging = path.join(dir, '.staging');
-    await mkdir(staging, { recursive: true });
-    if ((await lstat(staging)).isSymbolicLink()) failure('UNSAFE_ARCHIVE_PATH');
-    const temporary = path.join(staging, `${objectId}.tmp`);
-    const file = await open(temporary, 'wx', 0o600);
-    try {
-      await file.writeFile(bytes);
-      await file.sync();
-    } finally {
-      await file.close();
-    }
-    await rename(temporary, path.join(destination, path.posix.basename(object.filename)));
-    await this.syncDirectory(destination);
-    await this.fault?.('after-object-rename');
-    return object;
-  }
   async recover(): Promise<void> {
     const started = performance.now();
     const stage = (name: string): void =>
@@ -556,17 +360,7 @@ class Archive implements ArchiveHandle {
     const clean = await this.db.call<boolean>('beginSession');
     this.recovery.cleanStartup = clean;
     stage('metadata');
-    const mediaRoot = path.join(this.root, 'subjects');
-    const created = await mkdir(mediaRoot, { recursive: true });
-    if ((await lstat(mediaRoot)).isSymbolicLink()) failure('UNSAFE_ARCHIVE_PATH');
-    if (created !== undefined) await this.syncDirectory(this.root);
-    const subjects = new Set<string>();
-    for await (const entry of await opendir(mediaRoot)) {
-      if (!/^stripchat-[1-9]\d*$/.test(entry.name)) continue;
-      if (!entry.isDirectory() || entry.isSymbolicLink()) failure('UNSAFE_ARCHIVE_PATH');
-      const id = `stripchat:${entry.name.slice(10)}`;
-      subjects.add(id);
-    }
+    const subjects = await this.files.discoverSubjects();
     const storage = await this.db.read<{
       replayed: number;
       recordsRead: number;
@@ -582,7 +376,7 @@ class Archive implements ArchiveHandle {
       const objects = await this.db.call<ObjectRecord[]>('unverifiedObjects');
       if (!objects.length) break;
       for (const object of objects) {
-        await this.verifyObject(object);
+        await this.files.verify(object);
         this.recovery.objectsVerified++;
         await this.db.call('verified', { id: object.id });
       }
@@ -591,7 +385,7 @@ class Archive implements ArchiveHandle {
       await this.collect(id);
     }
     stage('recovered_objects');
-    this.startUnitIndex();
+    this.unitIndex.start();
     if (
       !clean ||
       (await this.db.call('settingGet', { key: 'archive.orphan-scan-pending' })) === '1'
@@ -600,28 +394,6 @@ class Archive implements ArchiveHandle {
       this.orphanSubjects = [...subjects];
       this.orphanTotal = this.orphanSubjects.length;
       this.startOrphanSweep();
-    }
-  }
-  private async verifyObject(object: ObjectRecord): Promise<void> {
-    const filename = await this.objectPath(object);
-    const file = await open(filename, 'r');
-    try {
-      const info = await file.stat();
-      if (info.size !== object.bytes) failure('MEDIA_INTEGRITY_FAILED');
-      const digest = createHash('sha256');
-      const buffer = Buffer.alloc(64 * 1024);
-      let position = 0;
-      for (;;) {
-        const { bytesRead } = await file.read(buffer, 0, buffer.length, position);
-        if (!bytesRead) break;
-        position += bytesRead;
-        if (position > object.bytes) failure('MEDIA_INTEGRITY_FAILED');
-        digest.update(buffer.subarray(0, bytesRead));
-      }
-      if (position !== object.bytes || digest.digest('hex') !== object.hash)
-        failure('MEDIA_INTEGRITY_FAILED');
-    } finally {
-      await file.close();
     }
   }
   private startOrphanSweep(): void {
@@ -651,13 +423,13 @@ class Archive implements ArchiveHandle {
       });
   }
   private async isolateOrphans(id: string): Promise<boolean> {
-    const dir = await this.directory(id);
+    const dir = await this.files.directory(id);
     const orphaned = path.join(dir, '.orphaned');
     const isolate = async (source: string, name: string): Promise<void> => {
       await mkdir(orphaned, { recursive: true });
       if ((await lstat(orphaned)).isSymbolicLink()) failure('UNSAFE_ARCHIVE_PATH');
       await rename(source, path.join(orphaned, `${randomUUID()}-${name}`));
-      await this.syncDirectory(orphaned);
+      await syncDirectory(orphaned);
     };
     for await (const batch of orphanCandidates(dir)) {
       if (this.closing || this.poisoned) return false;
@@ -683,7 +455,7 @@ class Archive implements ArchiveHandle {
             } catch (error) {
               // A completed commit or GC may have consumed a candidate while it
               // waited for the subject queue. Absence is already reconciled.
-              if (code(error) !== 'ENOENT') throw error;
+              if (fileErrorCode(error) !== 'ENOENT') throw error;
             }
           }
         },
@@ -697,51 +469,62 @@ class Archive implements ArchiveHandle {
     const existing = this.gcWork.get(id);
     // The first collector accounts for bytes; joiners must not count them twice.
     if (existing) return existing.then(() => 0);
-    const work = this.collectFiles(id).finally(() => this.gcWork.delete(id));
+    const work = this.collectFiles(id)
+      .then((reclaimed) => {
+        this.gcRetries.delete(id);
+        return reclaimed;
+      })
+      .catch((error: unknown) => {
+        const attempt = Math.min(4, (this.gcRetries.get(id)?.attempt ?? -1) + 1);
+        const delay = Math.min(300_000, 30_000 * 2 ** attempt);
+        this.gcRetries.set(id, { at: Date.now() + delay, attempt });
+        throw error;
+      })
+      .finally(() => {
+        this.gcWork.delete(id);
+        this.scheduleGcRetry();
+      });
     this.gcWork.set(id, work);
     return work;
   }
+
+  private scheduleGcRetry(): void {
+    clearTimeout(this.gcRetryTimer);
+    this.gcRetryTimer = undefined;
+    if (this.closing || this.poisoned || this.gcRetryRunning) return;
+    let subject: string | undefined;
+    let at = Infinity;
+    for (const [id, retry] of this.gcRetries) {
+      if (retry.at >= at || this.gcWork.has(id)) continue;
+      subject = id;
+      at = retry.at;
+    }
+    if (!subject) return;
+    const id = subject;
+    this.gcRetryTimer = setTimeout(
+      () => {
+        this.gcRetryTimer = undefined;
+        if (this.closing || this.poisoned) return;
+        this.gcRetryRunning = true;
+        // The normal collector owns both the durable checkpoint and close wait.
+        void this.withBackgroundReads(() => this.collect(id))
+          .catch((error: unknown) => console.warn('archive_gc_retry_failed', id, error))
+          .finally(() => {
+            this.gcRetryRunning = false;
+            this.scheduleGcRetry();
+          });
+      },
+      Math.max(0, at - Date.now()),
+    ).unref();
+  }
+
   private async collectFiles(id: string): Promise<number> {
     let reclaimed = 0;
     for (;;) {
       const objects = await this.db.call<ObjectRecord[]>('pendingGc', { id });
       if (!objects.length) return reclaimed;
-      const directories = new Set<string>();
-      let batchFailed = false;
-      const results = await Promise.allSettled(
-        objects.map((object) =>
-          this.gcIo.run(async () => {
-            if (batchFailed) return;
-            try {
-              const filename = await this.objectPath(object);
-              const bytes = (await stat(filename)).size;
-              await this.fault?.('before-unlink');
-              await unlink(filename);
-              directories.add(path.dirname(filename));
-              reclaimed += bytes;
-              await this.fault?.('after-unlink');
-            } catch (error) {
-              if (code(error) !== 'ENOENT') {
-                batchFailed = true;
-                throw error;
-              }
-            }
-          }),
-        ),
-      );
-      const errors = results
-        .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
-        .map((result) => result.reason as unknown);
-      if (errors.length === 1) throw errors[0];
-      if (errors.length)
-        throw new AggregateError(
-          errors,
-          errors[0] instanceof Error ? errors[0].message : 'ARCHIVE_GC_BATCH_FAILED',
-          { cause: errors[0] },
-        );
-      // The tombstone journal makes unlink replayable. Persist directory changes
-      // once per directory, then checkpoint the bounded batch atomically.
-      for (const directory of directories) await this.syncDirectory(directory);
+      const { reclaimedBytes } = await this.files.reclaimBatch(objects, this.gcIo);
+      reclaimed += reclaimedBytes;
       await this.db.call('gcDone', { segmentIds: objects.map((object) => object.id) });
       if (this.closing) return reclaimed;
       // Release CPU/I/O scheduling between bounded batches, never a subject commit lock.
@@ -782,7 +565,7 @@ class Archive implements ArchiveHandle {
       return this.directoryRead;
     });
   }
-  setGlobalRecording(enabled: boolean): Promise<void> {
+  setGlobalRecording(enabled: boolean): Promise<string[]> {
     if (typeof enabled !== 'boolean') failure('INVALID_POLICY');
     return this.run(() => this.db.call('globalRecording', { enabled }));
   }
@@ -898,6 +681,9 @@ class Archive implements ArchiveHandle {
   eventMeta(): Promise<EventMeta> {
     return this.run(() => this.db.read('eventMeta'));
   }
+  emptyRecordingDays(at = Date.now()): Promise<MediaTimeRange[]> {
+    return this.run(() => this.db.read('emptyRecordingDays', { at, from: 0 }));
+  }
   syncRevisions(): Promise<{ media: number; events: number; personal: number }> {
     return this.run(() => this.db.read('syncRevisions'));
   }
@@ -933,7 +719,7 @@ class Archive implements ArchiveHandle {
   }
   runHistory(from: number, to: number): Promise<RunHistoryResponse> {
     return this.run(async () => {
-      windowRange(from, to);
+      await archiveWindows(this, from, to, WORKBENCH_WINDOW_MS);
       return await this.db.read('runHistory', { from, to });
     });
   }
@@ -991,14 +777,14 @@ class Archive implements ArchiveHandle {
         if (input.init) {
           init = await this.db.call<ObjectRecord | null>('init', {
             id: input.subjectId,
-            hash: await this.hash(input.init),
+            hash: await this.files.hash(input.init),
           });
           if (!init) {
-            init = await this.writeObject(input.subjectId, input.init, 'init', bucket);
+            init = await this.files.write(input.subjectId, input.init, 'init', bucket);
             staged.push(init);
           }
         }
-        const media = await this.writeObject(input.subjectId, input.bytes, 'fragment', bucket);
+        const media = await this.files.write(input.subjectId, input.bytes, 'fragment', bucket);
         staged.push(media);
         const segment: Segment = {
           id: media.id,
@@ -1034,7 +820,7 @@ class Archive implements ArchiveHandle {
         // publication. An uncertain durable write still requires recovery.
         if (error instanceof Error && error.message === 'METADATA_STORAGE_BUSY') {
           const results = await Promise.allSettled(
-            staged.map(async (object) => unlink(await this.objectPath(object))),
+            staged.map((object) => this.files.discard(object)),
           );
           if (results.some((result) => result.status === 'rejected'))
             console.warn(JSON.stringify({ event: 'unpublished_media_cleanup_failed' }));
@@ -1085,11 +871,11 @@ class Archive implements ArchiveHandle {
         limit > MAX_SNAPSHOT_PAGE_SIZE
       )
         failure('INVALID_SNAPSHOT_LIMIT');
-      windowRange(window.fromMs, window.toMs);
+      await archiveWindows(this, window.fromMs, window.toMs);
       const deadline = signal
         ? AbortSignal.any([signal, AbortSignal.timeout(12000)])
         : AbortSignal.timeout(12000);
-      await this.readyUnits(deadline);
+      await this.unitIndex.wait(deadline);
       const layout = { id, window };
       for (;;) {
         deadline.throwIfAborted();
@@ -1114,7 +900,7 @@ class Archive implements ArchiveHandle {
   }
   snapshotUnit(id: string, at: number, unitId?: string): Promise<SnapshotItem | null> {
     return this.run(async () => {
-      await this.readyUnits();
+      await this.unitIndex.wait();
       subjectId(id);
       if (!Number.isSafeInteger(at) || at < 0 || at >= Number.MAX_SAFE_INTEGER)
         failure('INVALID_TIME_WINDOW');
@@ -1133,7 +919,7 @@ class Archive implements ArchiveHandle {
     )
       failure('INVALID_MEDIA_SELECTION');
     return this.serial(id, async () => {
-      await this.readyUnits();
+      await this.unitIndex.wait();
       const newest = new Map<string, UnitSeenEvidence>();
       for (const item of evidence)
         if (item.toMs > (newest.get(item.unitId)?.toMs ?? -1)) newest.set(item.unitId, item);
@@ -1143,7 +929,7 @@ class Archive implements ArchiveHandle {
   unitFavorites(
     id: string,
     ids: string[],
-    liked: boolean,
+    liked: FavoriteChange,
     revision: number,
   ): Promise<PersonalTimeline & FavoriteRemovalResult> {
     subjectId(id);
@@ -1158,7 +944,7 @@ class Archive implements ArchiveHandle {
   private async favoriteUnits(
     id: string,
     ids: string[],
-    liked: boolean,
+    liked: FavoriteChange,
     revision: number,
   ): Promise<PersonalTimeline & FavoriteRemovalResult> {
     const selection = await this.prepareSelection(
@@ -1168,15 +954,7 @@ class Archive implements ArchiveHandle {
       undefined,
       { includeUnitIds: ids },
     );
-    await this.db.call('favoriteMediaSelection', {
-      id,
-      selectionId: selection.id,
-      liked,
-      personalRevision: revision,
-    });
-    void this.resumeFavorites().catch((error) =>
-      console.warn('favorite_materialization_failed', error),
-    );
+    await this.acceptFavoriteSelection(id, selection.id, liked, revision);
     return {
       ...(await this.db.read<PersonalTimeline>('unitFavoriteQuery', { id, ids })),
       removed: ids.length,
@@ -1187,7 +965,7 @@ class Archive implements ArchiveHandle {
     if (ids.length > MAX_SNAPSHOT_SELECTION || ids.some((key) => !UUID.test(key)))
       failure('INVALID_MEDIA_SELECTION');
     return this.run(async () => {
-      await this.readyUnits();
+      await this.unitIndex.wait();
       return this.db.read('unitFavoriteQuery', { id, ids });
     });
   }
@@ -1197,9 +975,9 @@ class Archive implements ArchiveHandle {
     to: number,
   ): Promise<(MediaTimeRange & { openUnitId?: string }) | null> {
     subjectId(id);
-    windowRange(from, to);
     return this.run(async () => {
-      await this.readyUnits();
+      await archiveWindows(this, from, to);
+      await this.unitIndex.wait();
       return this.db.read('unitBounds', { id, from, to });
     });
   }
@@ -1207,7 +985,7 @@ class Archive implements ArchiveHandle {
     subjectId(id);
     if (!UUID.test(unitId)) failure('INVALID_MEDIA_SELECTION');
     return this.run(async () => {
-      await this.readyUnits();
+      await this.unitIndex.wait();
       return this.db.read('unitRange', { id, unitId });
     });
   }
@@ -1216,7 +994,7 @@ class Archive implements ArchiveHandle {
     if (!UUID.test(unitId) || !Number.isSafeInteger(at) || at < 0)
       failure('INVALID_MEDIA_SELECTION');
     return this.run(async () => {
-      await this.readyUnits();
+      await this.unitIndex.wait();
       return this.db.read('unitSource', { id, unitId, at });
     });
   }
@@ -1224,7 +1002,7 @@ class Archive implements ArchiveHandle {
     subjectId(id);
     if (!UUID.test(segmentId)) failure('INVALID_MEDIA_SELECTION');
     return this.run(async () => {
-      await this.readyUnits();
+      await this.unitIndex.wait();
       return this.db.read('snapshotForSegment', { id, segmentId });
     });
   }
@@ -1237,7 +1015,7 @@ class Archive implements ArchiveHandle {
     if ((cursor?.length ?? 0) > 256 || !Number.isSafeInteger(limit) || limit < 1 || limit > 128)
       failure('INVALID_MEDIA_SELECTION');
     return this.run(async () => {
-      await this.readyUnits();
+      await this.unitIndex.wait();
       return this.db.read('snapshotUnits', { id, cursor, limit });
     });
   }
@@ -1249,20 +1027,61 @@ class Archive implements ArchiveHandle {
     includeProtection = false,
     signal?: AbortSignal,
   ): Promise<CoverageResponse> {
+    return this.readCoverage<CoverageResponse>(
+      'coverage',
+      id,
+      from,
+      to,
+      buckets,
+      includeProtection,
+      signal,
+    );
+  }
+  workbenchRow(
+    id: string,
+    from: number,
+    to: number,
+    buckets: number,
+    includeProtection: boolean,
+    signal?: AbortSignal,
+  ): Promise<{ coverage: CoverageResponse; status: StatusHistoryResponse }> {
+    return this.readCoverage<{ coverage: CoverageResponse; status: StatusHistoryResponse }>(
+      'workbenchRow',
+      id,
+      from,
+      to,
+      buckets,
+      includeProtection,
+      signal,
+    );
+  }
+  private readCoverage<T>(
+    method: 'coverage' | 'workbenchRow',
+    id: string,
+    from: number,
+    to: number,
+    buckets: number,
+    includeProtection: boolean,
+    signal?: AbortSignal,
+  ): Promise<T> {
     return this.run(async () => {
       subjectId(id);
       windowRange(from, to, false);
       if (
-        to - from > 31 * 86400000 ||
+        (method === 'coverage' && to - from > 31 * 86400000) ||
         !Number.isSafeInteger(buckets) ||
         buckets < 1 ||
         buckets > 720
       )
         failure('INVALID_COVERAGE_WINDOW');
-      await this.readyUnits(signal);
-      return await this.db.read(
-        'coverage',
-        { id, from, to, buckets: Math.min(buckets, to - from), includeProtection },
+      const ranges =
+        method === 'workbenchRow' && to - from > WORKBENCH_WINDOW_MS
+          ? await archiveWindows(this, from, to, WORKBENCH_WINDOW_MS)
+          : undefined;
+      await this.unitIndex.wait(signal);
+      return await this.db.read<T>(
+        method,
+        { id, from, to, buckets: Math.min(buckets, to - from), includeProtection, ranges },
         signal,
       );
     });
@@ -1291,22 +1110,7 @@ class Archive implements ArchiveHandle {
       if (!UUID.test(id)) return null;
       const object = await this.db.call<ObjectRecord | null>('media', { id });
       if (!object) return null;
-      try {
-        const filename = await this.objectPath(object);
-        const info = await stat(filename, { bigint: true });
-        if (Number(info.size) !== object.bytes) failure('MEDIA_INTEGRITY_FAILED');
-        const signature = `${info.size}:${info.mtimeNs}:${info.ctimeNs}`;
-        if (this.verified.get(id) !== signature) {
-          await this.verifyObject(object);
-          if (this.verified.size >= 1024)
-            this.verified.delete(this.verified.keys().next().value ?? '');
-          this.verified.set(id, signature);
-        }
-        return { path: filename, bytes: object.bytes, contentType: 'video/mp4' };
-      } catch (error) {
-        if (code(error) === 'ENOENT') return null;
-        throw error;
-      }
+      return this.files.media(object);
     });
   }
   deleteRange(
@@ -1324,8 +1128,10 @@ class Archive implements ArchiveHandle {
     options: MediaSelectionOptions = {},
   ): Promise<MediaSelection> {
     subjectId(id);
-    windowRange(window.fromMs, window.toMs);
-    return this.run(() => this.prepareSelection(id, window, mode, signal, options));
+    return this.run(async () => {
+      await archiveWindows(this, window.fromMs, window.toMs);
+      return this.prepareSelection(id, window, mode, signal, options);
+    });
   }
   /** Admitted operations use this owner directly and survive graceful close. */
   private async prepareSelection(
@@ -1333,9 +1139,9 @@ class Archive implements ArchiveHandle {
     window: MediaTimeRange,
     mode: MediaSelectionMode,
     signal?: AbortSignal,
-    options: MediaSelectionOptions = {},
+    options: MediaSelectionOptions & { favoriteFilter?: boolean } = {},
   ): Promise<MediaSelection> {
-    await this.readyUnits();
+    await this.unitIndex.wait();
     signal?.throwIfAborted();
     const selectionId = await this.db.call<string>('beginMediaSelection', {
       id,
@@ -1357,7 +1163,13 @@ class Archive implements ArchiveHandle {
         await new Promise<void>((resolve) => setImmediate(resolve));
       }
     }
-    while (await this.db.call<boolean>('buildMediaSelection', { id, selectionId })) {
+    while (
+      await this.db.call<boolean>('buildMediaSelection', {
+        id,
+        selectionId,
+        favoriteFilter: options.favoriteFilter,
+      })
+    ) {
       signal?.throwIfAborted();
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
@@ -1367,7 +1179,7 @@ class Archive implements ArchiveHandle {
   favoriteMediaSelection(
     id: string,
     selectionId: string,
-    liked: boolean,
+    liked: FavoriteChange,
     revision: number,
     patch: MediaSelectionPatch,
     signal?: AbortSignal,
@@ -1412,7 +1224,7 @@ class Archive implements ArchiveHandle {
     subjectId(id);
     this.validateSelection(ranges);
     return this.run(async () => {
-      await this.readyUnits();
+      await this.unitIndex.wait();
       const planId = await this.db.call<string>('beginDeletionPlan', { id, ranges });
       while (await this.db.call<boolean>('buildDeletionPlan', { id: planId }))
         await new Promise<void>((resolve) => setImmediate(resolve));
@@ -1452,22 +1264,46 @@ class Archive implements ArchiveHandle {
   private async acceptFavoriteSelection(
     id: string,
     selectionId: string,
-    liked: boolean,
+    liked: FavoriteChange,
     revision: number,
     signal?: AbortSignal,
   ): Promise<MediaSelectionResult> {
+    const favoriteChanges =
+      liked === 'toggle'
+        ? await this.prepareFavoriteInversion(id, selectionId, revision, signal)
+        : [{ selectionId, liked }];
     // The same subject queue covers retention's read-and-tombstone interval.
     signal?.throwIfAborted();
     const result = await this.db.call<MediaSelectionResult>('favoriteMediaSelection', {
       id,
-      selectionId,
-      liked,
+      favoriteChanges,
       personalRevision: revision,
     });
     void this.resumeFavorites().catch((error) =>
       console.warn('favorite_materialization_failed', error),
     );
     return result;
+  }
+  private async prepareFavoriteInversion(
+    id: string,
+    selectionId: string,
+    revision: number,
+    signal?: AbortSignal,
+  ): Promise<FavoriteSelectionChange[]> {
+    const source = await this.db.read<MediaSelection>('mediaSelection', { id, selectionId });
+    if (source.personalRevision !== revision) failure('PERSONAL_REVISION_STALE');
+    const changes: FavoriteSelectionChange[] = [];
+    let count = 0;
+    for (const liked of [false, true]) {
+      const group = await this.prepareSelection(id, source, 'explicit', signal, {
+        baseSelectionId: selectionId,
+        favoriteFilter: !liked,
+      });
+      count += group.count;
+      changes.push({ selectionId: group.id, liked });
+    }
+    if (count !== source.count) failure('MEDIA_SELECTION_STALE');
+    return changes;
   }
   resumeFavorites(): Promise<void> {
     if (this.favoriteWork) return this.favoriteWork;
@@ -1561,42 +1397,61 @@ class Archive implements ArchiveHandle {
     if (!UUID.test(commandId)) failure('INVALID_MEDIA_SELECTION');
     return this.run(async () => {
       const started = performance.now();
-      const job = await this.db.call<MediaDeletionJob>('admitDeletionIntent', {
-        id,
-        commandId,
-        deletionTarget,
-      });
-      console.info(
-        JSON.stringify({
-          event: 'media_deletion_admitted',
+      const { job, published } = await this.db.call<{ job: MediaDeletionJob; published: boolean }>(
+        'admitDeletionIntent',
+        {
+          id,
           commandId,
-          subjectId: id,
-          phase: job.phase,
-          elapsedMs: Math.round(performance.now() - started),
-        }),
+          deletionTarget,
+        },
       );
-      this.notifyMedia({
-        kind: 'delete',
-        subjectId: id,
-        fromMs: job.fromMs ?? deletionTarget.fromMs,
-        toMs: job.toMs ?? deletionTarget.toMs,
-      });
-      // Schedule after the durable reply: heavy preparation is never an HTTP prerequisite.
-      setImmediate(() => {
-        void this.resumeDeletions().catch((error) =>
-          console.warn('Deletion queue unavailable', error),
+      if (published) {
+        console.info(
+          JSON.stringify({
+            event: 'media_deletion_admitted',
+            commandId,
+            subjectId: id,
+            state: job.state,
+            phase: job.phase,
+            elapsedMs: Math.round(performance.now() - started),
+          }),
         );
-      });
+        this.notifyMedia({
+          kind: 'delete',
+          subjectId: id,
+          fromMs: job.fromMs ?? deletionTarget.fromMs,
+          toMs: job.toMs ?? deletionTarget.toMs,
+        });
+      }
+      if (job.state !== 'completed' && job.state !== 'failed')
+        setImmediate(() => {
+          void this.resumeDeletions().catch((error) =>
+            console.warn('Deletion queue unavailable', error),
+          );
+        });
       return job;
     });
   }
-  deletionJobs(): Promise<MediaDeletionJob[]> {
+  async deletionJobs(): Promise<MediaDeletionJob[]> {
+    return (await this.deletionInventory()).jobs;
+  }
+  deletionInventory(): Promise<MediaDeletionQueue> {
     return this.run(async () => {
-      this.deletionRead ??= this.db.call<MediaDeletionJob[]>('mediaDeletionJobs').finally(() => {
-        this.deletionRead = undefined;
-      });
+      this.deletionRead ??= this.db
+        .call<MediaDeletionQueue>('mediaDeletionInventory')
+        .finally(() => {
+          this.deletionRead = undefined;
+        });
       return this.deletionRead;
     });
+  }
+  deletionJob(commandId: string): Promise<MediaDeletionJob | null> {
+    if (!UUID.test(commandId)) failure('INVALID_MEDIA_SELECTION');
+    return this.run(() => this.db.read('mediaDeletionJob', { commandId }));
+  }
+  subscribeDeletionComplete(listener: () => void): () => void {
+    this.deletionCompleteListeners.add(listener);
+    return () => this.deletionCompleteListeners.delete(listener);
   }
   async retryDeletions(): Promise<void> {
     await this.run(() =>
@@ -1617,27 +1472,27 @@ class Archive implements ArchiveHandle {
           if (failures.length) throw failures[0];
           while (active.size < this.backgroundConcurrency && !this.closing && !this.poisoned) {
             const excludedSubjects = [...active.keys()];
-            const preparing = await this.db.read<MediaDeletionJob | null>('pendingDeletionIntent', {
+            const job = await this.db.read<PendingDeletion | null>('nextMediaDeletion', {
               excludedSubjects,
             });
-            const job =
-              preparing ??
-              (await this.db.call<PendingDeletion | null>('nextMediaDeletion', {
-                excludedSubjects,
-              }));
             if (!job) break;
-            // Claiming is centralized. DB row locks end with their transaction;
-            // the active subject owns the bounded execution step until it settles.
+            // The archive owner and active subject map reserve a step without a journal write.
+            // Drain each committed plan page before producing the next one for this subject.
+            const preparing = job.state === 'preparing' && job.segmentIds.length === 0;
             const task = this.backgroundPool
               .run(async () => {
                 if (this.closing || this.poisoned) return;
-                if (preparing) await this.prepareDeletionStep(preparing);
-                else await this.executeDeletionBatch(job as PendingDeletion);
+                if (preparing) await this.prepareDeletionStep(job);
+                else await this.executeDeletionBatch(job);
               })
               .catch((error: unknown) => {
                 failures.push(error);
               })
-              .finally(() => active.delete(job.subjectId));
+              .finally(() => {
+                active.delete(job.subjectId);
+                // An in-flight lookup may have excluded this subject before the step finished.
+                this.deletionWakeup.notify();
+              });
             active.set(job.subjectId, task);
           }
           if (epoch !== this.deletionWakeup.epoch) continue;
@@ -1661,12 +1516,25 @@ class Archive implements ArchiveHandle {
     return this.deletionWork;
   }
   private async prepareDeletionStep(pending: MediaDeletionJob): Promise<void> {
+    const started = performance.now();
+    if (pending.phase === 'units' && !pending.scannedUnits && !pending.error)
+      console.info(
+        JSON.stringify({
+          event: 'media_deletion_started',
+          commandId: pending.id,
+          queueMs: Math.max(0, Date.now() - pending.createdAtMs),
+        }),
+      );
     try {
       await this.fault?.('before-deletion-prepare');
       const result = await this.db.call<MediaDeletionJob | null>('prepareDeletionIntent', {
         commandId: pending.id,
       });
-      if (result && (result.phase !== pending.phase || result.state === 'failed'))
+      const elapsedMs = Math.round(performance.now() - started);
+      if (
+        result &&
+        (result.phase !== pending.phase || result.state === 'failed' || elapsedMs >= 500)
+      )
         console.info(
           JSON.stringify({
             event: 'media_deletion_phase',
@@ -1676,6 +1544,7 @@ class Archive implements ArchiveHandle {
             scannedUnits: result.scannedUnits,
             selectedUnits: result.selectedUnits,
             fragments: result.total,
+            elapsedMs,
           }),
         );
       if (result?.state === 'failed')
@@ -1685,23 +1554,66 @@ class Archive implements ArchiveHandle {
           fromMs: result.fromMs ?? 0,
           toMs: result.toMs ?? 0,
         });
+      if (result?.state === 'completed') this.emitDeletionComplete(result);
     } catch (error) {
       await this.db.call('retryDeletionIntent', { id: pending.id });
       console.warn('Deletion preparation paused for recovery', pending.id, error);
     }
   }
   private async executeDeletionBatch(job: PendingDeletion): Promise<void> {
+    let advanced: MediaDeletionJob;
     try {
-      // Logical acceptance already retired derivatives; GC is a separate, bounded owner.
-      const result = await this.remove(job.subjectId, { segmentIds: job.segmentIds }, true, false);
-      await this.db.call('advanceMediaDeletion', {
+      const result = await this.remove(
+        job.subjectId,
+        { segmentIds: job.segmentIds },
+        true,
+        false,
+        true,
+      );
+      const checkpointStarted = performance.now();
+      advanced = await this.db.call<MediaDeletionJob>('advanceMediaDeletion', {
         id: job.id,
         processed: job.processed + job.segmentIds.length,
-        reclaimedBytes: result.reclaimedBytes,
+        gcObjectIds: result.gcObjectIds,
       });
+      const checkpointMs = Math.round(performance.now() - checkpointStarted);
+      if (
+        !job.processed ||
+        advanced.state === 'completed' ||
+        Math.floor(advanced.processed / 2048) > Math.floor(job.processed / 2048) ||
+        result.tombstoneMs + result.reclaimMs + checkpointMs >= 1000
+      )
+        console.info(
+          JSON.stringify({
+            event: 'media_deletion_batch',
+            commandId: job.id,
+            processed: advanced.processed,
+            reclaimedBytes: advanced.reclaimedBytes,
+            tombstoneMs: result.tombstoneMs,
+            reclaimMs: result.reclaimMs,
+            unlinkMs: result.unlinkMs,
+            directorySyncMs: result.directorySyncMs,
+            checkpointMs,
+          }),
+        );
     } catch (error) {
       await this.db.call('retryMediaDeletion', { id: job.id });
-      console.warn('Media deletion paused for recovery', job.id, error);
+      console.warn(
+        this.poisoned ? 'Media deletion paused for archive recovery' : 'Media deletion will retry',
+        job.id,
+        error,
+      );
+      return;
+    }
+    if (advanced.state === 'completed') this.emitDeletionComplete(advanced);
+  }
+  private emitDeletionComplete(job: MediaDeletionJob): void {
+    for (const listener of this.deletionCompleteListeners) {
+      try {
+        listener();
+      } catch (error) {
+        console.warn('archive_deletion_complete_listener_failed', job.id, error);
+      }
     }
   }
   private validateSelection(ranges: MediaTimeRange[]): void {
@@ -1725,26 +1637,55 @@ class Archive implements ArchiveHandle {
   deleteUnlocated(id: string): Promise<{ deletedSegments: number; reclaimedBytes: number }> {
     return this.removeAll(id, { unlocated: true });
   }
-  pruneBefore(cutoffMs: number): Promise<{ deletedSegments: number; reclaimedBytes: number }> {
+  pruneBefore(cutoffMs: number, retentionDays?: number): Promise<RemovalResult> {
     return this.run(async () => {
-      await this.readyUnits();
+      await this.unitIndex.wait();
       if (!Number.isSafeInteger(cutoffMs) || cutoffMs < 0) failure('INVALID_PRUNE_CUTOFF');
+      if (
+        retentionDays !== undefined &&
+        (!Number.isSafeInteger(retentionDays) || retentionDays < 1)
+      )
+        failure('INVALID_RETENTION_DAYS');
       const subjects = await this.db.call<Subject[]>('list', { activity: false });
       let deletedSegments = 0,
         reclaimedBytes = 0;
       for (const subject of subjects) {
-        const result = await this.removeAll(subject.id, { cutoff: cutoffMs }, true);
+        const result = await this.removeAll(subject.id, { cutoff: cutoffMs, retentionDays }, true);
         deletedSegments += result.deletedSegments;
         reclaimedBytes += result.reclaimedBytes;
+        if (result.retentionChanged) break;
       }
       return { deletedSegments, reclaimedBytes };
     });
   }
-  private removeAll(
-    id: string,
-    filter: DeleteFilter,
-    accepted = false,
-  ): Promise<{ deletedSegments: number; reclaimedBytes: number }> {
+  pruneEmptyDays(at: number, from = 0): Promise<number | null> {
+    return this.run(() =>
+      this.withBackgroundReads(async () => {
+        // Give fragments finishing around midnight a chance to reach the archive.
+        const empty = await this.db.read<MediaTimeRange[]>('emptyRecordingDays', {
+          at: at - EMPTY_DAY_SETTLE_MS,
+          from,
+          includePendingDeletion: true,
+        });
+        let remaining = 8;
+        for (const range of empty) {
+          if (!remaining) return range.fromMs;
+          // Spend the same transaction budget on a single busy date as on several small ones.
+          for (;;) {
+            remaining--;
+            const more = await this.db.call<boolean>('pruneEmptyHistory', {
+              from: range.fromMs,
+              to: range.toMs,
+            });
+            if (!more) break;
+            if (!remaining) return range.fromMs;
+          }
+        }
+        return null;
+      }),
+    );
+  }
+  private removeAll(id: string, filter: DeleteFilter, accepted = false): Promise<RemovalResult> {
     const drain = async () => {
       let deletedSegments = 0,
         reclaimedBytes = 0;
@@ -1752,7 +1693,7 @@ class Archive implements ArchiveHandle {
         const batch = await this.remove(id, filter, true);
         deletedSegments += batch.deletedSegments;
         reclaimedBytes += batch.reclaimedBytes;
-        if (!batch.deletedSegments) return { deletedSegments, reclaimedBytes };
+        if (!batch.deletedSegments) return { ...batch, deletedSegments, reclaimedBytes };
       }
     };
     // The admitted sweep survives close, but each batch releases the subject lock
@@ -1761,51 +1702,62 @@ class Archive implements ArchiveHandle {
   }
   private remove(
     id: string,
+    filter: DeleteFilter & { segmentIds: string[] },
+    accepted: boolean,
+    publishChange: boolean,
+    deferGcCheckpoint: true,
+  ): Promise<DeferredRemovalResult>;
+  private remove(
+    id: string,
+    filter: DeleteFilter,
+    accepted?: boolean,
+    publishChange?: boolean,
+  ): Promise<RemovalResult>;
+  private remove(
+    id: string,
     filter: DeleteFilter,
     accepted = false,
     publishChange = true,
-  ): Promise<{ deletedSegments: number; reclaimedBytes: number }> {
+    deferGcCheckpoint = false,
+  ): Promise<RemovalResult | DeferredRemovalResult> {
+    const started = performance.now();
     const publish = this.serial(
       id,
       async () => {
         subjectId(id);
         if (filter.from !== undefined && filter.to !== undefined)
           windowRange(filter.from, filter.to, false);
-        const subject = await this.db.call<Subject>('subject', { id });
-        if (
-          filter.personalRevision !== undefined &&
-          filter.personalRevision !== (await this.db.call<number>('personalRevision'))
-        )
-          failure('STALE_DELETE_PLAN');
-        const candidates = await this.db.call<
-          { id: string; start: number | null; end: number | null }[]
-        >('deleteBatch', { id, ...filter });
+        const { subject, revision, candidates } = await this.db.read<{
+          subject: Pick<Subject, 'id' | 'providerId' | 'handle'>;
+          revision: number;
+          candidates: { id: string; start: number | null; end: number | null }[];
+        }>('deleteBatch', { id, ...filter });
+        if (!candidates.length) return 0;
         const segmentIds = candidates.map((candidate) => candidate.id);
-        let deletedSegments = 0;
+        const record: JournalRecord = {
+          version: 1,
+          revision,
+          subject,
+          kind: 'delete',
+          segmentIds,
+        };
+        await this.fault?.('before-journal-write');
         try {
-          if (segmentIds.length) {
-            const revision = (await this.db.call<number>('head', { id })) + 1;
-            const record: JournalRecord = {
-              version: 1,
-              revision,
-              subject: { id: subject.id, providerId: subject.providerId, handle: subject.handle },
-              kind: 'delete',
-              segmentIds,
-            };
-            await this.fault?.('before-journal-write');
-            await this.db.call('apply', { record });
-            await this.fault?.('after-tombstone-sync');
-            await this.fault?.('after-tombstone-commit');
-            deletedSegments += segmentIds.length;
-          }
+          const applied = await this.db.call<boolean>(
+            deferGcCheckpoint ? 'applyQueuedDeletion' : 'apply',
+            { record, retentionDays: filter.retentionDays },
+          );
+          if (!applied) return null;
+          await this.fault?.('after-tombstone-sync');
+          await this.fault?.('after-tombstone-commit');
         } catch (error) {
-          // Only an uncertain metadata publication requires archive recovery.
-          // Once the tombstone is committed, physical GC is independently retryable.
+          // The recovery barrier starts at publication. Once the tombstone is
+          // committed, physical GC can retry independently.
           if (!(error instanceof Error) || error.message !== 'METADATA_STORAGE_BUSY')
             this.poisoned = true;
           throw error;
         }
-        if (deletedSegments && publishChange) {
+        if (publishChange) {
           let fromMs = Infinity,
             toMs = -Infinity;
           for (const { start, end } of candidates) {
@@ -1815,16 +1767,31 @@ class Archive implements ArchiveHandle {
           }
           if (fromMs < toMs) this.notifyMedia({ kind: 'delete', subjectId: id, fromMs, toMs });
         }
-        return deletedSegments;
+        return segmentIds.length;
       },
       accepted,
     );
     // Tombstones are final before unlink. Future commits cannot reuse retired
     // UUID objects (including init objects); they publish a new object instead.
-    return publish.then(async (deletedSegments) => ({
-      deletedSegments,
-      reclaimedBytes: await this.collect(id),
-    }));
+    return publish.then(async (deletedSegments) => {
+      if (deletedSegments === null)
+        return { deletedSegments: 0, reclaimedBytes: 0, retentionChanged: true };
+      if (!deferGcCheckpoint) return { deletedSegments, reclaimedBytes: await this.collect(id) };
+
+      const tombstoned = performance.now();
+      const objects = await this.db.call<ObjectRecord[]>('pendingGc', {
+        id,
+        segmentIds: filter.segmentIds,
+      });
+      const reclaimed = await this.files.reclaimBatch(objects, this.gcIo);
+      return {
+        deletedSegments,
+        ...reclaimed,
+        gcObjectIds: objects.map((object) => object.id),
+        tombstoneMs: tombstoned - started,
+        reclaimMs: performance.now() - tombstoned,
+      };
+    });
   }
   recoveryStats(): {
     cleanStartup: boolean;
@@ -1861,7 +1828,7 @@ class Archive implements ArchiveHandle {
         for (const object of objects.slice(0, limit - checked)) {
           // Tombstone may win while scrub is reading: never restore it.
           try {
-            await this.verifyObject(object);
+            await this.files.verify(object);
           } catch (error) {
             if (await this.db.call('media', { id: object.id })) throw error;
           }
@@ -1884,16 +1851,16 @@ class Archive implements ArchiveHandle {
   }
   personal(id: string, from: number, to: number): Promise<PersonalTimeline> {
     subjectId(id);
-    windowRange(from, to);
     return this.run(async () => {
-      await this.readyUnits();
+      await archiveWindows(this, from, to);
+      await this.unitIndex.wait();
       return this.db.read('personal', { id, from, to });
     });
   }
   removeFavorite(id: string): Promise<void> {
     if (!UUID.test(id)) failure('INVALID_FAVORITE');
     return this.run(async () => {
-      await this.readyUnits();
+      await this.unitIndex.wait();
       const subject = await this.db.read<string | null>('favoriteSubject', { id });
       if (!subject) return;
       const revision = await this.db.read<number>('personalRevision');
@@ -1912,10 +1879,13 @@ class Archive implements ArchiveHandle {
   close(): Promise<void> {
     if (this.closed) return this.closed;
     this.closing = true;
+    clearTimeout(this.gcRetryTimer);
+    this.gcRetryTimer = undefined;
+    const indexStopped = this.unitIndex.stop();
     this.closed = (async () => {
       await Promise.allSettled([this.deletionWork, this.favoriteWork]);
       await this.orphanWork;
-      await this.unitWork;
+      await indexStopped;
       await Promise.allSettled([...this.operations]);
       await Promise.allSettled([...this.gcWork.values()]);
       try {

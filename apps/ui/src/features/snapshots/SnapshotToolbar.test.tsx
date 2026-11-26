@@ -46,3 +46,20 @@ it('disables range actions without media and reserves large page numbers', () =>
   expect(html).toContain('min-width:11ch');
   expect(html).toContain('9999 / 9999');
 });
+
+it('shows only the count during the live range preview', () => {
+  const html = renderToStaticMarkup(<SnapshotToolbar {...props} selection={{ count: 27 }} />);
+  expect(html).toContain('已选 27 项');
+  expect(html).not.toContain('<button');
+  expect(html).not.toContain('aria-label="截图页码"');
+});
+it('retains selection mode after deselecting the last item', () => {
+  const html = renderToStaticMarkup(
+    <SnapshotToolbar {...props} selection={{ count: 0, onClear: vi.fn() }} />,
+  );
+  expect(html).toContain('已选 0 项');
+  expect(html).toContain('aria-label="清除选择"');
+  expect(html).not.toContain('aria-label="上一页"');
+  expect(html).not.toContain('aria-label="收藏"');
+  expect(html).not.toContain('删除所有非喜欢');
+});

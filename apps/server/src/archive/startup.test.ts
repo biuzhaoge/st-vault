@@ -20,6 +20,8 @@ afterAll(async () => {
   await postgres.close();
 });
 
+// Three real archive starts and their fsyncs share this budget. The gates below
+// assert ordering independently of the speed of the container's storage.
 it('opens the recovered archive before orphan inspection and persists an interrupted sweep', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'stv-startup-'));
   let release!: () => void;
@@ -90,7 +92,7 @@ it('opens the recovered archive before orphan inspection and persists an interru
     await b.close();
     await rm(root, { recursive: true, force: true });
   }
-});
+}, 15000);
 
 it('never quarantines an in-flight rename before its journal and index commit', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'stv-startup-race-'));

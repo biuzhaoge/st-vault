@@ -124,11 +124,11 @@ try {
         rows: getComputedStyle(grid).gridTemplateRows.split(' ').length,
         mounted: grid.querySelectorAll('.snapshot-cell,.snapshot-slot-empty,.snapshot-gap').length,
         timestampOverlays: grid.querySelectorAll('.snapshot-cell time').length,
-        favoritesAtLeft: [...grid.querySelectorAll('.snapshot-favorite')].every((node) => {
-          const button = node.getBoundingClientRect();
-          const cell = node.parentElement.getBoundingClientRect();
-          return button.left - cell.left <= 3 && button.top - cell.top <= 3;
-        }),
+        singleTargets: [...grid.querySelectorAll('.snapshot-cell')].every(
+          (node) =>
+            node.querySelectorAll('button').length === 1 &&
+            node.querySelector('button[data-unit-index][data-liked]'),
+        ),
         fit: getComputedStyle(document.querySelector('video[data-media-slot="active"]')).objectFit,
         nestedCorners: [document.querySelector('.snapshot-viewport')].every(
           (node) =>
@@ -186,7 +186,7 @@ try {
   const normal = await geometry();
   await assertReviewGlass();
   assert.equal(normal.timestampOverlays, 0, 'Thumbnail images must have no timestamp overlay');
-  assert(normal.favoritesAtLeft, 'Thumbnail favorites belong in the top-left corner');
+  assert(normal.singleTargets, 'Each thumbnail uses one gesture target without an image overlay');
   await assertStatusEdges();
   assert(
     normal.trackCorners && normal.imageCorners && normal.cursorUnclipped && normal.nestedCorners,
@@ -376,7 +376,7 @@ try {
   const full = await geometry();
   await assertReviewGlass();
   assert.equal(full.timestampOverlays, 0, 'Fullscreen thumbnails must have no timestamp overlay');
-  assert(full.favoritesAtLeft, 'Fullscreen thumbnail favorites belong in the top-left corner');
+  assert(full.singleTargets, 'Fullscreen thumbnails retain the same single gesture target');
   await assertStatusEdges();
   assert(full.trackCorners && full.imageCorners && full.cursorUnclipped && full.nestedCorners);
   assert.equal(full.columns, 3);
@@ -415,7 +415,22 @@ try {
   await page.waitForTimeout(1300);
   await page.locator('.media-review').waitFor({ state: 'visible' });
   await page.screenshot({ path: '.local/qa/review-fullscreen.png' });
-  await page.getByRole('button', { name: '收起截图面板', exact: true }).click();
+  const totalText = await page.locator('.snapshot-total').evaluate((node) => {
+    const range = document.createRange();
+    range.setStart(node.firstChild, 0);
+    range.setEnd(node.firstChild, 1);
+    const { x, y, width, height } = range.getBoundingClientRect();
+    return { x: x + width / 2, y: y + height / 2 };
+  });
+  await page.mouse.dblclick(totalText.x, totalText.y);
+  const accidentalSelection = await page.evaluate(() => {
+    const selection = window.getSelection();
+    const text = selection.toString();
+    selection.removeAllRanges();
+    return text;
+  });
+  const reviewToggle = page.getByRole('button', { name: '收起截图面板', exact: true });
+  await reviewToggle.click();
   await page.locator('.media-review').waitFor({ state: 'hidden' });
   assert(await page.locator('.media-review').evaluate((node) => node.inert));
   const tab = await page.locator('.review-toggle').boundingBox();
@@ -424,6 +439,33 @@ try {
   await page.getByRole('button', { name: '展开截图面板', exact: true }).click();
   await page.locator('.media-review').waitFor({ state: 'visible' });
   assert.equal(await page.locator('.media-review').evaluate((node) => node.inert), false);
+  await page.evaluate(() => document.activeElement.blur());
+  const restingShadow = await reviewToggle.evaluate((node) => getComputedStyle(node).boxShadow);
+  await page.keyboard.press('Tab');
+  await reviewToggle.focus();
+  const keyboardFocus = await reviewToggle.evaluate((node) => {
+    const style = getComputedStyle(node);
+    return {
+      visible: node.matches(':focus-visible'),
+      outline: style.outlineStyle,
+      outlineColor: style.outlineColor,
+      shadow: style.boxShadow,
+    };
+  });
+  assert.deepEqual(
+    {
+      accidentalSelection,
+      focusVisible: keyboardFocus.visible,
+      outline: keyboardFocus.outline,
+      insetCue: keyboardFocus.shadow !== restingShadow && keyboardFocus.shadow.includes('inset'),
+    },
+    { accidentalSelection: '', focusVisible: true, outline: 'none', insetCue: true },
+    JSON.stringify(keyboardFocus),
+  );
+  await reviewToggle.press('Space');
+  await page.locator('.media-review').waitFor({ state: 'hidden' });
+  await page.getByRole('button', { name: '展开截图面板', exact: true }).press('Enter');
+  await page.locator('.media-review').waitFor({ state: 'visible' });
   assert(
     await page.evaluate(() => window.__reviewBoard === document.querySelector('.media-review')),
   );

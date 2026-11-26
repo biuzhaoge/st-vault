@@ -15,6 +15,10 @@ ST-Vault is a personal, single-administrator application. Limit access to the lo
 
 The app serves HTTP by default, with Compose publishing port 10002 on all host interfaces. HTTP sends PINs, cookies, keys, and sessions in plaintext. Use a firewall to restrict access. If you terminate TLS at your own reverse proxy, preserve the browser-facing Host and support SSE. Same-origin browser authentication over HTTPS sets `Secure` on session cookies.
 
+Signing out locks the current tab. If the connection drops, the page checks the session with the server. When the session is still active or the server is unreachable, use **Retry sign-out**. Refreshing the same tab also checks the session. The PIN form returns once revocation is confirmed.
+
+The workbench loads scripts from its own origin and allows blob workers for playback. Only same-origin pages can embed it. Cross-origin links omit the referrer. Open the workbench with a link from a NAS portal hosted on another origin.
+
 ## Storage boundaries
 
 PostgreSQL listens only on an application-private Unix socket; port 5432 is not mapped. Database storage must be reliable and local, not SMB/NFS. Only one instance may write a library. State directories and backups include sensitive settings and need restricted permissions. Anyone controlling the host or application process can still access data; media has no application-level encryption at rest.

@@ -59,6 +59,11 @@ jobs:
           actual="$(docker run --rm --network none --entrypoint node "$IMAGE:build-$GITHUB_RUN_ID-$ARCH" \
             -p 'require("./apps/server/package.json").version')"
           [[ "$actual" == "$VERSION" ]]
+      - name: Check the runtime against published Debian security packages
+        run: |
+          docker run --rm --entrypoint node \
+            --mount "type=bind,src=$GITHUB_WORKSPACE/scripts/check-debian-security.mjs,dst=/check.mjs,readonly" \
+            "$IMAGE:build-$GITHUB_RUN_ID-$ARCH" /check.mjs
       - name: Test the runtime lifecycle on its native architecture
         shell: pwsh
         run: |

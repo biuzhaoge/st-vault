@@ -260,7 +260,10 @@ it('includes worker-local execution timing for success, failure and clean close 
   });
   const metadata = new Metadata(root, worker);
   try {
-    await expect(metadata.call('mediaDeletionJobs')).resolves.toEqual([]);
+    await expect(metadata.call('mediaDeletionInventory')).resolves.toEqual({
+      jobs: [],
+      waiting: 0,
+    });
     await expect(metadata.call('unknownMethod')).rejects.toThrow('UNKNOWN_METADATA_METHOD');
     await metadata.call('close', { clean: true });
     expect(replies).toHaveLength(3);

@@ -4,12 +4,14 @@ import { MAX_SNAPSHOT_SELECTION } from '@st-vault/api-schema';
 import type { ArchivePort } from '../ports.js';
 import type { SyncClock } from '../runtime/sync-clock.js';
 import { runBackground } from '../runtime/background.js';
+import { archiveWindows } from '../archive/calendar-window.js';
 
 const subject = z
   .string()
   .regex(/^stripchat:[1-9]\d*$/)
   .refine((v) => Number.isSafeInteger(Number(v.slice(10))));
 const utc = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
+const favoriteChange = z.union([z.boolean(), z.literal('toggle')]);
 const exceptions = {
   includeUnitIds: z.array(z.string().uuid()).max(MAX_SNAPSHOT_SELECTION).default([]),
   excludeUnitIds: z.array(z.string().uuid()).max(MAX_SNAPSHOT_SELECTION).default([]),
@@ -68,8 +70,8 @@ export function registerMediaSelection(
         ...exceptions,
       })
       .strict()
-      .refine((v) => v.toMs > v.fromMs && v.toMs - v.fromMs <= 9 * 86400000)
       .parse(request.body);
+    await archiveWindows(archive, input.fromMs, input.toMs);
     return prepare(request, reply, (signal) =>
       archive.prepareMediaSelection!(id, input, input.mode, signal, input),
     );
@@ -84,7 +86,7 @@ export function registerMediaSelection(
         .object({ id: subject, selectionId: z.string().uuid() })
         .parse(request.params);
       const input = z
-        .object({ liked: z.boolean(), revision: utc, ...exceptions })
+        .object({ liked: favoriteChange, revision: utc, ...exceptions })
         .strict()
         .parse(request.body);
       return prepare(request, reply, (signal) =>
@@ -123,7 +125,7 @@ export function registerMediaSelection(
       const input = z
         .object({
           unitIds: z.array(z.string().uuid()).min(1).max(MAX_SNAPSHOT_SELECTION),
-          liked: z.boolean(),
+          liked: favoriteChange,
           revision: utc,
         })
         .strict()
@@ -143,6 +145,14 @@ export function registerMediaSelection(
     return Promise.resolve();
   });
   app.get('/api/media-deletions', () => archive.deletionJobs?.() ?? Promise.resolve([]));
+  app.get('/api/media-deletions/:commandId', async (request, reply) => {
+    reply.header('cache-control', 'private, no-store');
+    if (!archive.deletionJob) return reply.code(503).send({ error: 'archive_unavailable' });
+    const { commandId } = z.object({ commandId: z.string().uuid() }).parse(request.params);
+    const job = await archive.deletionJob(commandId);
+    if (!job) return reply.code(404).send({ error: 'media_deletion_not_found' });
+    return job;
+  });
   app.post(
     '/api/subjects/:id/deletion-intents',
     { bodyLimit: 8 * 1024 * 1024 },
@@ -151,35 +161,34 @@ export function registerMediaSelection(
       const id = subject.parse((request.params as { id: string }).id);
       const bounds = { fromMs: utc, toMs: utc };
       const patch = z.object(exceptions).strict().optional();
-      const target = z
-        .discriminatedUnion('kind', [
-          z
-            .object({
-              kind: z.literal('units'),
-              ...bounds,
-              unitIds: z.array(z.string().uuid()).min(1).max(MAX_SNAPSHOT_SELECTION),
-            })
-            .strict(),
-          z
-            .object({
-              kind: z.literal('selection'),
-              ...bounds,
-              selectionId: z.string().uuid(),
-              patch,
-            })
-            .strict(),
-          z
-            .object({
-              kind: z.literal('range'),
-              ...bounds,
-              mode: z.enum(['all', 'unliked']),
-              baseSelectionId: z.string().uuid().optional(),
-              patch,
-            })
-            .strict(),
-        ])
-        .refine((v) => v.toMs > v.fromMs && v.toMs - v.fromMs <= 9 * 86400000);
+      const target = z.discriminatedUnion('kind', [
+        z
+          .object({
+            kind: z.literal('units'),
+            ...bounds,
+            unitIds: z.array(z.string().uuid()).min(1).max(MAX_SNAPSHOT_SELECTION),
+          })
+          .strict(),
+        z
+          .object({
+            kind: z.literal('selection'),
+            ...bounds,
+            selectionId: z.string().uuid(),
+            patch,
+          })
+          .strict(),
+        z
+          .object({
+            kind: z.literal('range'),
+            ...bounds,
+            mode: z.enum(['all', 'unliked']),
+            baseSelectionId: z.string().uuid().optional(),
+            patch,
+          })
+          .strict(),
+      ]);
       const input = z.object({ commandId: z.string().uuid(), target }).strict().parse(request.body);
+      await archiveWindows(archive, input.target.fromMs, input.target.toMs);
       return reply.code(202).send(await archive.admitDeletion(id, input.commandId, input.target));
     },
   );

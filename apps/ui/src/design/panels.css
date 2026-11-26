@@ -286,7 +286,7 @@
   color: var(--accent-hover);
 }
 .panel-badge.is-warning {
-  color: var(--private);
+  color: var(--warning);
 }
 .panel-actions {
   display: flex;
@@ -331,7 +331,7 @@
   box-shadow: var(--segment-track-shadow);
 }
 .panel-content .primary:hover:enabled {
-  background: color-mix(in srgb, var(--accent), black 10%);
+  background: var(--accent-fill-hover);
 }
 .panel-content .secondary:hover:enabled,
 .panel-content .text-button:hover:enabled {

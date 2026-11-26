@@ -1,11 +1,33 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, rm, lstat } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile, rm, lstat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { linkWorkspaceDependencies } from './lib/workspace-dependencies.mjs';
+test('includes upstream notices for bundled browser dependencies in the release output', async () => {
+  const { build } = await import('vite');
+  const outDir = await mkdtemp(path.join(tmpdir(), 'stv-ui-licenses-'));
+  try {
+    await build({ root: 'apps/ui', logLevel: 'silent', build: { outDir } });
+    const notices = await readFile(path.join(outDir, 'assets/third-party-licenses.md'), 'utf8');
+    const scheduler = await readFile('node_modules/scheduler/LICENSE', 'utf8');
+    assert.match(notices, /^## scheduler - /m);
+    assert.ok(notices.includes(scheduler.trim()));
+    assert.match(notices, /^## hls\.js - /m);
+  } finally {
+    await rm(outDir, { recursive: true, force: true });
+  }
+});
+test('keeps server request validators out of the initial browser chunk', async () => {
+  const { build } = await import('vite');
+  const result = await build({ root: 'apps/ui', logLevel: 'silent', build: { write: false } });
+  const entry = result.output.find((asset) => asset.type === 'chunk' && asset.isEntry);
+  assert.ok(entry, 'the release has a browser entry chunk');
+  const modules = Object.keys(entry.modules).map((id) => id.replaceAll('\\', '/'));
+  assert.ok(!modules.some((id) => id.includes('/node_modules/zod/')), 'Zod is server-only');
+});
 test('rejects a malformed release version before building', () => {
   const result = spawnSync(process.execPath, ['scripts/build-release.mjs'], {
     env: { ...process.env, STV_BUILD_VERSION: '0.0.01' },

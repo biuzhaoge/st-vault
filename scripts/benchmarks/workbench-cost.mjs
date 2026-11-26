@@ -47,7 +47,7 @@ const groups = [
     workloads: ['coverage', 'same-window', 'max-batch'],
   },
 ];
-const methods = ['coverage', 'statusHistory'];
+const methods = ['coverage', 'statusHistory', 'workbenchRow'];
 const workloads = [
   'coverage',
   'statusHistory',
@@ -302,7 +302,8 @@ async function benchmark(archiveRoot, client, schema, group, workload) {
   }
   const rpc = {};
   for (const [method, samples] of Object.entries(measured)) {
-    const expected = direct && method !== workload ? 0 : sampleRounds * clients * rows;
+    const expected =
+      method === (direct ? workload : 'workbenchRow') ? sampleRounds * clients * rows : 0;
     assert.equal(samples.roundTrip.length, expected, `Unexpected RPC count for ${method}`);
     assert(samples.worker.every(Number.isFinite), `Missing Worker timing for ${method}`);
     if (expected > 0) {

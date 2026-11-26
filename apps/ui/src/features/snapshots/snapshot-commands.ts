@@ -6,8 +6,19 @@ import type {
   MediaSelection,
   MediaSelectionResult,
   MediaDeletionTarget,
+  FavoriteChange,
 } from '@st-vault/api-schema';
-import { request, MutationOutcomeUnknown } from '../../shared/lib/api';
+import { ApiError, request, MutationOutcomeUnknown } from '../../shared/lib/api';
+import { MAX_SNAPSHOT_SELECTION } from '@st-vault/api-schema';
+
+type FavoriteFacts = Pick<PersonalTimeline, 'favorites' | 'revision'>;
+interface FavoriteBatch {
+  revision: number;
+  favorites?: PersonalTimeline['favorites'];
+}
+// The selection preparation route uses the 512 KiB server limit. A UUID in a
+// JSON array consumes 39 bytes, including quotes and a separator.
+const PREPARATION_UNIT_LIMIT = 10000;
 
 interface Operation {
   readonly revision: number;
@@ -92,15 +103,83 @@ export class SnapshotCommands {
     item: SnapshotItem,
     liked: boolean,
     revision: number,
-  ): Promise<Pick<PersonalTimeline, 'favorites' | 'revision'>> {
+    signal?: AbortSignal,
+  ): Promise<FavoriteFacts> {
+    return this.setFavorites(subjectId, [item.unitId], liked, revision, signal);
+  }
+  setFavorites(
+    subjectId: string,
+    ids: readonly [string],
+    liked: boolean,
+    revision: number,
+    signal?: AbortSignal,
+  ): Promise<FavoriteFacts>;
+  setFavorites(
+    subjectId: string,
+    ids: readonly string[],
+    liked: FavoriteChange,
+    revision: number | undefined,
+    signal?: AbortSignal,
+  ): Promise<FavoriteBatch>;
+  setFavorites(
+    subjectId: string,
+    ids: readonly string[],
+    liked: FavoriteChange,
+    revision: number | undefined,
+    signal?: AbortSignal,
+  ): Promise<FavoriteBatch> {
+    const unitIds = [...new Set(ids)];
+    if (!unitIds.length) return Promise.reject(Error('EMPTY_SNAPSHOT_SELECTION'));
     const earlier = this.favoriteTail;
     const result = (async () => {
-      const prior = earlier
-        ? ((await earlier) ?? (await this.personal(subjectId, [item])).revision)
-        : this.favoriteRevision;
-      return this.post<Pick<PersonalTimeline, 'favorites' | 'revision'>>(
-        `/api/subjects/${encodeURIComponent(subjectId)}/unit-favorites`,
-        { unitIds: [item.unitId], liked, revision: Math.max(revision, prior ?? revision) },
+      const prior = earlier ? await earlier : this.favoriteRevision;
+      const inspected =
+        revision === undefined || (earlier && prior === undefined)
+          ? (await this.queryFavorites(subjectId, [unitIds[0]], signal)).revision
+          : revision;
+      const expected = Math.max(inspected, revision ?? 0, prior ?? 0);
+      signal?.throwIfAborted();
+      const base = `/api/subjects/${encodeURIComponent(subjectId)}`;
+      if (unitIds.length <= MAX_SNAPSHOT_SELECTION)
+        return this.post<FavoriteFacts>(base + '/unit-favorites', {
+          unitIds,
+          liked,
+          revision: expected,
+        });
+      // Each token extends the same frozen explicit selection. No favorites are
+      // changed until the final version-checked request.
+      const prefix = unitIds.length - MAX_SNAPSHOT_SELECTION;
+      let selectionId: string | undefined;
+      for (let start = 0; start < prefix; start += PREPARATION_UNIT_LIMIT) {
+        const end = Math.min(start + PREPARATION_UNIT_LIMIT, prefix);
+        const selection: MediaSelection = await this.transport<MediaSelection>(
+          base + '/media-selection',
+          {
+            method: 'POST',
+            operation: 'session',
+            headers: { 'content-type': 'application/json' },
+            signal,
+            body: JSON.stringify({
+              fromMs: 0,
+              toMs: 1,
+              mode: 'explicit',
+              baseSelectionId: selectionId,
+              includeUnitIds: unitIds.slice(start, end),
+            }),
+          },
+        );
+        signal?.throwIfAborted();
+        if (selection.personalRevision !== expected || selection.count !== end)
+          throw new ApiError('media_selection_stale', 409);
+        selectionId = selection.id;
+      }
+      return this.post<MediaSelectionResult>(
+        base + '/media-selection/' + selectionId + '/favorites',
+        {
+          liked,
+          revision: expected,
+          includeUnitIds: unitIds.slice(prefix),
+        },
       );
     })();
     const tail = result.then(
@@ -145,7 +224,59 @@ export class SnapshotCommands {
     items: SnapshotItem[],
     signal?: AbortSignal,
   ): Promise<PersonalTimeline> {
-    if (!items.length) throw Error('EMPTY_SNAPSHOT_SELECTION');
+    const value = await this.queryFavorites(
+      subjectId,
+      items.map((item) => item.unitId),
+      signal,
+    );
+    return {
+      ...value,
+      ...items.reduce(
+        (bounds, item) => ({
+          fromMs: Math.min(bounds.fromMs, item.slotFromMs),
+          toMs: Math.max(bounds.toMs, item.slotToMs),
+        }),
+        { fromMs: Infinity, toMs: -Infinity },
+      ),
+    };
+  }
+  async queryFavorites(
+    subjectId: string,
+    ids: readonly string[],
+    signal?: AbortSignal,
+  ): Promise<PersonalTimeline> {
+    const unitIds = [...new Set(ids)];
+    if (!unitIds.length) throw Error('EMPTY_SNAPSHOT_SELECTION');
+    let result: PersonalTimeline | undefined;
+    for (let start = 0; start < unitIds.length; start += MAX_SNAPSHOT_SELECTION) {
+      const part = await this.favoritePage(
+        subjectId,
+        unitIds.slice(start, start + MAX_SNAPSHOT_SELECTION),
+        signal,
+      );
+      if (!result)
+        result =
+          unitIds.length > MAX_SNAPSHOT_SELECTION
+            ? { ...part, favorites: [...part.favorites] }
+            : part;
+      else {
+        if (result.revision !== part.revision) throw new ApiError('media_selection_stale', 409);
+        if (part.favorites.length) {
+          result.fromMs = result.favorites.length
+            ? Math.min(result.fromMs, part.fromMs)
+            : part.fromMs;
+          result.toMs = Math.max(result.toMs, part.toMs);
+        }
+        for (const favorite of part.favorites) result.favorites.push(favorite);
+      }
+    }
+    return result!;
+  }
+  private async favoritePage(
+    subjectId: string,
+    unitIds: string[],
+    signal?: AbortSignal,
+  ): Promise<PersonalTimeline> {
     const budget = new AbortController();
     const timer = setTimeout(
       () => budget.abort(new DOMException('Preparation timed out', 'TimeoutError')),
@@ -160,27 +291,34 @@ export class SnapshotCommands {
           method: 'POST',
           operation: 'session',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ unitIds: items.map((item) => item.unitId) }),
+          body: JSON.stringify({ unitIds }),
           signal: combined,
         },
       );
       combined.throwIfAborted();
       if (value.truncated) throw Error('FAVORITES_TRUNCATED');
-      return {
-        ...value,
-        ...items.reduce(
-          (bounds, item) => ({
-            fromMs: Math.min(bounds.fromMs, item.slotFromMs),
-            toMs: Math.max(bounds.toMs, item.slotToMs),
-          }),
-          { fromMs: Infinity, toMs: -Infinity },
-        ),
-      };
+      return value;
     } finally {
       clearTimeout(timer);
     }
   }
   jobs(signal?: AbortSignal): Promise<MediaDeletionJob[]> {
     return this.transport('/api/media-deletions', { signal });
+  }
+  async receipt(id: string, signal?: AbortSignal): Promise<MediaDeletionJob | null> {
+    try {
+      return await this.transport<MediaDeletionJob>(
+        `/api/media-deletions/${encodeURIComponent(id)}`,
+        { signal },
+      );
+    } catch (cause) {
+      if (
+        cause instanceof ApiError &&
+        cause.status === 404 &&
+        cause.message === 'media_deletion_not_found'
+      )
+        return null;
+      throw cause;
+    }
   }
 }

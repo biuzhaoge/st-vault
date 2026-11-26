@@ -144,7 +144,13 @@ export function createSubjectAvatars(options: {
     const run = async () => {
       while (ids.length && !controller.signal.aborted) {
         for (const id of ids) roster.delete(id);
-        await process(ids);
+        try {
+          await process(ids);
+        } catch (error) {
+          // Roster reads can fail before workers record an individual retry.
+          for (const id of ids) roster.add(id);
+          throw error;
+        }
         if (!roster.size) return;
         const remaining = new Set(roster);
         ids = batch().filter((id) => remaining.has(id));

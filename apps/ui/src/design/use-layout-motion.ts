@@ -1,7 +1,7 @@
 import { useLayoutEffect, useRef, type RefObject } from 'react';
 import { LayoutMotion } from './layout-motion';
 export function useLayoutMotion(
-  root: RefObject<HTMLElement>,
+  root: RefObject<HTMLElement> | null,
   scope: string,
   revision: unknown,
   selector?: string,
@@ -11,12 +11,17 @@ export function useLayoutMotion(
   const previous = useRef<{ value: unknown } | null>(null);
   motion.current ??= new LayoutMotion();
   useLayoutEffect(() => {
+    if (!root) {
+      motion.current!.clear();
+      previous.current = null;
+      return;
+    }
     if (root.current)
       motion.current!.update(root.current, scope, selector, previous.current?.value !== revision);
     previous.current = { value: revision };
   }, [root, scope, revision, selector, capture]);
   useLayoutEffect(() => {
-    const node = root.current;
+    const node = root?.current;
     if (!node) return;
     // Responsive/fullscreen CSS changes geometry without changing media data.
     // Refresh the baseline so the next heartbeat never animates from an old layout.

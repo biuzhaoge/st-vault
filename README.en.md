@@ -27,9 +27,17 @@ Screenshots use synthetic test data.
 
 **Live and replay in the same workspace.** Click a cover to watch a public stream. Enable automatic recording to save the highest available source quality. Select a recorded range and click an image to jump into it. Short gaps remain visible and long gaps are compressed. Hover over a thumbnail to see its recording's start and end times.
 
+**Skip dates without recordings.** Dates follow the deployment time zone. Today stays visible even before its first recording. A past date stays visible if any broadcaster has footage. Empty past dates are skipped so neighboring recorded dates touch. Selection and playback keep the original recording timestamps.
+
+To select a range with the keyboard, focus a broadcaster's recording timeline and press Enter to start with the visible interval. Tab between the start and end handles. Arrow keys move a handle by one second, Shift + Arrow by one minute, and Page Up or Page Down by one hour. Press Enter to replay the footage in that interval, or Escape to cancel.
+
 ![Recording playback and current playback position](docs/assets/screenshots/playback.png)
 
-**Keep the moments you like.** Use the heart in the top-left corner of a thumbnail to favorite or unfavorite its recording unit. A favorite protects the whole unit from retention cleanup. “Unlike all” and “Delete unliked” apply to the entire current time range, including other pages. Progress appears in the status panel. Refreshing or closing the browser does not cancel accepted deletion jobs.
+**Play and favorite screenshots.** Click once and the thumbnail shrinks slightly, then springs back as playback jumps to that position. Click the same thumbnail again during the rebound and it settles with a small wobble. The pink heart in the upper-left corner toggles and the playhead stays in place. The current thumbnail has a mint play symbol in the center and a soft gradient along the bottom. Press Enter on a focused thumbnail to jump immediately. Favoriting protects the entire recording unit from retention cleanup.
+
+Drag from a thumbnail to select a range. On a touchscreen, press and hold before dragging. Pink outlines mark the thumbnails between the starting point and the pointer, and the toolbar shows the selection count. Hold at the top or bottom edge to continue onto another page. Drag back to shrink the range. Release to flip each selected thumbnail's favorite status. Press Escape to cancel the drag. With keyboard focus on a thumbnail, press F to toggle its favorite or select it with Shift + Space and commit with Enter.
+
+Outside selection mode, “Unlike all” and “Delete unliked” apply to the entire current time range, including other pages. Progress appears in the status panel. Refreshing or closing the browser does not cancel accepted deletion jobs.
 
 ![Fullscreen playback with the screenshot management sidebar](docs/assets/screenshots/fullscreen.png)
 
@@ -79,11 +87,12 @@ Open `http://NAS-address:10002` after starting, or <http://127.0.0.1:10002> on t
 - **Port.** If the port is in use, change the left side of `10002:10002`, for example to `10003:10002`.
 - **Storage.** `data` holds settings, credentials, and the `postgres` database directory. `media` holds recordings and the portable library. Edit their host paths as needed. PostgreSQL requires a local filesystem. On Windows Docker Desktop, place `data` on the WSL Linux filesystem or mount a local Docker volume at `/data/postgres` as described in the [storage guide](docs/CONTRIBUTING.en.md#postgresql-storage).
 - **Time zone and version.** The default time zone is `Asia/Shanghai`. To change it, add `TZ: America/New_York` under Compose `environment` or pass `-e TZ=America/New_York` to Docker. Replace `latest` with `0.1.1` to pin this release.
+- **Empty-date cleanup.** By default, the archive clears broadcaster status history, historical events, recording coverage summaries, and completed program runs wholly inside the skipped period. Set `STV_CLEAN_EMPTY_DAYS=0` to retain this history while still skipping empty dates on the timeline.
 - **Use an existing reverse proxy.** Join the app and proxy to the same Docker network. Point the proxy at the app's network name or alias on port `10002`. Omit `ports` if all access goes through the proxy.
 
 The stop timeout gives recording and PostgreSQL time to finish writing. Keep your existing `data` and `media` paths and any database volume you have configured when upgrading.
 
-Set a six-digit PIN on first visit. Connect an account from the workbench, and import a key before playing an encrypted stream. If a live connection times out, open the player's CDN menu to test actual download speeds and select a node. Changing nodes reconnects all live streams and recordings immediately and may cause a short interruption.
+Set a six-digit PIN on first visit. If the startup screen reports a connection failure, select **Reconnect** once the network is available. Connect an account from the workbench, and import a key before playing an encrypted stream. If a live connection times out, open the player's CDN menu to test actual download speeds and select a node. Changing nodes reconnects all live streams and recordings immediately and may cause a short interruption.
 
 The workbench uses a landscape layout. The browser viewport must be at least 744 × 600 CSS pixels and no wider than 21:9. Phones, portrait tablets, and undersized split windows show a display-size prompt. On touchscreens, swipe vertically to scroll the broadcaster list or page through screenshots, and drag horizontally on a timeline to select a range.
 

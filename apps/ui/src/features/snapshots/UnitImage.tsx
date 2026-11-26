@@ -152,7 +152,7 @@ export const UnitImage = memo(function UnitImage({
 
   return (
     <span ref={node} className="minute-image">
-      {image ? <img ref={picture} src={image.url} alt="" /> : null}
+      {image ? <img ref={picture} src={image.url} draggable={false} alt="" /> : null}
     </span>
   );
 });

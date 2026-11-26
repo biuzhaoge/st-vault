@@ -1,6 +1,6 @@
 import type { BackgroundTask, Segment, SnapshotItem } from '@st-vault/api-schema';
 import type { ArchivePort, PreviewsPort } from '../ports.js';
-import { createHttp, waitFor } from '../provider/http.js';
+import { createHttp, ProviderError, waitFor } from '../provider/http.js';
 import { MediaBudget } from '../provider/media-budget.js';
 import { createFfmpegDecoder, jpeg, SnapshotDecodeError, verifyJpeg } from './ffmpeg.js';
 import { ScreenshotJobs, SNAPSHOT_REQUEST_PRIORITY } from './jobs.js';
@@ -286,7 +286,13 @@ export function createPreviews(options: PreviewOptions): PreviewsPort {
   const coverDiagnostics = new DerivativeDiagnostics(now);
   const coverFailures = new Map<
     string,
-    { source: string; attempts: number; retryAt: number; missing: boolean }
+    {
+      source: string;
+      attempts: number;
+      retryAt: number;
+      missing: boolean;
+      discovered: string | null;
+    }
   >();
   const coverMissing = (error: unknown): boolean =>
     missingImageResponse(error) ||
@@ -300,7 +306,12 @@ export function createPreviews(options: PreviewOptions): PreviewsPort {
       source ? new URL(source).hostname : undefined,
     );
   };
-  const failCover = (id: string, qualification: string, error: unknown): void => {
+  const failCover = (
+    id: string,
+    qualification: string,
+    error: unknown,
+    discovered: string | null = null,
+  ): void => {
     const previous = coverFailures.get(id);
     const attempts = previous?.source === qualification ? Math.min(previous.attempts + 1, 7) : 1;
     coverFailures.delete(id);
@@ -311,6 +322,7 @@ export function createPreviews(options: PreviewOptions): PreviewsPort {
       attempts,
       retryAt: now() + Math.min(300000, 5000 * 2 ** (attempts - 1)),
       missing: coverMissing(error),
+      discovered,
     });
   };
   const defaultDownloads = new Map<string, Promise<Uint8Array>>();
@@ -352,44 +364,79 @@ export function createPreviews(options: PreviewOptions): PreviewsPort {
     defaultDownloads.set(key, work);
     return work;
   };
-  const fetchCover = async (id: string, abort: AbortSignal, force = false): Promise<Uint8Array> => {
+  const discoverCover = async (providerId: number, signal: AbortSignal): Promise<string | null> => {
+    try {
+      const item = await sites.read(
+        '/api/front/v2/broadcasts/' + providerId,
+        (text) => broadcastResponse(text, providerId),
+        signal,
+      );
+      return broadcastCover(providerId, item);
+    } catch (error) {
+      if (signal.aborted) throw new PreviewError('preview_cancelled');
+      const restricted =
+        error instanceof ProviderError &&
+        error.code === 'upstream-http' &&
+        error.status === 403 &&
+        !error.challenge;
+      if (!restricted && !coverMissing(error))
+        coverDiagnostics.record('cover_source_lookup_failed', error);
+      return null;
+    }
+  };
+  const fetchCover = async (
+    id: string,
+    abort: AbortSignal,
+    background = false,
+  ): Promise<Uint8Array | null> => {
     const broadcaster = await options.archive.getSubject(id, { activity: false });
     if (!broadcaster) {
       coverFailures.delete(id);
       observedSources.delete(id);
       versions.delete(id);
-      throw new PreviewError('preview_not_found');
+      return null;
     }
     const providerId = broadcaster.providerId,
       key = 'cover:' + providerId;
     const hit = cached(key);
-    if (hit && !force) return hit;
+    if (hit && !background) return hit;
     const local = hit ?? (await coverDisk?.get(key));
     const previous = local && previewImageType(local) ? local : null;
-    let source: string | null = null;
+    let source: string | null = null,
+      discovered: string | null = null;
     let qualification = '',
-      cooling = false,
       primaryFailed = false;
     try {
       const storedSource = coverSource(await options.archive.subjectPreview?.(id));
-      qualification = JSON.stringify([observedSources.get(id) ?? storedSource, storedSource]);
+      const observed = observedSources.has(id);
+      source = observedSources.get(id) ?? storedSource;
+      qualification = JSON.stringify([source, storedSource]);
       const failure = coverFailures.get(id);
-      cooling = failure?.source === qualification && now() < failure.retryAt;
-      if (cooling) {
-        if (previous) return previous;
-        throw new PreviewError('preview_not_found');
+      // A foreground lookup may have found a URL before the image download failed.
+      // A later roster or status observation supersedes that retry target.
+      if (
+        !source &&
+        !observed &&
+        !broadcaster.archived &&
+        failure?.source === qualification &&
+        !failure.missing
+      ) {
+        discovered = failure.discovered;
+        source = discovered;
       }
-      if (observedSources.has(id)) source = observedSources.get(id)!;
-      else if (storedSource) source = storedSource;
-      else {
-        const item = await sites.read(
-          '/api/front/v2/broadcasts/' + providerId,
-          (text) => broadcastResponse(text, providerId),
-          abort,
-        );
-        source = broadcastCover(providerId, item);
+      // The account list and the status clock own discovery for background jobs.
+      // Do not invalidate a foreground negative cache on a routine empty warm-up.
+      const discover = !background && !broadcaster.archived && !observed;
+      if (!source && !discover) {
+        if (!failure?.missing || failure.source !== qualification) coverFailures.delete(id);
+        if (previous) save(key, previous, 15000, true);
+        return previous;
       }
-      source ??= storedSource;
+      if (failure?.source === qualification && now() < failure.retryAt) return previous;
+      if (!source) {
+        discovered = await discoverCover(providerId, abort);
+        source = discovered;
+      }
       if (!source) {
         if (!previous) throw new PreviewError('preview_not_found');
         coverFailures.delete(id);
@@ -431,12 +478,9 @@ export function createPreviews(options: PreviewOptions): PreviewsPort {
       return bytes;
     } catch (error) {
       if (abort.aborted) throw new PreviewError('preview_cancelled');
-      if (!cooling) {
-        failCover(id, qualification, error);
-        reportCoverFailure(error, source);
-      }
-      if (previous && previewImageType(previous)) return previous;
-      throw new PreviewError('preview_not_found');
+      failCover(id, qualification, error, discovered);
+      reportCoverFailure(error, source);
+      return previous;
     }
   };
   const downloadCover = (job: string): Promise<void> =>
@@ -461,7 +505,7 @@ export function createPreviews(options: PreviewOptions): PreviewsPort {
         }
       }
       coverFailures.delete(job);
-      if (!observedSources.get(id) && (!source || versions.get(id) !== source))
+      if (source && !observedSources.get(id) && versions.get(id) !== source)
         await fetchCover(id, abort, true);
     });
   const renderSnapshot = (
@@ -704,8 +748,7 @@ export function createPreviews(options: PreviewOptions): PreviewsPort {
       return Promise.resolve(rows);
     },
     retryCovers: async () => {
-      const covers = queueCoverRetries(true);
-      await preview.warmCovers?.(covers);
+      await queueCovers(queueCoverRetries(true));
     },
     ...(avatars ? { retryAvatars: () => avatars.refresh() } : {}),
     retryScreenshots: async () => {
@@ -767,7 +810,9 @@ export function createPreviews(options: PreviewOptions): PreviewsPort {
         if (cachedOnly) throw new PreviewError('preview_not_found');
         const releaseNetwork = await networkBudget.acquire(abort);
         try {
-          return await fetchCover(id, abort);
+          const bytes = await fetchCover(id, abort);
+          if (!bytes) throw new PreviewError('preview_not_found');
+          return bytes;
         } finally {
           releaseNetwork();
         }
@@ -833,7 +878,8 @@ export function createPreviews(options: PreviewOptions): PreviewsPort {
       if (
         observedSources.has(id) &&
         observedSources.get(id) === safe &&
-        ((safe === null ? versions.has(id) : versions.get(id) === safe) ||
+        (safe === null ||
+          versions.get(id) === safe ||
           (coverFailures.get(id)?.retryAt ?? 0) > now())
       )
         return;
@@ -926,14 +972,15 @@ export function createPreviews(options: PreviewOptions): PreviewsPort {
     const queued: string[] = [];
     if (closed) return queued;
     const time = now();
-    let budget = options.networkConcurrency ?? 2;
     for (const [id, failure] of coverFailures) {
       const queue = coverQueue(id);
-      if (failure.missing || queue.has(id) || (!manual && failure.retryAt > time)) continue;
+      if (failure.missing || (!manual && (queue.has(id) || failure.retryAt > time))) continue;
       if (manual) failure.retryAt = time;
       queue.add(id);
       queued.push(id);
-      if (--budget === 0) break;
+      // A heartbeat admits one batch. A manual request owns all of its queued
+      // work, which still runs under the ordinary batch and network limits.
+      if (!manual && queued.length === (options.networkConcurrency ?? 2)) break;
     }
     schedule();
     return queued;

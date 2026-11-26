@@ -6,7 +6,7 @@ import type { CoverageResponse, StatusHistoryResponse } from '@st-vault/api-sche
 import { describe, it, expect, vi } from 'vitest';
 import { registerWorkbench, type WorkbenchOptions } from './workbench.js';
 
-type Archive = Pick<ArchivePort, 'coverage' | 'statusHistory'>;
+type Archive = Pick<ArchivePort, 'workbenchRow'>;
 const url = '/api/workbench?ids=stripchat:1&from=0&to=3600000&buckets=360';
 const coverage = (subjectId = 'stripchat:1'): CoverageResponse => ({
   subjectId,
@@ -41,9 +41,9 @@ const status = (subjectId = 'stripchat:1'): StatusHistoryResponse => ({
     },
   ],
 });
+const rowData = (id: string) => ({ coverage: coverage(id), status: status(id) });
 const basic = (): Archive => ({
-  coverage: vi.fn((id: string) => Promise.resolve(coverage(id))),
-  statusHistory: vi.fn((id: string) => Promise.resolve(status(id))),
+  workbenchRow: vi.fn((id: string) => Promise.resolve(rowData(id))),
 });
 function appFor(archive: Archive, options?: WorkbenchOptions): FastifyInstance {
   const app = Fastify();
@@ -62,6 +62,28 @@ function gate(): { promise: Promise<void>; release: () => void } {
   return { promise, release };
 }
 describe('bounded batched workbench reads', () => {
+  it('submits one cancellable archive read for each admitted subject', async () => {
+    const app = Fastify();
+    const workbenchRow = vi.fn((id: string) =>
+      Promise.resolve({ coverage: coverage(id), status: status(id) }),
+    );
+    registerWorkbench(app, { workbenchRow });
+    try {
+      const response = await app.inject(url.replace('stripchat:1', 'stripchat:1,stripchat:2'));
+      expect(response.statusCode).toBe(200);
+      expect(workbenchRow).toHaveBeenCalledTimes(2);
+      expect(workbenchRow).toHaveBeenCalledWith(
+        'stripchat:2',
+        0,
+        3600000,
+        360,
+        false,
+        expect.any(AbortSignal),
+      );
+    } finally {
+      await app.close();
+    }
+  });
   it('requests protection only for the explicitly active deletion subject', async () => {
     const archive = basic(),
       app = appFor(archive);
@@ -69,7 +91,7 @@ describe('bounded batched workbench reads', () => {
       await app.inject(
         url.replace('stripchat:1', 'stripchat:1,stripchat:2') + '&protection=stripchat:2',
       );
-      expect(archive.coverage).toHaveBeenCalledWith(
+      expect(archive.workbenchRow).toHaveBeenCalledWith(
         'stripchat:1',
         0,
         3600000,
@@ -77,7 +99,7 @@ describe('bounded batched workbench reads', () => {
         false,
         expect.any(AbortSignal),
       );
-      expect(archive.coverage).toHaveBeenCalledWith(
+      expect(archive.workbenchRow).toHaveBeenCalledWith(
         'stripchat:2',
         0,
         3600000,
@@ -96,7 +118,9 @@ describe('bounded batched workbench reads', () => {
     };
     const archive = {
       ...basic(),
-      coverage: vi.fn(() => Promise.resolve({ ...coverage(), ...masks })),
+      workbenchRow: vi.fn(() =>
+        Promise.resolve({ coverage: { ...coverage(), ...masks }, status: status() }),
+      ),
       favoriteCoverage: vi.fn(() => Promise.reject(Error('obsolete favorite read'))),
     };
     const app = appFor(archive);
@@ -107,7 +131,7 @@ describe('bounded batched workbench reads', () => {
       expect(row.coverage).toMatchObject(masks);
       expect(row).not.toHaveProperty('favoriteCoverage');
       expect(archive.favoriteCoverage).not.toHaveBeenCalled();
-      expect(archive.coverage).toHaveBeenCalledTimes(1);
+      expect(archive.workbenchRow).toHaveBeenCalledTimes(1);
     } finally {
       await app.close();
     }
@@ -127,7 +151,7 @@ describe('bounded batched workbench reads', () => {
       }
     };
     const app = appFor(
-      { coverage: (id) => read(coverage(id)), statusHistory: (id) => read(status(id)) },
+      { workbenchRow: (id) => read(rowData(id)) },
       { maxRequests: 8, rowConcurrency: 4, totalRowConcurrency: 4 },
     );
     const ids = Array.from({ length: 8 }, (_, i) => `stripchat:${i + 1}`);
@@ -136,7 +160,7 @@ describe('bounded batched workbench reads', () => {
     );
     try {
       await tick();
-      expect(maximum).toBe(8);
+      expect(maximum).toBe(4);
       wait.release();
       for (const response of await Promise.all(requests)) {
         expect(response.statusCode).toBe(200);
@@ -144,7 +168,7 @@ describe('bounded batched workbench reads', () => {
           response.json<{ rows: { subjectId: string }[] }>().rows.map((row) => row.subjectId),
         ).toEqual(ids);
       }
-      expect(maximum).toBe(8);
+      expect(maximum).toBe(4);
     } finally {
       wait.release();
       await Promise.allSettled(requests);
@@ -159,7 +183,7 @@ describe('bounded batched workbench reads', () => {
       const result = await app.inject(url.replace('stripchat:1', 'stripchat:1,stripchat:1'));
       expect(result.statusCode).toBe(200);
       expect(result.headers['cache-control']).toBe('private, no-store');
-      expect(archive.coverage).toHaveBeenCalledTimes(1);
+      expect(archive.workbenchRow).toHaveBeenCalledTimes(1);
       const row = result.json<{
         rows: { coverage: CoverageResponse; status: StatusHistoryResponse }[];
       }>().rows[0];
@@ -199,7 +223,7 @@ describe('bounded batched workbench reads', () => {
         url + '&extra=1',
       ])
         expect((await app.inject(address)).statusCode).toBe(400);
-      expect(archive.coverage).not.toHaveBeenCalled();
+      expect(archive.workbenchRow).not.toHaveBeenCalled();
     } finally {
       await app.close();
     }
@@ -209,19 +233,12 @@ describe('bounded batched workbench reads', () => {
       app = appFor(archive);
     try {
       expect((await app.inject(url.replace('to=3600000', 'to=60000'))).statusCode).toBe(200);
-      expect(archive.coverage).toHaveBeenCalledWith(
+      expect(archive.workbenchRow).toHaveBeenCalledWith(
         'stripchat:1',
         0,
         60000,
         360,
         false,
-        expect.any(AbortSignal),
-      );
-      expect(archive.statusHistory).toHaveBeenCalledWith(
-        'stripchat:1',
-        0,
-        60000,
-        360,
         expect.any(AbortSignal),
       );
       expect((await app.inject(url.replace('to=3600000', 'to=1000'))).statusCode).toBe(200);
@@ -246,22 +263,21 @@ describe('bounded batched workbench reads', () => {
       }
     };
     const app = appFor({
-      coverage: (id) => read(coverage(id)),
-      statusHistory: (id) => read(status(id)),
+      workbenchRow: (id) => read(rowData(id)),
     });
     const ids = Array.from({ length: 24 }, (_, i) => `stripchat:${i + 1}`),
       result = app.inject(url.replace('stripchat:1', ids.join(',')));
     try {
       await tick();
-      expect(calls).toBe(6);
-      expect(maximum).toBe(6);
+      expect(calls).toBe(3);
+      expect(maximum).toBe(3);
       wait.release();
       const response = await result;
       expect(
         response.json<{ rows: { subjectId: string }[] }>().rows.map((row) => row.subjectId),
       ).toEqual(ids);
-      expect(calls).toBe(48);
-      expect(maximum).toBe(6);
+      expect(calls).toBe(24);
+      expect(maximum).toBe(3);
     } finally {
       wait.release();
       await result;
@@ -272,23 +288,18 @@ describe('bounded batched workbench reads', () => {
     const wait = gate();
     let calls = 0;
     const app = appFor({
-      coverage: async (id) => {
+      workbenchRow: async (id) => {
         calls++;
         await wait.promise;
-        return coverage(id);
-      },
-      statusHistory: async (id) => {
-        calls++;
-        await wait.promise;
-        return status(id);
+        return rowData(id);
       },
     });
     const pending = Array.from({ length: 4 }, () => app.inject(url));
     try {
       await tick();
-      expect(calls).toBe(8);
+      expect(calls).toBe(4);
       expect((await app.inject(url)).json()).toEqual({ error: 'workbench_busy' });
-      expect(calls).toBe(8);
+      expect(calls).toBe(4);
       wait.release();
       expect((await Promise.all(pending)).every((result) => result.statusCode === 200)).toBe(true);
       expect((await app.inject(url)).statusCode).toBe(200);
@@ -303,15 +314,11 @@ describe('bounded batched workbench reads', () => {
     let settled = false,
       calls = 0;
     const app = appFor({
-      coverage: (id) => {
+      workbenchRow: (id) => {
         calls++;
         return id === 'stripchat:1'
           ? Promise.reject(new Error('fixture-failure'))
-          : wait.promise.then(() => coverage(id));
-      },
-      statusHistory: (id) => {
-        calls++;
-        return wait.promise.then(() => status(id));
+          : wait.promise.then(() => rowData(id));
       },
     });
     const result = app
@@ -322,11 +329,11 @@ describe('bounded batched workbench reads', () => {
       });
     try {
       await tick();
-      expect(calls).toBe(6);
+      expect(calls).toBe(3);
       expect(settled).toBe(false);
       wait.release();
       await result;
-      expect(calls).toBe(6);
+      expect(calls).toBe(3);
     } finally {
       wait.release();
       await result;
@@ -338,7 +345,7 @@ describe('bounded batched workbench reads', () => {
       nextStarted = gate(),
       failNext = gate();
     const read = vi.fn((id: string) => {
-      if (id === 'stripchat:1') return first.promise.then(() => coverage(id));
+      if (id === 'stripchat:1') return first.promise.then(() => rowData(id));
       nextStarted.release();
       return failNext.promise.then(() => {
         throw Error('METADATA_STORAGE_BUSY');
@@ -349,11 +356,7 @@ describe('bounded batched workbench reads', () => {
       const code = error instanceof Error ? error.message : 'unexpected';
       return reply.code(code === 'METADATA_STORAGE_BUSY' ? 503 : 500).send({ error: code });
     });
-    registerWorkbench(
-      app,
-      { coverage: read, statusHistory: (id) => Promise.resolve(status(id)) },
-      { rowConcurrency: 2, totalRowConcurrency: 1 },
-    );
+    registerWorkbench(app, { workbenchRow: read }, { rowConcurrency: 2, totalRowConcurrency: 1 });
     const result = Promise.resolve(
       app.inject(url.replace('stripchat:1', 'stripchat:1,stripchat:2,stripchat:3')),
     );
@@ -380,16 +383,11 @@ describe('bounded batched workbench reads', () => {
     let calls = 0;
     let serverSignal: AbortSignal | undefined;
     const archive: Archive = {
-      coverage: async (id, _from, _to, _buckets, _protection, signal) => {
+      workbenchRow: async (id, _from, _to, _buckets, _protection, signal) => {
         serverSignal = signal;
         calls++;
         await wait.promise;
-        return coverage(id);
-      },
-      statusHistory: async (id) => {
-        calls++;
-        await wait.promise;
-        return status(id);
+        return rowData(id);
       },
     };
     const entries: Record<string, unknown>[] = [];
@@ -412,7 +410,7 @@ describe('bounded batched workbench reads', () => {
       signal: controller.signal,
     }).catch(() => undefined);
     try {
-      await vi.waitFor(() => expect(calls).toBe(2));
+      await vi.waitFor(() => expect(calls).toBe(1));
       controller.abort();
       await request;
       await vi.waitFor(() => expect(serverSignal?.aborted).toBe(true));
@@ -425,7 +423,7 @@ describe('bounded batched workbench reads', () => {
       expect(closed).toBe(false);
       wait.release();
       await closing;
-      expect(calls).toBe(2);
+      expect(calls).toBe(1);
       const timing = entries.filter((entry) => entry.event === 'workbench_batch_timing');
       expect(timing).toHaveLength(1);
       expect(timing[0]).toMatchObject({

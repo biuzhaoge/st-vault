@@ -2,15 +2,17 @@ import assert from 'node:assert/strict';
 import { writeFile } from 'node:fs/promises';
 import { chromium } from 'playwright-core';
 import { startFixture } from './support/fixture.mjs';
+import { createRouteDrain } from './support/route-drain.mjs';
 
 const fixture = await startFixture();
-let browser, page;
+const routes = createRouteDrain();
+let browser;
 try {
   browser = await chromium.launch({
     executablePath: process.env.STV_QA_BROWSER_EXECUTABLE ?? '/usr/bin/chromium',
     headless: true,
   });
-  page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+  const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
   await page.route('**/*', (route) =>
     new URL(route.request().url()).hostname === '127.0.0.1' ? route.continue() : route.abort(),
   );
@@ -315,7 +317,7 @@ try {
       .slice(0, 2)
       .map((row) => row.dataset.subjectId);
   });
-  await page.route('**/api/workbench?*', async (route) => {
+  await routes.route(page, '**/api/workbench?*', async (route) => {
     const response = await route.fetch();
     const packet = await response.json();
     const bounds = await page
@@ -387,8 +389,10 @@ try {
     await scroller.evaluate((root) => {
       const signature = () => {
         const lane = root.querySelector('.track-lane');
-        const filter = document.querySelector('.subject-filters [aria-pressed="true"]');
-        return `${lane?.dataset.from}:${lane?.dataset.to}:${filter?.getAttribute('aria-label')}`;
+        const filters = [
+          ...document.querySelectorAll('.subject-filters [aria-pressed="true"]'),
+        ].map((button) => button.getAttribute('aria-label'));
+        return `${lane?.dataset.from}:${lane?.dataset.to}:${filters.join()}`;
       };
       const original = signature();
       const result = (window.__navigationReveal = { order: [], frames: 0, overlap: false });
@@ -447,7 +451,10 @@ try {
   console.log('[qa] Viewport reveal passed for span changes, navigation and filter changes');
 } finally {
   // Route handlers read page geometry; drain them before disposing that page.
-  await page?.unrouteAll({ behavior: 'wait' });
-  await browser?.close();
-  await fixture.close();
+  try {
+    await routes.drain();
+  } finally {
+    await browser?.close();
+    await fixture.close();
+  }
 }

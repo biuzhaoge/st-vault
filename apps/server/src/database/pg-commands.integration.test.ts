@@ -5,7 +5,11 @@ import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { EmbeddedPostgres } from './embedded.js';
 import { SqlDatabase } from './sql.js';
-import { DeletionStore } from '../archive/deletion-store.js';
+import {
+  deletionBatchSize,
+  deletionPlanPageSize,
+  DeletionStore,
+} from '../archive/deletion-store.js';
 import { DeletionIntents } from '../archive/deletion-intents.js';
 import { MediaSelectionStore } from '../archive/media-selection-store.js';
 import { FavoriteCommands } from '../archive/favorite-commands.js';
@@ -33,7 +37,8 @@ describe.skipIf(process.env.STV_TEST_POSTGRES !== '1')('PostgreSQL media command
     vi.stubEnv('STV_DATABASE_PASSWORD', server.connection.password);
     let db = await SqlDatabase.open(root);
     cleanup.push(() => db.close());
-    await db.exec(`CREATE TABLE subjects(id TEXT PRIMARY KEY,deletion_revision BIGINT NOT NULL DEFAULT 0);
+    await db.exec(`CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+      CREATE TABLE subjects(id TEXT PRIMARY KEY,deletion_revision BIGINT NOT NULL DEFAULT 0);
       CREATE TABLE personal_owner(id BIGINT PRIMARY KEY,revision BIGINT NOT NULL DEFAULT 0);
       INSERT INTO personal_owner VALUES(1,0);
       CREATE TABLE objects(id TEXT PRIMARY KEY,bytes BIGINT NOT NULL);
@@ -145,7 +150,7 @@ describe.skipIf(process.env.STV_TEST_POSTGRES !== '1')('PostgreSQL media command
       const job = await f.db.transaction(() => stores.intents.step());
       if (!job) break;
       expect((job.scannedUnits ?? 0) - priorScanned).toBeLessThanOrEqual(256);
-      expect(job.total - priorTotal).toBeLessThanOrEqual(128);
+      expect(job.total - priorTotal).toBeLessThanOrEqual(deletionPlanPageSize);
       priorScanned = job.scannedUnits ?? 0;
       priorTotal = job.total;
       if (job.state === 'queued') break;
@@ -162,7 +167,7 @@ describe.skipIf(process.env.STV_TEST_POSTGRES !== '1')('PostgreSQL media command
     for (let steps = 0; steps < 10; steps++) {
       const job = await f.db.transaction(() => stores.jobs.next());
       if (!job) break;
-      expect(job.segmentIds.length).toBeLessThanOrEqual(128);
+      expect(job.segmentIds.length).toBeLessThanOrEqual(deletionBatchSize);
       await f.db.transaction(async () => {
         for (const segment of job.segmentIds)
           await f.db.prepare('UPDATE segments SET deleted=1 WHERE id=?').run(segment);
@@ -188,7 +193,9 @@ describe.skipIf(process.env.STV_TEST_POSTGRES !== '1')('PostgreSQL media command
     );
     await f.db.transaction(() => s.selections.build(subject, selection));
     expect((await s.selections.summary(subject, selection)).count).toBe(2);
-    await f.db.transaction(() => s.favorites.accept(subject, selection, true, 0));
+    await f.db.transaction(() =>
+      s.favorites.accept(subject, [{ selectionId: selection, liked: true }], 0),
+    );
     expect(await f.db.prepare('SELECT unit FROM unit_favorite_facts ORDER BY unit').all()).toEqual([
       { unit: 'u-000001' },
       { unit: 'u-000002' },
@@ -203,9 +210,20 @@ describe.skipIf(process.env.STV_TEST_POSTGRES !== '1')('PostgreSQL media command
       { unit: 'u-000002' },
     ]);
     const job = randomUUID();
-    await f.db.transaction(() =>
-      s.intents.admit(subject, job, { kind: 'range', mode: 'unliked', fromMs: 0, toMs: 360000 }),
+    const baseSelectionId = await f.db.transaction(() =>
+      s.selections.begin(subject, { fromMs: 0, toMs: 360000 }, 'explicit', {
+        includeUnitIds: ['u-000003'],
+      }),
     );
+    await f.db.transaction(() => s.selections.build(subject, baseSelectionId));
+    const target = {
+      kind: 'range',
+      mode: 'unliked',
+      fromMs: 0,
+      toMs: 360000,
+      baseSelectionId,
+    } as const;
+    await f.db.transaction(() => s.intents.admit(subject, job, target));
     // An intent written before favorite exclusions were tracked has no protectedFavorites field.
     await f.db
       .prepare(
@@ -213,7 +231,8 @@ describe.skipIf(process.env.STV_TEST_POSTGRES !== '1')('PostgreSQL media command
       )
       .run(job);
     await f.db.exec('UPDATE personal_owner SET revision=revision+1 WHERE id=1');
-    expect(await f.db.transaction(() => s.intents.step())).toMatchObject({
+    const failed = await f.db.transaction(() => s.intents.step());
+    expect(failed).toMatchObject({
       state: 'failed',
       error: 'media_selection_stale',
     });
@@ -223,6 +242,32 @@ describe.skipIf(process.env.STV_TEST_POSTGRES !== '1')('PostgreSQL media command
     expect(await f.db.prepare('SELECT count(*) AS count FROM deletion_items').get()).toEqual({
       count: 0,
     });
+    await f.db
+      .prepare(
+        `INSERT INTO media_deletions(id,subject,state,total,created,updated)
+      SELECT 'filler-'||n,?,'completed',0,1,?::bigint+n FROM generate_series(1,20) n`,
+      )
+      .run(subject, Date.now() + 10000);
+    await expect(
+      f.db.transaction(async () => {
+        await s.intents.cleanup();
+        throw Error('TEST_CLEANUP_INTERRUPTED');
+      }),
+    ).rejects.toThrow('TEST_CLEANUP_INTERRUPTED');
+    expect(await s.intents.get(job)).toEqual(failed);
+    // Previous releases could stop after setting discarding, before removing the intent.
+    await f.db.prepare("UPDATE media_deletions SET state='discarding' WHERE id=?").run(job);
+    await expect(s.selections.summary(subject, baseSelectionId)).rejects.toThrow(
+      'MEDIA_SELECTION_STALE',
+    );
+    expect(await f.db.transaction(() => s.intents.admit(subject, job, target))).toEqual(failed);
+    while (await f.db.transaction(() => s.intents.cleanup())) {
+      /* drain bounded pages */
+    }
+    expect(await f.db.transaction(() => s.intents.admit(subject, job, target))).toEqual(failed);
+    expect(await s.intents.lookup(job)).toEqual(failed);
+    await f.db.prepare("UPDATE settings SET value='{}' WHERE key=?").run('deletion.receipt.' + job);
+    await expect(s.intents.lookup(job)).rejects.toThrow('INVALID_DELETION_RECEIPT');
   }, 30000);
 
   it('keeps legacy exact plans idempotent and applies PostgreSQL retry backoff', async () => {

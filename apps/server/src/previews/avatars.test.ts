@@ -87,6 +87,41 @@ it('retries a failed portrait on the next heartbeat without another browser imag
     await rm(root, { recursive: true, force: true });
   }
 });
+it('retains imported portraits across a temporary roster read failure', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'stv-avatar-roster-retry-'));
+  const rows = [42, 43].map(
+    (providerId) => ({ id: `stripchat:${providerId}`, providerId }) as Subject,
+  );
+  const listSubjects = vi
+    .fn<() => Promise<Subject[]>>()
+    .mockRejectedValueOnce(Error('temporary archive read failure'))
+    .mockResolvedValue(rows);
+  const image = Buffer.from([255, 216, 255, 217]);
+  const fetch = vi.fn(() => Promise.resolve(new Response(image)));
+  const service = createSubjectAvatars({
+    root,
+    fetch,
+    archive: {
+      listSubjects,
+      getSetting: () => Promise.resolve('https://static-cdn.strpst.com/avatars/first'),
+      setSetting: () => Promise.resolve(),
+    },
+  });
+  try {
+    await expect(service.warm(rows.map((row) => row.id))).rejects.toThrow(
+      'temporary archive read failure',
+    );
+    expect(service.status()).toMatchObject({ state: 'retrying', pending: 2 });
+    await service.refresh();
+    expect(listSubjects).toHaveBeenCalledTimes(2);
+    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(service.status()).toMatchObject({ state: 'idle', pending: 0, failed: 0 });
+    for (const row of rows) expect(await service.read(row.id)).toEqual(image);
+  } finally {
+    await service.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
 it('retains the bound avatar profile host on failure and uses a newly bound host after account change', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'stv-avatar-sites-'));
   const image = Buffer.from([255, 216, 255, 217]);

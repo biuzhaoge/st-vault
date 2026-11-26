@@ -1,14 +1,18 @@
 import type { SessionInfo } from '@st-vault/api-schema';
 import { DEFAULT_RANGE_MS, isValidViewPosition, RANGE_STOPS } from './range-control';
-import { normalizeSubjectFilter } from '../directory/subjects';
+import {
+  DEFAULT_SUBJECT_FILTERS,
+  normalizeSubjectFilters,
+  type SubjectFilter,
+} from '../directory/subjects';
 
 export interface ViewPreferences {
-  filter: string;
+  filters: readonly SubjectFilter[];
   durationMs: number;
   viewToMs?: number | null;
 }
 const defaults: ViewPreferences = {
-  filter: 'ONLINE',
+  filters: DEFAULT_SUBJECT_FILTERS,
   durationMs: DEFAULT_RANGE_MS,
   viewToMs: null,
 };
@@ -21,9 +25,9 @@ export function readPreferences(key: string): ViewPreferences {
   try {
     const value: unknown = JSON.parse(localStorage.getItem(key) ?? 'null');
     if (!value || typeof value !== 'object' || Array.isArray(value)) return { ...defaults };
-    const saved = value as Partial<ViewPreferences>;
+    const saved = value as Record<string, unknown>;
     return {
-      filter: normalizeSubjectFilter(String(saved.filter)),
+      filters: normalizeSubjectFilters(saved.filters ?? saved.filter),
       durationMs:
         typeof saved.durationMs === 'number' && RANGE_STOPS.includes(saved.durationMs)
           ? saved.durationMs
@@ -39,7 +43,7 @@ export function writePreferences(key: string, value: ViewPreferences): void {
     localStorage.setItem(
       key,
       JSON.stringify({
-        filter: value.filter,
+        filters: value.filters,
         durationMs: value.durationMs,
         viewToMs: value.viewToMs ?? null,
       }),

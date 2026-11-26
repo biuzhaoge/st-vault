@@ -12,12 +12,14 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
       - run: docker compose config --quiet
       - run: docker build --target qa -t st-vault:qa -f deploy/Dockerfile .
-      - run: docker run --rm st-vault:qa npm run check
+      - run: docker run --rm --network none st-vault:qa npm run check
       - run: docker run --rm --entrypoint npm st-vault:qa audit --omit=dev --audit-level=high
+      - name: Run the browser suite against the compiled release
+        run: docker run --rm --network none --shm-size=1g st-vault:qa npm run test:browser

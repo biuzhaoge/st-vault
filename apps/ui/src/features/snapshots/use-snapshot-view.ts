@@ -375,12 +375,19 @@ export function useSnapshotView({
     subjectId: string,
     unitId: string,
     result: Pick<PersonalTimeline, 'favorites' | 'revision'>,
+    read: PersonalTimeline,
   ): void => {
-    setPagePersonal((old) =>
-      old?.value.subjectId === subjectId && old.scope === personalScopeRef.current
-        ? { ...old, value: mergeFavoriteResult(old.value, result, [unitId]) }
-        : old,
-    );
+    setPagePersonal((old) => {
+      if (old?.value.subjectId === subjectId && old.scope === personalScopeRef.current)
+        return { ...old, value: mergeFavoriteResult(old.value, result, [unitId]) };
+      if (personalScopeRef.current !== personalScope) return old;
+      // The receipt proves this unit's state while the rest of the page is loading.
+      return {
+        scope: personalScope,
+        stale: true,
+        value: mergeFavoriteResult(read, result, [unitId]),
+      };
+    });
   };
   const navigate = (atMs: number): void => {
     if (followLive) return;

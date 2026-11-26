@@ -87,7 +87,7 @@ interface Entry {
   initKey: string | null;
   init: Uint8Array | null;
   discontinuitySequence: bigint;
-  recordingRequested: boolean;
+  recordingLeases: number;
 }
 const MAX_SEGMENT = 16 * 1024 * 1024,
   MAX_INIT = 2 * 1024 * 1024;
@@ -206,7 +206,7 @@ export function createIngressHub(options: IngressOptions): IngressHub {
       let oldest: Entry | undefined;
       for (const entry of retained) {
         const head = entry.frames[0];
-        if (!head || (entry.recordingRequested && !head.committed)) continue;
+        if (!head || (entry.recordingLeases > 0 && !head.committed)) continue;
         if (!oldest || head.publishedOrder < oldest.frames[0].publishedOrder) oldest = entry;
       }
       if (!oldest) return false;
@@ -261,8 +261,12 @@ export function createIngressHub(options: IngressOptions): IngressHub {
     for (const recorder of entry.recorders) stopRecorder(recorder, entry.error);
     memory.changed();
   };
-  const release = (entry: Entry): void => {
+  const release = (entry: Entry, recording: boolean): void => {
     entry.refs--;
+    if (recording) {
+      entry.recordingLeases--;
+      if (entry.recordingLeases === 0) memory.changed();
+    }
     if (entry.refs === 0) {
       entry.controller.abort();
       clearRing(entry);
@@ -507,7 +511,7 @@ export function createIngressHub(options: IngressOptions): IngressHub {
               scope,
               true,
             );
-          const coldViewer = initial && !entry.recordingRequested;
+          const coldViewer = initial && entry.recordingLeases === 0;
           initial = false;
           const source = entry.source;
           // A segment can take longer than its own duration while bounded prefetch catches up.
@@ -829,7 +833,7 @@ export function createIngressHub(options: IngressOptions): IngressHub {
         initKey: null,
         init: null,
         discontinuitySequence: 0n,
-        recordingRequested,
+        recordingLeases: 0,
       };
       entries.set(subject.id, entry);
       for (const listener of listeners) listener();
@@ -838,12 +842,14 @@ export function createIngressHub(options: IngressOptions): IngressHub {
       tasks.add(entry.done);
       void entry.done.finally(() => tasks.delete(entry!.done)).catch(() => undefined);
     }
-    entry.recordingRequested ||= recordingRequested;
+    // Protect the first frame while a recorder waits for readiness as well as
+    // while it consumes frames. A viewer can outlive every recording lease.
+    if (recordingRequested) entry.recordingLeases++;
     entry.refs++;
     try {
       await waitFor(entry.ready, signal);
     } catch (error) {
-      release(entry);
+      release(entry, recordingRequested);
       if (entry.refs === 0) await entry.done;
       throw error;
     }
@@ -900,7 +906,7 @@ export function createIngressHub(options: IngressOptions): IngressHub {
       release: () => {
         if (!released) {
           released = true;
-          release(entry);
+          release(entry, recordingRequested);
         }
       },
     };

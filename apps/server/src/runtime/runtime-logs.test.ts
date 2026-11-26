@@ -152,6 +152,16 @@ it('preserves individual service-drain failures while redacting their secrets', 
   expect(result).toContain('first-close-failed');
   expect(result).not.toContain('private-token');
 });
+it('redacts named session cookies and credential headers in diagnostic text', () => {
+  const fields = redactLog({
+    stv_next: 'fixture-session-value',
+    cf_clearance: 'fixture-clearance-value',
+    detail: 'Authorization: Basic fixture-basic-value\nCookie: a=one; b=fixture-cookie-value',
+  }) as Record<string, string>;
+  expect(fields.stv_next).toBe('[redacted]');
+  expect(fields.cf_clearance).toBe('[redacted]');
+  expect(fields.detail).toBe('Authorization: [redacted]\nCookie: [redacted]');
+});
 it('persists ordered JSON lines and bounds rotation without discarding current diagnostics', async () => {
   const directory = await mkdtemp(path.join(tmpdir(), 'stv-logs-'));
   try {

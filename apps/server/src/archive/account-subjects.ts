@@ -55,25 +55,23 @@ export class AccountSubjects {
           .run(subject.id);
     }
     if (!syncAccount) return;
-    // Every existing subject belongs to the account membership partition.
-    const previous = await this.db
+    // Subjects without prior membership also belong to the partition. Update only
+    // changed rows so an unchanged roster creates no portable membership writes.
+    const changed = await this.db
       .prepare(
-        'SELECT s.id AS subject FROM subjects s LEFT JOIN account_subjects a ON a.subject=s.id WHERE a.following=1 OR a.subject IS NULL',
+        `WITH desired AS (
+        SELECT s.id,CASE WHEN present.id IS NULL THEN 0 ELSE 1 END AS following
+        FROM subjects s LEFT JOIN json_array_elements_text(?::json) AS present(id) ON present.id=s.id)
+        INSERT INTO account_subjects(subject,following)
+        SELECT d.id,d.following FROM desired d LEFT JOIN account_subjects a ON a.subject=d.id
+        WHERE a.following IS DISTINCT FROM d.following
+        ON CONFLICT(subject) DO UPDATE SET following=excluded.following
+        RETURNING subject,following`,
       )
-      .all<{
-        subject: string;
-      }>();
-    await this.db.exec(
-      'INSERT INTO account_subjects SELECT id,0 FROM subjects ON CONFLICT(subject) DO NOTHING',
-    );
-    const current = new Set(subjects.map((s) => s.id));
-    await this.db.exec('UPDATE account_subjects SET following=0 WHERE following=1');
-    const follow = this.db.prepare(
-      'INSERT INTO account_subjects VALUES(?,1) ON CONFLICT(subject) DO UPDATE SET following=1',
-    );
-    for (const subject of subjects) await follow.run(subject.id);
-    for (const subject of previous)
-      if (!current.has(subject.subject)) await this.disable(subject.subject);
+      .all<{ subject: string; following: number }>(
+        JSON.stringify([...new Set(subjects.map((s) => s.id))]),
+      );
+    for (const member of changed) if (member.following === 0) await this.disable(member.subject);
   }
   async prepare(subjects: SubjectInput[], generation: string): Promise<void> {
     if ((await this.current()) === generation) return;

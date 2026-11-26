@@ -304,6 +304,74 @@ describe('public and one-shot account separation', () => {
     await expect(provider.importList('fixture=one-shot')).rejects.toMatchObject({ status: 403 });
     expect(await provider.status(12)).toBe('OFFLINE');
   });
+  it.each(['favorites', 'favorites/offline'])(
+    'reads every row of short %s pages and merges duplicates across routes',
+    async (route) => {
+      const roster = Array.from({ length: 150 }, (_, index) => ({
+        id: index + 1,
+        username: `fixture-${index + 1}`,
+      }));
+      const offsets: number[] = [];
+      const provider = fixtureProvider(async (input) => {
+        const url = new URL(requestUrl(input));
+        if (url.pathname.includes('initial-dynamic'))
+          return Response.json({
+            initialDynamic: { jwtToken: 'synthetic-token', user: { username: 'owner' } },
+          });
+        if (url.pathname !== `/api/front/models/${route}`)
+          return Response.json({ models: [roster[0]], totalCount: 1 });
+        const offset = Number(url.searchParams.get('offset'));
+        offsets.push(offset);
+        return Response.json({
+          models: roster.slice(offset, offset + 50),
+          totalCount: roster.length,
+        });
+      });
+      try {
+        const subjects = await provider.importList('fixture=synthetic');
+        expect(offsets).toEqual([0, 50, 100]);
+        expect(subjects.map((row) => row.providerId)).toEqual(roster.map((row) => row.id));
+      } finally {
+        provider.sites.close();
+      }
+    },
+  );
+  it.each(['duplicate', 'changed total', 'oversized page', 'empty page', 'page limit'])(
+    'rejects an unverifiable roster (%s)',
+    async (scenario) => {
+      const rows = Array.from({ length: 101 }, (_, index) => ({
+        id: index + 1,
+        username: `fixture-${index + 1}`,
+      }));
+      let pageRequests = 0;
+      const provider = fixtureProvider(async (input) => {
+        const url = new URL(requestUrl(input));
+        if (url.pathname.includes('initial-dynamic'))
+          return Response.json({
+            initialDynamic: { jwtToken: 'synthetic-token', user: { username: 'owner' } },
+          });
+        pageRequests++;
+        if (scenario === 'page limit') {
+          const offset = Number(url.searchParams.get('offset'));
+          return Response.json({ models: rows.slice(offset, offset + 1), totalCount: 102 });
+        }
+        if (scenario === 'oversized page') return Response.json({ models: rows, totalCount: 101 });
+        if (url.searchParams.get('offset') === '0')
+          return Response.json({ models: rows.slice(0, 100), totalCount: 101 });
+        if (scenario === 'empty page') return Response.json({ models: [], totalCount: 101 });
+        if (scenario === 'changed total') return Response.json({ models: [], totalCount: 100 });
+        return Response.json({ models: [rows[0]], totalCount: 101 });
+      });
+      try {
+        await expect(provider.importList('fixture=synthetic')).rejects.toMatchObject({
+          code: 'incomplete-account-list',
+        });
+        if (scenario === 'page limit') expect(pageRequests).toBe(101);
+      } finally {
+        provider.sites.close();
+      }
+    },
+  );
   it('propagates an HTTP error instead of inventing OFFLINE', async () => {
     const provider = fixtureProvider(async () => new Response('', { status: 503 }));
     await expect(provider.status(12)).rejects.toMatchObject({ status: 503 });

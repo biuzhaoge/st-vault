@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { request } from '../../shared/lib/api';
 import { messageFor } from '../../shared/lib/errors';
 import { tr } from '../../shared/lib/i18n';
@@ -30,19 +30,20 @@ export function RuntimeSettingsForm({
   onSaved: (settings: RuntimeSettings) => Promise<void>;
   recording: React.ReactNode;
 }): JSX.Element {
-  const [draft, setDraft] = useState<SettingsDraft>(() => settingsToDraft(settings));
-  const [dirty, setDirty] = useState(false);
+  const [edits, setEdits] = useState<Partial<SettingsDraft>>({});
+  const current = settingsToDraft(settings);
+  const draft = { ...current, ...edits };
+  const dirty = Object.keys(edits).length > 0;
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
 
-  useEffect(() => {
-    if (!dirty) setDraft(settingsToDraft(settings));
-  }, [settings.pollMs, settings.retentionDays, settings.minFreeBytes, dirty]);
-
   function edit(field: keyof SettingsDraft, value: string): void {
-    setDraft((current) => ({ ...current, [field]: value }));
-    setDirty(true);
+    setEdits((previous) => {
+      const next = { ...previous, [field]: value };
+      if (value.trim() !== '' && Number(value) === Number(current[field])) delete next[field];
+      return next;
+    });
     setError('');
     setMessage('');
   }
@@ -53,25 +54,32 @@ export function RuntimeSettingsForm({
     setMessage('');
 
     const pollSeconds = Number(draft.pollSeconds);
-    const pollMsFloat = pollSeconds * 1000;
+    const pollMs = Math.round(pollSeconds * 1000);
     const retentionDays = Number(draft.retentionDays);
     const minFreeGiB = Number(draft.minFreeGiB);
     const minFreeBytesFloat = minFreeGiB * GIB;
     const minFreeBytes = Math.round(minFreeBytesFloat);
     if (
+      draft.pollSeconds.trim() === '' ||
       !Number.isFinite(pollSeconds) ||
-      pollMsFloat < 1000 ||
-      pollMsFloat > 300000 ||
-      !Number.isInteger(pollMsFloat)
+      pollMs < 1000 ||
+      pollMs > 300000 ||
+      pollMs / 1000 !== pollSeconds
     ) {
       setError(tr('轮询间隔须为 1–300 秒，最多精确到毫秒（小数点后三位）。'));
       return;
     }
-    if (!Number.isInteger(retentionDays) || retentionDays < 0 || retentionDays > 3650) {
+    if (
+      draft.retentionDays.trim() === '' ||
+      !Number.isInteger(retentionDays) ||
+      retentionDays < 0 ||
+      retentionDays > 3650
+    ) {
       setError(tr('保留天数须为 0–3650 的整数；0 表示永久保留。'));
       return;
     }
     if (
+      draft.minFreeGiB.trim() === '' ||
       !Number.isFinite(minFreeGiB) ||
       minFreeGiB < 0 ||
       minFreeBytesFloat > SETTINGS_MAX_FREE_BYTES ||
@@ -80,11 +88,11 @@ export function RuntimeSettingsForm({
       setError(tr('最低剩余空间须为 0–1048576 GiB，并换算为整数 Byte。'));
       return;
     }
-    const values: RuntimeSettings = {
-      pollMs: pollMsFloat,
-      retentionDays,
-      minFreeBytes,
-    };
+    const values: Partial<RuntimeSettings> = {};
+    if (edits.pollSeconds !== undefined) values.pollMs = pollMs;
+    if (edits.retentionDays !== undefined) values.retentionDays = retentionDays;
+    if (edits.minFreeGiB !== undefined) values.minFreeBytes = minFreeBytes;
+    if (!dirty) return;
     setSaving(true);
     try {
       const saved = await request<RuntimeSettings>('/api/settings', {
@@ -92,8 +100,7 @@ export function RuntimeSettingsForm({
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(values),
       });
-      setDraft(settingsToDraft(saved));
-      setDirty(false);
+      setEdits({});
       setMessage(tr('设置已保存'));
       void onSaved(saved).catch((cause: unknown) => setError(messageFor(cause)));
     } catch (cause) {
@@ -104,8 +111,7 @@ export function RuntimeSettingsForm({
   }
 
   function resetDraft(): void {
-    setDraft(settingsToDraft(settings));
-    setDirty(false);
+    setEdits({});
     setError('');
     setMessage('');
   }
@@ -124,6 +130,7 @@ export function RuntimeSettingsForm({
           >
             <input
               type="number"
+              required
               min="1"
               max="300"
               step="0.001"
@@ -135,6 +142,7 @@ export function RuntimeSettingsForm({
           <PanelField label={tr('录像保留天数')} hint={tr('0 为永久保留。')}>
             <input
               type="number"
+              required
               min="0"
               max="3650"
               step="1"
@@ -149,9 +157,10 @@ export function RuntimeSettingsForm({
           >
             <input
               type="number"
+              required
               min="0"
               max="1048576"
-              step="0.001"
+              step="any"
               value={draft.minFreeGiB}
               disabled={saving}
               onChange={(event) => edit('minFreeGiB', event.target.value)}

@@ -2,7 +2,7 @@
 
 **简体中文** · [English](api.en.md)
 
-这些接口服务于同仓库工作台，尚未承诺独立公共 API 的版本兼容。请求约束以 [api-schema](../packages/api-schema/src/index.ts) 和对应 HTTP 模块中的 Zod schema 为准。时间均为 UTC epoch 毫秒，ID 使用 `stripchat:<providerId>`；界面按 `/api/session` 返回的 `timeZone`（部署 `TZ`）显示；日历查询允许最多 8 个 UTC 日以覆盖夏令时回拨后的 7 个当地日。
+这些接口服务于同仓库工作台，尚未承诺独立公共 API 的版本兼容。请求约束以 [api-schema](../packages/api-schema/src/index.ts) 和各 HTTP 模块为准。时间均为 UTC epoch 毫秒，ID 使用 `stripchat:<providerId>`。界面按 `/api/session` 返回的 `timeZone`（部署 `TZ`）显示。
 
 除健康、静态资源和本地登录/初始化入口外，业务接口要求管理员会话。管理员可使用 `GET /api/keys/current` 查看当前密钥，使用 `PUT /api/keys/current` 提交 `{name, value}` 添加或更换。修改请求校验 Origin，敏感接口禁用缓存。HTTP 的部署边界见[安全与数据保护](SECURITY.md)。
 
@@ -24,16 +24,20 @@
 
 ## 工作台与媒体
 
-| 接口组 | 入口与契约                                                                                                                |
-| ------ | ------------------------------------------------------------------------------------------------------------------------- |
-| 主播   | `GET /api/subjects`；单主播/批量策略 PATCH；`PUT /api/subjects/recording-default` 保存 `{enabled}` 并应用到全部未归档主播 |
-| 时间线 | `GET /api/workbench` 聚合可见行；单主播 timeline、coverage、recording-bounds                                              |
-| 直播   | `POST /api/subjects/:id/live`；live-progress；会话 manifest/media；DELETE 关闭                                            |
-| 回放   | `POST /api/playback`；会话 seek、close、manifest 和授权媒体读取                                                           |
-| 图片   | preview/avatar JPEG、snapshot-pages、单元 JPEG                                                                            |
-| 历史   | events、events/meta、events/runs、events/read                                                                             |
-| 网络   | network/routes 读取/更新 HLS CDN；network/probe 手动测试 CDN 或登录候选站点                                               |
-| 管理   | system、settings、keys、me/favorites                                                                                      |
+| 接口组 | 入口与契约                                                                                                                         |
+| ------ | ---------------------------------------------------------------------------------------------------------------------------------- |
+| 主播   | `GET /api/subjects`；单主播/批量策略 PATCH；`PUT /api/subjects/recording-default` 保存 `{enabled}` 并应用到全部未归档主播          |
+| 时间线 | `GET /api/workbench` 聚合可见行，`GET /api/archive-calendar` 返回全库空白日期。单主播接口包括 timeline、coverage、recording-bounds |
+| 直播   | `POST /api/subjects/:id/live`；live-progress；会话 manifest/media；DELETE 关闭                                                     |
+| 回放   | `POST /api/playback`；会话 seek、close、manifest 和授权媒体读取                                                                    |
+| 图片   | preview/avatar JPEG、snapshot-pages、单元 JPEG                                                                                     |
+| 历史   | events、events/meta、events/runs、events/read                                                                                      |
+| 网络   | network/routes 读取/更新 HLS CDN；network/probe 手动测试 CDN 或登录候选站点                                                        |
+| 管理   | system、settings、keys、me/favorites                                                                                               |
+
+`GET /api/subjects` 在有连续在线记录时返回可选的 `onlineSinceMs`，表示工作台用于在线排序的、最近一次连续在线的最早观测时间。连续的公开和私密状态属于同一次在线。`lastOnlineAtMs` 仍是最新在线状态区间的起点，供离线和归档排序。
+
+`GET /api/archive-calendar` 返回 `{emptyDays:[{fromMs,toMs}]}`。范围按时间排序，覆盖部署时区里已结束且全库没有可回放录像的完整日期，相邻空白日合并为半开区间。该接口要求管理员会话并禁止缓存。工作台和运行记录允许最多八个 UTC 日的可见时长，录像定位、回放、截图分页与批量操作允许最多九个。超过原始时长上限的请求由服务端用全库空白日期验证可见时长。原始分片列表和单主播独立状态、覆盖接口仍使用各自的原始时间范围上限。
 
 `GET /api/network/routes` 返回可选节点 `cdnHosts`、已选节点 `preferences.cdnHost`、生产者已解析的节点 `activeCdns` 和手动测速状态 `cdnProbe`。保存不同节点后，各直播生产者立即取消旧节点请求并连接新节点。
 
@@ -69,23 +73,29 @@
 
 `GET /api/system` 保留原有健康、磁盘、录制和截图数据，并返回 `capturedAtMs`、`backgroundTasks` 与 `ingress`。任务项包含稳定 `id`、分组 `group`、状态 `state`，以及可选的最近执行/成功/下次调度时间、已处理量、总量、待处理量和失败量。没有总量时不能由客户端推算百分比。`target` 仅用于公开接入点的主机名及延迟，不包含凭据、媒体地址或本地路径。`ingress` 是共享直播入口的当前主播数、保留字节与内存预算。
 
-`deletionJobs` 提供本次状态聚合使用的删除任务列表，格式与 `GET /api/media-deletions` 相同。空数组表示没有任务，`null` 表示列表暂时不可用。客户端可用独立接口恢复读取，或在删除提交的响应丢失时按命令 ID 立即核验。
+`deletionJobs` 与 `GET /api/media-deletions` 返回的任务列表格式相同，包含所有已获名额的在途任务、最多 20 项最早等待名额的任务和最多 20 项最新终态任务。`deletionWaiting` 为等待名额的完整数量。空数组表示没有任务，`null` 表示状态暂时不可用。客户端可用独立接口恢复读取，或在删除提交的响应丢失时按命令 ID 立即核验。
 
 状态读取不启动任务，不扫描整个录像或截图历史。某个观测源失败时保留其他源的结果，该任务以 `task_status_unavailable` 标记；同一失败周期只记录一次诊断及一次恢复事件。浏览器复用统一时钟和 SSE 失效更新，不为状态面板建立额外轮询。具体任务见[后台任务参考](architecture.md#并行与任务调度)。
 
 ## 批量喜欢与删除
 
+`GET /api/media-deletions/:commandId` 按 UUID 查询单条删除回执，需要登录。返回当前任务或已从近期列表裁剪的终态任务，响应结构均为 `MediaDeletionJob`。无可用回执时返回 404 和 `media_deletion_not_found`，读取失败时返回服务错误。查询本身不发起删除。升级前已丢失的历史回执也可能返回 404。
+
 `POST /api/subjects/:id/unit-seen` 接收 `{evidence:[{unitId,toMs}]}`（1–100 项），将该主播可见单元的 `seen_to` 单调推进到已展示边界，并截断至已提交媒体终点，返回 `{changed}`。截图加载成功且首次进入前台截图区的可视范围时，记录界面当时已知的落盘末端。预取和悬浮预览不产生已看记录。已经展示的图片不会因单元增长、封口或元数据刷新而自动追加已看范围，旧请求不能回退边界。`unit_seen_ranges` 经媒体库持久日志保存，不修改喜欢 revision，不参与保留保护。覆盖响应的 `seenSpans` 汇总已看前缀。有已看证据时还返回 `unreadSpans`，汇总未看后缀；空数组表示窗口内没有未看的录像覆盖。两种投影均按桶限制数量，同一桶可以同时包含已看和未看区间。时间线分别绘制两种覆盖，空档保持空白。这些投影仅供显示。客户端使用独立 `seen` 通知刷新时间线，避免重载截图目录；其他客户端沿统一心跳读取。
 
-网页删除统一使用 `POST /api/subjects/:id/deletion-intents`，提交 `{commandId,target}`。`commandId` 为 UUID；target 共同包含 `fromMs,toMs`，并按 kind 指定 `units + unitIds`、`selection + selectionId/patch` 或 `range + mode(all/unliked)/baseSelectionId/patch`。202 表示意图已写入媒体库日志，准备和删除均由后台接手，逻辑隐藏即刻生效。相同键与同一目标返回原任务；不同目标复用键返回409。`GET /api/media-deletions` 同步 preparing/queued/running/retry/completed/failed、phase、scannedUnits、selectedUnits和删除版本，准备中不要求已知总量。见[持久命令](architecture.md#录像单元与前端一致性)。
+网页删除统一使用 `POST /api/subjects/:id/deletion-intents`，提交 `{commandId,target}`。`commandId` 为 UUID；target 共同包含 `fromMs,toMs`，并按 kind 指定 `units + unitIds`、`selection + selectionId/patch` 或 `range + mode(all/unliked)/baseSelectionId/patch`。202 表示意图已写入媒体库日志，准备和删除均由后台接手，逻辑隐藏即刻生效。相同键与同一目标返回原任务；不同目标复用键返回409。`GET /api/media-deletions` 同步 waiting/preparing/queued/running/retry/completed/failed、phase、scannedUnits、selectedUnits和删除版本，等待与准备阶段可以没有已知总量。见[持久命令](architecture.md#录像单元与前端一致性)。
+
+归档为准备和回收保留 64 个在途名额。名额用完时，已确认的请求仍持久入队，返回 202 和 `waiting` 状态。名额释放后按入队顺序自动补位，进程重启后继续处理原任务。遇到归档读取繁忙时，同一任务会退避重试。
+
+`phase=plan` 时，已持久化的清单页可以先回收，`total` 会随清单生成而增加，`processed` 和 `reclaimedBytes` 也可同时推进。已同步确认移除的对象按归档登记字节计入一次，其中包含重启前已移除而尚未确认的对象。任务在清单结束且全部批次确认回收后进入 `completed`。
 
 以下精确集合与计划接口仍可用于程序化检查；网页不再等待其预览或统计：
 
 1. `POST /api/subjects/:id/media-selection`：提交 `{fromMs,toMs,mode}`，mode为 `all`、`unliked` 或 `explicit`；可带baseSelectionId进行并集，及includeUnitIds/excludeUnitIds。后台每批256单元准备冻结集合，返回id、count、personalRevision和deletionRevision。准备取消不会提交修改。
-2. `POST /api/subjects/:id/media-selection/:selectionId/favorites`：提交 `{liked,revision}` 和可选增删例外。持久接纳命令后立即返回；逻辑喜欢投影即时生效，物理标记每批256项整理，重启继续。每个非空接受命令只推进一次revision；count及旧removed字段表示请求目标数，不表示每项都发生物理变化。
+2. `POST /api/subjects/:id/media-selection/:selectionId/favorites` 接收 `{liked,revision}` 和可选增删例外。`liked` 接受布尔值或 `"toggle"`。翻转操作按同一版本确定收藏和取消收藏的两组单元，并在一个事务中接纳。接纳后逻辑收藏即时生效，物理标记每批 256 项整理，重启后继续。每个非空组推进一次 `revision`，`count` 和旧 `removed` 字段报告目标数。
 3. `POST /api/subjects/:id/delete-selection/preview`：提交selectionId或unitIds，两者互斥；冻结完整单元身份，返回影响范围、计划和个人revision；旧ranges HTTP输入明确拒绝。大集合准备也分批让行。
 4. `POST /api/subjects/:id/delete-selection`：提交 `{planId,personalRevision}`，202表示已接纳。逻辑隐藏立即生效，回收后台分批执行；`GET /api/media-deletions`读取进度和重试状态。
-5. 当前页操作仍支持 `POST /api/subjects/:id/unit-favorites/query` 与 `POST /api/subjects/:id/unit-favorites`（unitIds、liked、revision），及 `DELETE /api/me/favorites/:id`。它们消费同一喜欢命令所有者，不绕过逻辑投影。
+5. 明确单元 ID 的操作使用 `POST /api/subjects/:id/unit-favorites/query` 或 `POST /api/subjects/:id/unit-favorites`。写入端点接受 `{unitIds,liked,revision}`，其中 `liked` 同样接受布尔值或 `"toggle"`。`DELETE /api/me/favorites/:id` 也使用同一套收藏命令和逻辑投影。
 
 接受和保留清理在同主播写序列中协调；已接纳喜欢在物理整理之前就保护整个单元，包括后续追加成员。取消喜欢后重新适用保留规则，不立即删除录像。明确确认的手动删除仍可删除喜欢画面；逻辑已删除单元不继续出现在个人喜欢和覆盖摘要中。其他客户端改变个人revision或删除世代时返回409，必须重新确认，不能默默扩大原操作。
 

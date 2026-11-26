@@ -2,11 +2,17 @@ import type { UnitSeenEvidence } from '@st-vault/api-schema';
 import type {
   MediaSelection,
   MediaSelectionMode,
+  FavoriteChange,
   MediaSelectionOptions,
   MediaSelectionPatch,
   MediaSelectionResult,
 } from '@st-vault/api-schema';
-import type { BackgroundTask, MediaDeletionJob, MediaDeletionTarget } from '@st-vault/api-schema';
+import type {
+  BackgroundTask,
+  MediaDeletionJob,
+  MediaDeletionQueue,
+  MediaDeletionTarget,
+} from '@st-vault/api-schema';
 import type {
   AccountSyncConfig,
   AccountSyncResult,
@@ -67,6 +73,8 @@ export type MediaChange =
 export interface ArchivePort {
   /** Background source/maintenance reads must not consume playback execution reserves. */
   withBackgroundReads?<T>(action: () => Promise<T>): Promise<T>;
+  emptyRecordingDays?(at?: number): Promise<MediaTimeRange[]>;
+  pruneEmptyDays?(at: number, from?: number): Promise<number | null>;
   admitDeletion?(
     subjectId: string,
     commandId: string,
@@ -82,7 +90,7 @@ export interface ArchivePort {
   favoriteMediaSelection?(
     subjectId: string,
     selectionId: string,
-    liked: boolean,
+    liked: FavoriteChange,
     revision: number,
     patch: MediaSelectionPatch,
     signal?: AbortSignal,
@@ -95,6 +103,9 @@ export interface ArchivePort {
   ): Promise<MediaDeletePlan>;
   backgroundTasks?(): Promise<BackgroundTask[]>;
   deletionJobs?(): Promise<MediaDeletionJob[]>;
+  deletionInventory?(): Promise<MediaDeletionQueue>;
+  deletionJob?(commandId: string): Promise<MediaDeletionJob | null>;
+  subscribeDeletionComplete?(listener: () => void): () => void;
   resumeDeletions?(): Promise<void>;
   retryDeletions?(): Promise<void>;
   resumeFavorites?(): Promise<void>;
@@ -107,7 +118,7 @@ export interface ArchivePort {
   unitFavorites?(
     subjectId: string,
     unitIds: string[],
-    liked: boolean,
+    liked: FavoriteChange,
     revision: number,
   ): Promise<PersonalTimeline & FavoriteRemovalResult>;
   unitFavoriteQuery?(subjectId: string, unitIds: string[]): Promise<PersonalTimeline>;
@@ -152,7 +163,7 @@ export interface ArchivePort {
   accountActivation(): Promise<string | null>;
   discardAccountPreparation(generation: string): Promise<void>;
   listSubjects(options?: { activity?: false }): Promise<Subject[]>;
-  setGlobalRecording(enabled: boolean): Promise<void>;
+  setGlobalRecording(enabled: boolean): Promise<string[]>;
   getSubject(id: string, options?: { activity?: false }): Promise<Subject | null>;
   setPolicy(
     id: string,
@@ -201,8 +212,19 @@ export interface ArchivePort {
     includeProtection?: boolean,
     signal?: AbortSignal,
   ): Promise<CoverageResponse>;
+  workbenchRow(
+    subjectId: string,
+    fromMs: number,
+    toMs: number,
+    buckets: number,
+    includeProtection: boolean,
+    signal?: AbortSignal,
+  ): Promise<{ coverage: CoverageResponse; status: StatusHistoryResponse }>;
   deleteUnlocated(subjectId: string): Promise<{ deletedSegments: number; reclaimedBytes: number }>;
-  pruneBefore(cutoffMs: number): Promise<{ deletedSegments: number; reclaimedBytes: number }>;
+  pruneBefore(
+    cutoffMs: number,
+    retentionDays?: number,
+  ): Promise<{ deletedSegments: number; reclaimedBytes: number }>;
   scrub?(options?: {
     limit?: number;
     delayMs?: number;

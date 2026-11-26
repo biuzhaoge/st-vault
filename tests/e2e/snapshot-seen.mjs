@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict';
 import { chromium } from 'playwright-core';
+import { snapshotMarks } from './support/snapshot-frame.mjs';
 import { startFixture } from './support/fixture.mjs';
+import { dragRecordedTimeline, showRecordedTimeline } from './support/recorded-timeline.mjs';
 
-const fixture = await startFixture();
+const fixture = await startFixture({ archiveBeforeMidnight: true });
 let browser;
 let releaseImages;
 const gate = new Promise((resolve) => {
@@ -31,11 +33,11 @@ try {
   await page.goto('http://127.0.0.1:10085');
   await page.getByLabel('6 位 PIN', { exact: true }).fill('012345');
   const row = page.locator(`.track-row[data-subject-id="${fixture.info.subjectId}"]`);
-  await row.waitFor();
+  await showRecordedTimeline(page, row, fixture.info);
   const peer = await page.context().newPage();
   await peer.goto('http://127.0.0.1:10085');
   const peerRow = peer.locator(`.track-row[data-subject-id="${fixture.info.subjectId}"]`);
-  await peerRow.waitFor();
+  await showRecordedTimeline(peer, peerRow, fixture.info);
   await page.bringToFront();
   // Timeline hover downloads are deliberately outside screenshot-area evidence.
   const clip = await row.locator('.track-clip').first().boundingBox();
@@ -61,6 +63,9 @@ try {
     content: '.snapshot-grid { transform: translateY(110%) !important; }',
   });
   await page.getByRole('button', { name: '00 演示直播', exact: true }).click();
+  // Opening live returns the directory to today. Select the recorded units on their own date.
+  const recordingLane = await showRecordedTimeline(page, row, fixture.info);
+  await dragRecordedTimeline(page, recordingLane);
   await page.locator('.snapshot-cell').first().waitFor();
   await page.waitForTimeout(300);
   assert.equal(reports.length, 0, 'metadata and pending JPEGs are not seen evidence');
@@ -118,23 +123,30 @@ try {
     );
   }
   await page.unroute('**/snapshot-pages?*');
-  await page.waitForFunction(() => !document.querySelector('.snapshot-favorite')?.disabled);
-  await page.locator('.snapshot-favorite').first().click();
-  const heart = page.locator('.snapshot-favorite[aria-pressed="true"]').first();
-  await heart.waitFor();
+  await page.waitForFunction(
+    () =>
+      document.querySelector('.snapshot-grid button[data-unit-index]')?.dataset.favoriteReady ===
+      'true',
+  );
+  await page
+    .locator('.snapshot-grid button[data-unit-index][data-favorite-ready="true"]')
+    .first()
+    .dblclick();
+  const card = page.locator('.snapshot-grid button[data-unit-index][data-liked="true"]').first();
+  await card.waitFor();
   const favoriteTrack = '.track-clip[data-favorite="true"]';
   const favoriteFocus = page.locator(`.viewer-focus ${favoriteTrack}`);
   await favoriteFocus.waitFor();
   await row.locator(favoriteTrack).waitFor();
-  await page.waitForFunction(() => {
-    const button = document.querySelector('.snapshot-favorite[aria-pressed="true"]');
-    return button && getComputedStyle(button).color === 'rgb(245, 138, 199)';
-  });
+  const heart = (await card.evaluate(snapshotMarks)).favorite;
+  assert.ok(heart, 'The favorite heart is painted');
   assert.equal(
-    await favoriteFocus.evaluate((node) =>
-      getComputedStyle(node).getPropertyValue('--coverage-tint').trim(),
-    ),
-    '#f58ac7',
+    await favoriteFocus
+      .locator('.coverage-base')
+      .first()
+      .evaluate((stop) => getComputedStyle(stop).stopColor),
+    heart.fill,
+    'The favorite timeline interval is painted with the same pink as the heart',
   );
   assert.equal(await page.locator('.track-favorite-range').count(), 0);
   assert.equal(
@@ -147,7 +159,7 @@ try {
   await page.reload();
   await page.locator('.viewer-focus .track-clip[data-seen="true"]').waitFor();
   await favoriteFocus.waitFor();
-  await heart.click();
+  await card.dblclick();
   await favoriteFocus.waitFor({ state: 'detached' });
   await row.locator(favoriteTrack).waitFor({ state: 'detached' });
   assert.deepEqual(errors, []);

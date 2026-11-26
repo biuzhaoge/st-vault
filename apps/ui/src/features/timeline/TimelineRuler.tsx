@@ -5,28 +5,32 @@ import { calendarDivisions, rulerLabels, rulerTicks } from './ruler';
 import { DAY_MS } from './range-control';
 import { formatDateTime } from './timeline';
 import { clockLabel, dayKey } from '../../shared/lib/date-label';
-import { calendarSpan, civilTime } from '../../shared/lib/time';
+import { civilTime } from '../../shared/lib/time';
+import { fullCalendar, type ArchiveCalendar } from './archive-calendar';
 export const TimelineRuler = memo(function TimelineRuler({
   fromMs,
   toMs,
   labelInset = 0,
   overscanMs = 0,
   nowMs = Date.now(),
+  calendar = fullCalendar,
 }: {
   fromMs: number;
   toMs: number;
   labelInset?: number;
   overscanMs?: number;
   nowMs?: number;
+  calendar?: ArchiveCalendar;
 }): JSX.Element {
   useTranslation();
   const root = useRef<HTMLDivElement>(null),
     [width, setWidth] = useState(600);
-  const calendar = calendarSpan(fromMs, toMs) >= DAY_MS;
-  const divisions = calendarDivisions(fromMs, toMs, overscanMs);
-  const hourWidth = (width * 3600000) / (toMs - fromMs);
+  const scale = calendar.scale(fromMs, toMs);
+  const wholeDay = calendar.visibleSpan(fromMs, toMs) >= DAY_MS;
+  const divisions = calendarDivisions(fromMs, toMs, overscanMs, scale);
+  const hourWidth = (width * 3600000) / Math.max(1, scale.duration);
   const step = [1, 2, 3, 6, 12, 24].find((hours) => hours * hourWidth >= 42) ?? 24;
-  const ticks = calendar
+  const ticks = wholeDay
     ? divisions
         .filter(
           (tick) =>
@@ -36,8 +40,8 @@ export const TimelineRuler = memo(function TimelineRuler({
               (tick.position * width >= 22 + labelInset && tick.position * width <= width - 22)),
         )
         .map((tick) => ({ ...tick, label: clockLabel(tick.atMs).slice(0, 5) }))
-    : rulerTicks(fromMs, toMs, width, labelInset, overscanMs);
-  const { dates, hours } = rulerLabels(fromMs, toMs, width, nowMs, ticks, overscanMs);
+    : rulerTicks(fromMs, toMs, width, labelInset, overscanMs, scale);
+  const { dates, hours } = rulerLabels(fromMs, toMs, width, nowMs, ticks, overscanMs, scale);
   useEffect(() => {
     const node = root.current;
     if (!node) return;

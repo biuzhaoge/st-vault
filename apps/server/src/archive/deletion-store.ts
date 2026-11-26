@@ -1,11 +1,30 @@
 import { randomUUID } from 'node:crypto';
 import type { SqlDatabase } from '../database/sql.js';
-import type { MediaDeletionJob, MediaDeletePlan, MediaTimeRange } from '@st-vault/api-schema';
+import type {
+  MediaDeletionJob,
+  MediaDeletionQueue,
+  MediaDeletePlan,
+  MediaTimeRange,
+} from '@st-vault/api-schema';
 export interface PendingDeletion extends MediaDeletionJob {
   segmentIds: string[];
 }
 const columns =
   'id,subject AS "subjectId",state,total,processed,reclaimed AS "reclaimedBytes",from_ms AS "fromMs",to_ms AS "toMs",created AS "createdAtMs",updated AS "updatedAtMs",error';
+const maxActiveDeletions = 64;
+export const deletionBatchSize = 128;
+export const deletionPlanPageSize = 512;
+const reclaimingDeletionStates = "'queued','running','retry'";
+export const activeDeletionStates = `'preparing',${reclaimingDeletionStates}`;
+export const unfinishedDeletionStates = `'waiting',${activeDeletionStates}`;
+export const deletionItemStates = `'waiting',${reclaimingDeletionStates}`;
+/** Skip the residual-footage probe when a confirmed deletion already hides media. */
+export const pendingDeletionSql = `CASE WHEN EXISTS(
+  SELECT 1 FROM media_deletions WHERE subject=? AND state IN (${unfinishedDeletionStates})
+) THEN TRUE ELSE EXISTS(
+  SELECT 1 FROM recording_units u WHERE u.subject=? AND u.deleted=1
+  AND EXISTS(SELECT 1 FROM unit_segments m JOIN segments s ON s.id=m.segment WHERE m.unit=u.id AND s.deleted=0)
+) END`;
 /** Plans are frozen in indexed rows. Neither RPC nor the executor loads the full file set. */
 export class DeletionStore {
   private readonly db: SqlDatabase;
@@ -22,6 +41,7 @@ export class DeletionStore {
       created BIGINT NOT NULL,updated BIGINT NOT NULL,error TEXT,retry_at BIGINT NOT NULL DEFAULT 0,
       attempts BIGINT NOT NULL DEFAULT 0);
       CREATE INDEX IF NOT EXISTS media_deletions_pending ON media_deletions(state,retry_at,created);
+      CREATE INDEX IF NOT EXISTS deletion_waiting_order ON media_deletions(updated,created,id) WHERE state='waiting';
       CREATE TABLE IF NOT EXISTS deletion_plans(job TEXT PRIMARY KEY REFERENCES media_deletions(id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED,
         ranges TEXT NOT NULL,cutoff BIGINT NOT NULL,revision BIGINT NOT NULL,cursor_start BIGINT NOT NULL DEFAULT -1,
         cursor_id TEXT NOT NULL DEFAULT '',ready BIGINT NOT NULL DEFAULT 0,bytes BIGINT NOT NULL DEFAULT 0,liked BIGINT NOT NULL DEFAULT 0);
@@ -38,15 +58,42 @@ export class DeletionStore {
         from_ms BIGINT NOT NULL,to_ms BIGINT NOT NULL,PRIMARY KEY(job,from_ms));
       CREATE OR REPLACE VIEW visible_segments AS SELECT s.* FROM segments s WHERE NOT EXISTS(
         SELECT 1 FROM deletion_items i JOIN media_deletions d ON d.id=i.job
-        WHERE i.segment=s.id AND d.state IN ('queued','running','retry'));
+        WHERE i.segment=s.id AND d.state IN (${deletionItemStates}));
       `);
   }
   /** Run only after the portable journal is replayed, inside its durable transaction. */
   async recover(): Promise<void> {
     await this.db.exec("UPDATE media_deletions SET retry_at=0 WHERE state='preparing'");
     await this.db.exec(
-      "UPDATE media_deletions SET state='queued',retry_at=0 WHERE state IN ('queued','running','retry')",
+      `UPDATE media_deletions SET state='queued',retry_at=0 WHERE state IN (${reclaimingDeletionStates})`,
     );
+    await this.promoteWaiting();
+  }
+  async admissionState(startState: 'preparing' | 'queued'): Promise<'waiting' | typeof startState> {
+    const result = await this.db
+      .prepare(
+        `SELECT
+      EXISTS(SELECT 1 FROM media_deletions WHERE state='waiting') OR
+      (SELECT count(*) FROM media_deletions WHERE state IN (${activeDeletionStates}))>=? AS waiting`,
+      )
+      .get<{ waiting: boolean }>(maxActiveDeletions);
+    return result?.waiting ? 'waiting' : startState;
+  }
+  /** Take the free slots in admission order as part of the same durable transaction. */
+  async promoteWaiting(): Promise<void> {
+    await this.db
+      .prepare(
+        `WITH slots AS (
+        SELECT GREATEST(0,?::bigint-count(*)) AS free
+        FROM media_deletions WHERE state IN (${activeDeletionStates})
+      ), next AS (
+        SELECT id FROM media_deletions WHERE state='waiting'
+        ORDER BY updated,created,id LIMIT (SELECT free FROM slots)
+      ) UPDATE media_deletions d SET state=CASE WHEN EXISTS(
+        SELECT 1 FROM deletion_plans p WHERE p.job=d.id AND p.ready=1
+      ) THEN 'queued' ELSE 'preparing' END,updated=? FROM next WHERE d.id=next.id`,
+      )
+      .run(maxActiveDeletions, Date.now());
   }
   async begin(
     subject: string,
@@ -57,14 +104,6 @@ export class DeletionStore {
   ): Promise<string> {
     if (!(await this.db.prepare('SELECT id FROM subjects WHERE id=?').get(subject)))
       throw Error('SUBJECT_NOT_FOUND');
-    const pending = (await this.db
-      .prepare(
-        "SELECT count(*) n FROM media_deletions WHERE state IN ('preparing','queued','running','retry')",
-      )
-      .get<{
-        n: number;
-      }>())!;
-    if (pending.n >= 64) throw Error('MEDIA_DELETION_QUEUE_FULL');
     const merged: MediaTimeRange[] = [];
     for (const range of [...ranges].sort((a, b) => a.fromMs - b.fromMs)) {
       const last = merged.at(-1);
@@ -162,64 +201,59 @@ export class DeletionStore {
       }>(id);
     if (!p) throw Error('STALE_DELETE_PLAN');
     if (p.ready) return false;
-    const rows = await this.db
+    const admitted = p.state === 'preparing';
+    const limit = admitted ? deletionPlanPageSize : deletionBatchSize;
+    // Use the complete unit bounds, including explicit selections outside the initial range.
+    // Keeping the time/id cursor also lets an older, partly built plan resume unchanged.
+    const result = await this.db
       .prepare(
-        `SELECT s.id,s.start,s."end",s.created_revision,o.bytes,
-      ${p.state === 'preparing' ? '0' : 'CASE WHEN EXISTS(SELECT 1 FROM unit_segments m JOIN effective_unit_favorites f ON f.unit=m.unit WHERE m.segment=s.id) THEN 1 ELSE 0 END'} liked
-      FROM ${p.state === 'preparing' ? 'segments' : 'visible_segments'} s JOIN objects o ON o.id=s.media WHERE s.subject=? AND s.deleted=0
-      AND s.created_revision<=? AND (s.start,s.id)>(?,?) AND EXISTS(
-        SELECT 1 FROM unit_segments m JOIN deletion_units u ON u.unit=m.unit WHERE m.segment=s.id AND u.job=?)
-      ORDER BY s.start,s.id LIMIT 128`,
+        `WITH bounds AS MATERIALIZED (
+        SELECT min(u.start) AS lo,max(u."end") AS hi FROM deletion_units selected
+        JOIN recording_units u ON u.id=selected.unit
+        WHERE selected.job=? AND u."end">=?::bigint
+      ), files AS MATERIALIZED (
+        SELECT s.id,s.start,s."end",o.bytes,
+        ${admitted ? '0' : 'CASE WHEN EXISTS(SELECT 1 FROM effective_unit_favorites f WHERE f.unit=m.unit) THEN 1 ELSE 0 END'} AS liked
+        FROM bounds b JOIN ${admitted ? 'segments' : 'visible_segments'} s
+        ON s.start>=b.lo AND s.start<=b.hi
+        JOIN unit_segments m ON m.segment=s.id
+        JOIN deletion_units selected ON selected.unit=m.unit AND selected.job=?
+        JOIN objects o ON o.id=s.media
+        WHERE s.subject=? AND s.deleted=0 AND s.created_revision<=? AND (s.start,s.id)>(?,?)
+        ORDER BY s.start,s.id LIMIT ?
+      ), added AS (
+        INSERT INTO deletion_items(job,ordinal,segment)
+        SELECT ?,?::bigint+row_number() OVER(ORDER BY start,id),id FROM files RETURNING ordinal
+      ), totals AS MATERIALIZED (
+        SELECT (SELECT count(*) FROM added) AS count,min(start) AS lo,max("end") AS hi,
+        coalesce(sum(bytes),0) AS bytes,coalesce(sum(liked),0) AS liked FROM files
+      ), progress AS (
+        UPDATE media_deletions d SET total=d.total+t.count,from_ms=LEAST(d.from_ms,t.lo),
+        to_ms=GREATEST(d.to_ms,t.hi) FROM totals t WHERE d.id=? AND t.count>0
+      ), last AS (
+        SELECT start,id FROM files ORDER BY start DESC,id DESC LIMIT 1
       )
-      .all<{
-        id: string;
-        start: number;
-        end: number;
-        created_revision: number;
-        bytes: number;
-        liked: number;
-      }>(p.subject, p.cutoff, p.cursor_start, p.cursor_id, id);
-    const ordinal = p.total + rows.length;
-    await this.db
-      .prepare(
-        `INSERT INTO deletion_items(job,ordinal,segment) SELECT ?,ordinal,segment
-       FROM json_to_recordset(?::json) AS candidate(ordinal bigint,segment text)`,
+      UPDATE deletion_plans p SET cursor_start=coalesce((SELECT start FROM last),p.cursor_start),
+      cursor_id=coalesce((SELECT id FROM last),p.cursor_id),bytes=p.bytes+t.bytes,
+      liked=p.liked+t.liked,ready=CASE WHEN t.count<? THEN 1 ELSE 0 END
+      FROM totals t WHERE p.job=? RETURNING p.ready=0 AS more`,
       )
-      .run(
+      .get<{ more: boolean }>(
         id,
-        JSON.stringify(
-          rows.map((row, index) => ({ ordinal: p.total + index + 1, segment: row.id })),
-        ),
+        p.cursor_start,
+        id,
+        p.subject,
+        p.cutoff,
+        p.cursor_start,
+        p.cursor_id,
+        limit,
+        id,
+        p.total,
+        id,
+        limit,
+        id,
       );
-    const last = rows.at(-1);
-    if (last) {
-      await this.db
-        .prepare(
-          'UPDATE media_deletions SET total=?,from_ms=CASE WHEN from_ms IS NULL THEN ? ELSE LEAST(from_ms,?) END,to_ms=CASE WHEN to_ms IS NULL THEN ? ELSE GREATEST(to_ms,?) END WHERE id=?',
-        )
-        .run(
-          ordinal,
-          Math.min(...rows.map((r) => r.start)),
-          Math.min(...rows.map((r) => r.start)),
-          Math.max(...rows.map((r) => r.end)),
-          Math.max(...rows.map((r) => r.end)),
-          id,
-        );
-      await this.db
-        .prepare(
-          'UPDATE deletion_plans SET cursor_start=?,cursor_id=?,bytes=bytes+?,liked=liked+? WHERE job=?',
-        )
-        .run(
-          last.start,
-          last.id,
-          rows.reduce((n, r) => n + r.bytes, 0),
-          rows.reduce((n, r) => n + r.liked, 0),
-          id,
-        );
-    }
-    if (rows.length < 128)
-      await this.db.prepare('UPDATE deletion_plans SET ready=1 WHERE job=?').run(id);
-    return rows.length === 128;
+    return result!.more;
   }
   async plan(id: string): Promise<MediaDeletePlan> {
     const p = await this.db.prepare('SELECT * FROM deletion_plans WHERE job=? AND ready=1').get<{
@@ -257,14 +291,6 @@ export class DeletionStore {
     if (String(d.state) !== 'planned') return d;
     if (revision !== p.revision || revision !== (await this.revision()))
       throw Error('STALE_DELETE_PLAN');
-    const pending = (await this.db
-      .prepare(
-        "SELECT count(*) n FROM media_deletions WHERE state IN ('preparing','queued','running','retry')",
-      )
-      .get<{
-        n: number;
-      }>())!;
-    if (pending.n >= 64) throw Error('MEDIA_DELETION_QUEUE_FULL');
     if (d.createdAtMs < Date.now() - 3600000) throw Error('STALE_DELETE_PLAN');
     // Confirmation holds only this subject's commit queue. Its revision stream has
     // a stable end while other producers continue; each durable step scans 128 keys.
@@ -350,90 +376,114 @@ export class DeletionStore {
         `UPDATE recording_units SET closed=1 WHERE subject=? AND closed=0 AND EXISTS(SELECT 1 FROM deletion_units x WHERE x.job=? AND x.unit=recording_units.id)`,
       )
       .run(subject, id);
+    const state = await this.admissionState('queued');
     await this.db
       .prepare(
-        "UPDATE media_deletions SET state=CASE WHEN total=0 THEN 'completed' ELSE 'queued' END,updated=? WHERE id=?",
+        "UPDATE media_deletions SET state=CASE WHEN total=0 THEN 'completed' ELSE ? END,updated=? WHERE id=?",
       )
-      .run(Date.now(), id);
+      .run(state, Date.now(), id);
     return await this.get(id);
   }
-  async get(id: string): Promise<MediaDeletionJob> {
-    const row = await this.db
+  async find(id: string): Promise<MediaDeletionJob | undefined> {
+    return this.db
       .prepare(`SELECT ${columns} FROM media_deletions WHERE id=?`)
       .get<MediaDeletionJob>(id);
+  }
+  async get(id: string): Promise<MediaDeletionJob> {
+    const row = await this.find(id);
     if (!row) throw Error('MEDIA_DELETION_NOT_FOUND');
     return row;
   }
-  async list(): Promise<MediaDeletionJob[]> {
-    return await this.db
+  async list(): Promise<MediaDeletionQueue> {
+    return (await this.db
       .prepare(
-        `SELECT ${columns} FROM media_deletions WHERE state NOT IN('planned','discarding') ORDER BY (state='completed'),created DESC LIMIT 84`,
+        `WITH recent AS (
+          SELECT * FROM media_deletions WHERE state IN (${activeDeletionStates})
+          UNION ALL
+          (SELECT * FROM media_deletions WHERE state='waiting' ORDER BY updated,created,id LIMIT 20)
+          UNION ALL
+          (SELECT * FROM media_deletions WHERE state IN ('completed','failed') ORDER BY updated DESC,id DESC LIMIT 20)
+        ), jobs AS (SELECT ${columns} FROM recent)
+        SELECT coalesce(json_agg(jobs ORDER BY "createdAtMs" DESC,id DESC),'[]'::json) AS jobs,
+          (SELECT count(*) FROM media_deletions WHERE state='waiting') AS waiting
+        FROM jobs`,
       )
-      .all<MediaDeletionJob>();
+      .get<MediaDeletionQueue>())!;
   }
-  async pending(subject: string): Promise<boolean> {
-    // An active job already determines visibility. Probe residual footage only
-    // when no such job remains, within the same database round trip.
-    const row = await this.db
-      .prepare(
-        `SELECT CASE WHEN EXISTS(
-        SELECT 1 FROM media_deletions WHERE subject=? AND state IN ('preparing','queued','running','retry')
-      ) THEN TRUE ELSE EXISTS(
-        SELECT 1 FROM recording_units u WHERE u.subject=? AND u.deleted=1
-        AND EXISTS(SELECT 1 FROM unit_segments m JOIN segments s ON s.id=m.segment WHERE m.unit=u.id AND s.deleted=0)
-      ) END AS pending`,
-      )
-      .get<{ pending: boolean }>(subject, subject);
-    return row!.pending;
-  }
-  async next(excludedSubjects: readonly string[] = []): Promise<PendingDeletion | null> {
-    const row = await this.db
-      .prepare(
-        `SELECT ${columns} FROM media_deletions d WHERE state IN ('queued','running','retry') AND retry_at<=?
-        AND subject NOT IN(SELECT value FROM json_array_elements_text(?::json) AS busy(value))
+  async next(
+    excludedSubjects: readonly string[] = [],
+    includePreparing = false,
+  ): Promise<PendingDeletion | null> {
+    return (
+      (await this.db
+        .prepare(
+          `WITH candidate AS (
+        SELECT d.*${includePreparing ? ',i.phase,i.scanned AS "scannedUnits"' : ''} FROM media_deletions d
+        ${includePreparing ? 'LEFT JOIN deletion_intents i ON i.job=d.id' : ''}
+        WHERE d.state IN (${includePreparing ? activeDeletionStates : reclaimingDeletionStates}) AND d.retry_at<=?
+        AND d.subject NOT IN(SELECT value FROM json_array_elements_text(?::json) AS busy(value))
         AND NOT EXISTS(SELECT 1 FROM media_deletions older WHERE older.subject=d.subject
-          AND older.state IN ('preparing','queued','running','retry') AND (older.created,older.id)<(d.created,d.id))
-        ORDER BY updated,id LIMIT 1 FOR UPDATE SKIP LOCKED`,
+          AND older.state IN (${activeDeletionStates}) AND (older.created,older.id)<(d.created,d.id))
+        ORDER BY d.updated,d.created,d.id LIMIT 1
       )
-      .get<MediaDeletionJob>(Date.now(), JSON.stringify(excludedSubjects));
-    if (!row) return null;
-    await this.db
-      .prepare("UPDATE media_deletions SET state='running',updated=? WHERE id=?")
-      .run(Date.now(), row.id);
-    const ids = await this.db
-      .prepare(
-        'SELECT segment FROM deletion_items WHERE job=? AND ordinal>? ORDER BY ordinal LIMIT 128',
-      )
-      .all<{
-        segment: string;
-      }>(row.id, row.processed);
-    return { ...row, state: 'running', segmentIds: ids.map((r) => r.segment) };
+      SELECT ${columns}${includePreparing ? ',phase,"scannedUnits"' : ''},coalesce((
+        SELECT json_agg(batch.segment ORDER BY batch.ordinal) FROM (
+          SELECT segment,ordinal FROM deletion_items WHERE job=candidate.id
+          AND ordinal>candidate.processed ORDER BY ordinal LIMIT ?
+        ) batch
+      ),'[]'::json) AS "segmentIds" FROM candidate`,
+        )
+        .get<PendingDeletion>(Date.now(), JSON.stringify(excludedSubjects), deletionBatchSize)) ??
+      null
+    );
   }
-  async advance(id: string, processed: number, reclaimed: number): Promise<MediaDeletionJob> {
+  async advance(
+    id: string,
+    processed: number,
+    reclaimed: number,
+    gcObjectIds: readonly string[] = [],
+  ): Promise<MediaDeletionJob> {
+    // Count each object once, including files absent after an interrupted unlink.
+    // This write and the job cursor commit in the same portable transaction.
+    const reclaimedBytes = gcObjectIds.length
+      ? (await this.db
+          .prepare(
+            `WITH acknowledged AS (
+              UPDATE objects SET gc_done=1 WHERE subject=(SELECT subject FROM media_deletions WHERE id=?)
+              AND deleted=1 AND gc_done=0
+              AND id IN(SELECT value FROM json_array_elements_text(?::json)) RETURNING bytes
+            ) SELECT coalesce(sum(bytes),0)::bigint AS bytes FROM acknowledged`,
+          )
+          .get<{ bytes: number }>(id, JSON.stringify(gcObjectIds)))!.bytes
+      : reclaimed;
     await this.db
       .prepare(
-        "UPDATE media_deletions SET processed=?,reclaimed=reclaimed+?,state=CASE WHEN ?>=total THEN 'completed' ELSE 'queued' END,updated=?,error=NULL,retry_at=0 WHERE id=?",
+        `UPDATE media_deletions SET processed=?,reclaimed=reclaimed+?,
+        state=CASE WHEN state='preparing' THEN state WHEN ?>=total THEN 'completed' ELSE 'running' END,
+        updated=?,error=NULL,retry_at=0 WHERE id=?`,
       )
-      .run(processed, reclaimed, processed, Date.now(), id);
+      .run(processed, reclaimedBytes, processed, Date.now(), id);
     const result = await this.get(id);
     // Already-checkpointed IDs no longer participate in visibility or recovery.
     await this.db
       .prepare('DELETE FROM deletion_items WHERE job=? AND ordinal<=?')
       .run(id, processed);
+    if (result.state === 'completed') await this.promoteWaiting();
     return result;
   }
-  async cleanup(): Promise<boolean> {
+  async cleanup(beforeDiscard?: (id: string) => Promise<void>): Promise<boolean> {
     const row = await this.db
       .prepare(
         `SELECT id FROM media_deletions WHERE state='discarding'
       OR (state='planned' AND (created<? OR id NOT IN(SELECT id FROM media_deletions WHERE state='planned' ORDER BY created DESC LIMIT 8)))
-      OR (state IN ('completed','failed') AND id NOT IN(SELECT id FROM media_deletions WHERE state IN ('completed','failed') ORDER BY updated DESC LIMIT 20))
+      OR (state IN ('completed','failed') AND id NOT IN(SELECT id FROM media_deletions WHERE state IN ('completed','failed') ORDER BY updated DESC,id DESC LIMIT 20))
       ORDER BY created,id LIMIT 1`,
       )
       .get<{
         id: string;
       }>(Date.now() - 3600000);
     if (!row) return false;
+    await beforeDiscard?.(row.id);
     await this.db.prepare("UPDATE media_deletions SET state='discarding' WHERE id=?").run(row.id);
     for (const [table, key] of [
       ['deletion_items', 'ordinal'],
@@ -460,7 +510,9 @@ export class DeletionStore {
   async retry(id: string): Promise<void> {
     await this.db
       .prepare(
-        "UPDATE media_deletions SET state='retry',error='storage_unavailable',retry_at=?::bigint+LEAST(300000::bigint,30000::bigint*(1::bigint<<LEAST(attempts,4)::integer)),updated=?,attempts=attempts+1 WHERE id=?",
+        `UPDATE media_deletions SET state=CASE WHEN state='preparing' THEN state ELSE 'retry' END,
+        error='storage_unavailable',retry_at=?::bigint+LEAST(300000::bigint,30000::bigint*(1::bigint<<LEAST(attempts,4)::integer)),
+        updated=?,attempts=attempts+1 WHERE id=? AND state IN (${activeDeletionStates})`,
       )
       .run(Date.now(), Date.now(), id);
   }

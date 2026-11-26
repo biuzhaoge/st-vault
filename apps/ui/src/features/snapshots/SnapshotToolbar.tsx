@@ -2,6 +2,7 @@ import { Icon } from '../../design/Icon';
 import { tr } from '../../shared/lib/i18n';
 import { OverflowText } from '../../shared/ui/OverflowText';
 import { ProgressRing } from '../../shared/ui/ProgressRing';
+import { SnapshotToolbarSurface } from './SnapshotToolbarSurface';
 
 export interface SnapshotToolbarProps {
   total: number;
@@ -15,18 +16,28 @@ export interface SnapshotToolbarProps {
   onNext: () => void;
   onUnlike: () => void;
   onDelete: () => void;
+  selection?: {
+    count: number;
+    onClear?: () => void;
+  };
 }
 
 export function SnapshotToolbar(props: SnapshotToolbarProps): JSX.Element {
-  const paginated = !props.live && props.pages > 1 && props.pageIndex >= 0;
+  const selection = props.selection;
+  const paginated = !selection && !props.live && props.pages > 1 && props.pageIndex >= 0;
+  const status = props.status;
   return (
-    <nav className="snapshot-pages" aria-label={tr('截图工具')} aria-busy={props.busy}>
+    <SnapshotToolbarSurface selecting={!!selection} busy={props.busy} label={tr('截图工具')}>
       <span
         className="snapshot-total"
-        style={{ minWidth: `max(36px, ${String(props.total).length + 3}ch)` }}
-        title={tr('{{v0}} 张', { v0: props.total })}
+        style={{
+          minWidth: `max(36px, ${selection ? String(selection.count).length + 5 : String(props.total).length + 3}ch)`,
+        }}
+        title={selection ? undefined : tr('{{v0}} 张', { v0: props.total })}
       >
-        {tr('{{v0}} 张', { v0: props.total, context: 'compact' })}
+        {selection
+          ? tr('已选 {{v0}} 项', { v0: selection.count })
+          : tr('{{v0}} 张', { v0: props.total, context: 'compact' })}
       </span>
       {paginated && (
         <button
@@ -56,34 +67,43 @@ export function SnapshotToolbar(props: SnapshotToolbarProps): JSX.Element {
           <Icon name="chevron-left" />
         </button>
       )}
-      <div className="snapshot-actions">
-        {(
-          [
-            ['取消所有喜欢', 'heart-off', props.onUnlike],
-            ['删除所有非喜欢', 'trash', props.onDelete],
-          ] as const
-        ).map(([label, icon, onClick]) => (
-          <button
-            key={label}
-            aria-label={tr(label)}
-            disabled={props.busy || !props.connected || !props.total}
-            onClick={onClick}
-          >
-            <Icon name={icon} />
-            <span>{tr(label, { context: 'compact' })}</span>
-          </button>
-        ))}
-      </div>
-      {(props.busy || props.status) && (
+      {(!selection || selection.onClear) && (
+        <div className="snapshot-actions">
+          {selection ? (
+            <button aria-label={tr('清除选择')} onClick={selection.onClear}>
+              <Icon name="close" />
+              <span>{tr('清除选择')}</span>
+            </button>
+          ) : (
+            (
+              [
+                ['取消所有喜欢', 'heart-off', props.onUnlike],
+                ['删除所有非喜欢', 'trash', props.onDelete],
+              ] as const
+            ).map(([label, icon, onClick]) => (
+              <button
+                key={label}
+                aria-label={tr(label)}
+                disabled={props.busy || !props.connected || !props.total}
+                onClick={onClick}
+              >
+                <Icon name={icon} />
+                <span>{tr(label, { context: 'compact' })}</span>
+              </button>
+            ))
+          )}
+        </div>
+      )}
+      {(props.busy || status) && (
         <span
           className="snapshot-operation-status"
           role="status"
-          aria-label={props.busy && !props.status ? tr('处理中…') : undefined}
+          aria-label={props.busy && !status ? tr('处理中…') : undefined}
         >
           {props.busy && <ProgressRing />}
-          {props.status && <OverflowText text={props.status} tooltip={false} />}
+          {status && <OverflowText text={status} tooltip={false} />}
         </span>
       )}
-    </nav>
+    </SnapshotToolbarSurface>
   );
 }

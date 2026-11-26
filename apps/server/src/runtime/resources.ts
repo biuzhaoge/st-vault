@@ -5,6 +5,22 @@ import type { ArchivePort } from '../ports.js';
 import type { RuntimeSettings } from './settings.js';
 import type { SyncClock } from './sync-clock.js';
 import type { BackgroundTask } from '@st-vault/api-schema';
+import { EMPTY_DAY_SETTLE_MS } from '../archive/calendar-window.js';
+import { deploymentTimeZone } from './time-zone.js';
+
+/** Wake for a local date change if it comes before the hourly review. */
+function nextEmptyDayCheck(calendar: Intl.DateTimeFormat, now: number): number {
+  let from = now - EMPTY_DAY_SETTLE_MS;
+  let until = from + 3600000;
+  const day = calendar.format(from);
+  if (calendar.format(until) === day) return until + EMPTY_DAY_SETTLE_MS;
+  while (until - from > 1) {
+    const middle = Math.floor((from + until) / 2);
+    if (calendar.format(middle) === day) from = middle;
+    else until = middle;
+  }
+  return until + EMPTY_DAY_SETTLE_MS;
+}
 
 export interface DiskState {
   freeBytes: number;
@@ -18,7 +34,11 @@ interface ResourceOptions {
   root: string;
   dataRoot?: string;
   databaseRoot?: string;
-  archive: Pick<ArchivePort, 'pruneBefore' | 'scrub'>;
+  archive: Pick<
+    ArchivePort,
+    'pruneBefore' | 'scrub' | 'pruneEmptyDays' | 'subscribeDeletionComplete'
+  >;
+  cleanEmptyDays?: boolean;
   settings: () => RuntimeSettings;
   changed?: () => void;
   readDisk?: (root: string) => Promise<{ freeBytes: number; totalBytes: number }>;
@@ -38,6 +58,7 @@ export class ResourceMonitor {
   private diskPending: Promise<void> | undefined;
   private closed = false;
   private detachClock?: () => void;
+  private detachDeletion?: () => void;
   private lastPrune = 0;
   private pruneError: string | null = null;
   private integrityError: string | null = null;
@@ -50,7 +71,23 @@ export class ResourceMonitor {
   private pruneSuccess: number | null = null;
   private scrubSuccess: number | null = null;
   private checkedFiles = 0;
+  private readonly emptyDayCalendar = new Intl.DateTimeFormat('en-CA', {
+    timeZone: deploymentTimeZone(),
+    dateStyle: 'short',
+  });
+  private emptyDayCursor: number | undefined;
+  private emptyDayNext = 0;
+  private emptyDayLast: number | null = null;
+  private emptyDaySuccess: number | null = null;
+  private emptyDayError: string | null = null;
+  private emptyDayRunning = false;
+  private emptyDayRequested = false;
   constructor(private readonly options: ResourceOptions) {}
+  private nextEmptyDayRun(now: number): number {
+    if (this.emptyDayRequested && this.emptyDayCursor === undefined && !this.emptyDayError)
+      return now;
+    return this.emptyDayNext;
+  }
   backgroundTasks(): BackgroundTask[] {
     const disk = this.get(),
       retention = this.options.settings().retentionDays > 0,
@@ -112,6 +149,25 @@ export class ResourceMonitor {
         detail: 'checked-files',
         error: this.integrityError,
       },
+      ...(this.options.cleanEmptyDays && this.options.archive.pruneEmptyDays
+        ? ([
+            {
+              id: 'empty-day-cleanup',
+              group: 'protection',
+              state: this.emptyDayRunning
+                ? 'running'
+                : disk.error
+                  ? 'paused'
+                  : this.emptyDayError
+                    ? 'retrying'
+                    : 'waiting',
+              lastRunAtMs: this.emptyDayLast,
+              lastSuccessAtMs: this.emptyDaySuccess,
+              nextRunAtMs: disk.error ? null : Math.max(now, this.nextEmptyDayRun(now)),
+              error: this.emptyDayError,
+            },
+          ] satisfies BackgroundTask[])
+        : []),
     ];
   }
   get(): DiskState {
@@ -232,12 +288,41 @@ export class ResourceMonitor {
     if (settings.retentionDays > 0 && now - this.lastPrune >= 60000)
       await this.prune(now, settings.retentionDays);
     if (now - this.lastScrub >= 60000) await this.scrub(now);
+    if (
+      this.options.cleanEmptyDays &&
+      this.options.archive.pruneEmptyDays &&
+      now >= this.nextEmptyDayRun(now)
+    ) {
+      // The completed deletion may have emptied a date before the current scan cursor.
+      if (this.emptyDayRequested) {
+        this.emptyDayCursor = undefined;
+        this.emptyDayRequested = false;
+      }
+      this.emptyDayRunning = true;
+      this.emptyDayLast = now;
+      try {
+        this.emptyDayCursor =
+          (await this.options.archive.pruneEmptyDays(now, this.emptyDayCursor)) ?? undefined;
+        this.emptyDayNext =
+          this.emptyDayCursor === undefined
+            ? nextEmptyDayCheck(this.emptyDayCalendar, now)
+            : now + 5000;
+        this.emptyDaySuccess = this.options.now?.() ?? Date.now();
+        this.emptyDayError = null;
+      } catch (error) {
+        this.emptyDayNext = now + 60000;
+        this.emptyDayError = 'empty_day_cleanup_failed';
+        console.warn('empty_day_cleanup_failed', error);
+      } finally {
+        this.emptyDayRunning = false;
+      }
+    }
   }
   private prune(now: number, days: number): Promise<void> {
     if (this.pruning) return this.pruning;
     this.lastPrune = now;
     this.pruning = Promise.resolve()
-      .then(() => this.options.archive.pruneBefore(Math.max(0, now - days * 86400000)))
+      .then(() => this.options.archive.pruneBefore(Math.max(0, now - days * 86400000), days))
       .then(() => {
         this.pruneError = null;
         this.pruneSuccess = this.options.now?.() ?? Date.now();
@@ -271,6 +356,11 @@ export class ResourceMonitor {
     return this.scrubbing;
   }
   start(): void {
+    if (this.closed) return;
+    if (this.options.cleanEmptyDays && this.options.archive.pruneEmptyDays)
+      this.detachDeletion ??= this.options.archive.subscribeDeletionComplete?.(() => {
+        this.emptyDayRequested = true;
+      });
     if (this.options.clock) {
       this.detachClock ??= this.options.clock.subscribe('resources', () => this.check());
       return;
@@ -282,10 +372,12 @@ export class ResourceMonitor {
       }, 15000);
       this.timer.unref();
     };
-    if (!this.timer && !this.closed) schedule();
+    if (!this.timer) schedule();
   }
   async close(): Promise<void> {
     this.closed = true;
+    this.detachDeletion?.();
+    this.detachDeletion = undefined;
     this.detachClock?.();
     if (this.timer) clearTimeout(this.timer);
     await Promise.all([this.pending, this.diskPending, this.pruning, this.scrubbing]);

@@ -161,6 +161,7 @@ try {
     dataRoot: root,
     databaseRoot: existsSync(databaseRoot) ? databaseRoot : undefined,
     archive,
+    cleanEmptyDays: process.env.STV_CLEAN_EMPTY_DAYS !== '0',
     settings: settings.get,
     changed: () => {
       if (supervisor) runBackground(supervisor.reconcile(), 'storage_reconcile_failed');

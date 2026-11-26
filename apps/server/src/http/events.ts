@@ -1,8 +1,14 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import type { ArchivePort } from '../ports.js';
+import {
+  archiveWindows,
+  WORKBENCH_WINDOW_MS,
+  type CalendarArchive,
+} from '../archive/calendar-window.js';
 
-type EventsArchive = Pick<ArchivePort, 'events' | 'eventMeta' | 'ackEvents' | 'runHistory'>;
+type EventsArchive = Pick<ArchivePort, 'events' | 'eventMeta' | 'ackEvents' | 'runHistory'> &
+  CalendarArchive;
 const cursor = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 /** Requires the app's normal authenticated API hook; never accepts event creation from HTTP. */
 export function registerEvents(app: FastifyInstance, archive: EventsArchive): void {
@@ -17,8 +23,8 @@ export function registerEvents(app: FastifyInstance, archive: EventsArchive): vo
         to: z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER),
       })
       .strict()
-      .refine((value) => value.to > value.from && value.to - value.from <= 8 * 86400000)
       .parse(request.query);
+    await archiveWindows(archive, query.from, query.to, WORKBENCH_WINDOW_MS);
     reply.header('cache-control', 'private, no-store');
     return archive.runHistory(query.from, query.to);
   });

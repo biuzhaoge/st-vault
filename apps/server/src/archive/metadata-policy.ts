@@ -1,5 +1,6 @@
 /** Shared by admission and the worker: writes cannot accidentally enter a read lane. */
 export const metadataMutations = new Set([
+  'pruneEmptyHistory',
   'markUnitsSeen',
   'prepareAccountSubjects',
   'activateAccountSubjects',
@@ -18,7 +19,6 @@ export const metadataMutations = new Set([
   'admitDeletionIntent',
   'prepareDeletionIntent',
   'retryDeletionIntent',
-  'nextMediaDeletion',
   'advanceMediaDeletion',
   'retryMediaDeletion',
   'expediteMediaDeletions',
@@ -33,6 +33,7 @@ export const metadataMutations = new Set([
   'stopRun',
   'settingSet',
   'apply',
+  'applyQueuedDeletion',
   'beginSession',
   'verified',
   'gcDone',
@@ -41,15 +42,16 @@ export const metadataMutations = new Set([
 /** Resumable steps may yield between durable barriers. Admission and recording
  * commits remain foreground; per-subject command order is owned by their stores. */
 export const metadataBackgroundMutations = new Set([
+  'pruneEmptyHistory',
   'buildRecordingUnits',
   'selectionMaintenance',
   'materializeFavorites',
   'prepareDeletionIntent',
   'retryDeletionIntent',
-  'nextMediaDeletion',
   'advanceMediaDeletion',
   'retryMediaDeletion',
   'expediteMediaDeletions',
+  'applyQueuedDeletion',
   'gcDone',
 ]);
 
@@ -82,6 +84,7 @@ export const metadataStatementReads = new Set([
 
 const playbackReads = new Set(['hasMedia', 'locate', 'media', 'unitSource', 'unitRange']);
 const ordinaryReads = new Set([
+  'emptyRecordingDays',
   'list',
   'findSubject',
   'subjectPreview',
@@ -94,6 +97,7 @@ const ordinaryReads = new Set([
   'statusHistory',
   'timeline',
   'coverage',
+  'workbenchRow',
   'snapshotPages',
   'snapshotUnit',
   'snapshotForSegment',
@@ -102,12 +106,14 @@ const ordinaryReads = new Set([
   'unitFavoriteQuery',
   'storageStatus',
   'unitIndexStatus',
-  'mediaDeletionJobs',
-  'pendingDeletionIntent',
+  'mediaDeletionInventory',
+  'mediaDeletionJob',
+  'nextMediaDeletion',
   'knownObjects',
   'acceptedMediaDeletion',
   'mediaSelection',
   'deletionPlan',
+  'deleteBatch',
   'prepareSnapshotLayout',
   'accountActivation',
   'favoriteMaterializationStatus',

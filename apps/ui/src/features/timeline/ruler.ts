@@ -1,6 +1,7 @@
 import { civilTime, fromCivilTime, slotTime } from '../../shared/lib/time';
 import { dayKey, dayLabel, clockLabel } from '../../shared/lib/date-label';
 import { tr } from '../../shared/lib/i18n';
+import { fullCalendar } from './archive-calendar';
 const MINUTE = 60000,
   HOUR = 60 * MINUTE,
   DAY = 24 * HOUR;
@@ -13,13 +14,16 @@ export function calendarDivisions(
   from: number,
   to: number,
   overscan = 0,
+  scale = fullCalendar.scale(from, to),
 ): { atMs: number; position: number; level: 'day' | 'half-day' | 'hour' }[] {
-  if (!(to > from) || !Number.isFinite(to - from)) return [];
+  if (!(scale.duration > 0) || !Number.isFinite(scale.duration)) return [];
   const result: ReturnType<typeof calendarDivisions> = [];
   let atMs = from - overscan;
   // Actual-time traversal retains repeated DST hours; local rounding also
   // handles half-hour transitions without drawing a false whole-hour tick.
   for (let attempts = 0; atMs <= to + overscan && attempts < 1000; attempts++) {
+    atMs = scale.nextVisible(atMs);
+    if (atMs > to + overscan) break;
     const local = civilTime(atMs);
     const remainder = ((local % HOUR) + HOUR) % HOUR;
     if (remainder) {
@@ -29,7 +33,7 @@ export function calendarDivisions(
     const hour = ((local % DAY) + DAY) % DAY;
     result.push({
       atMs,
-      position: (atMs - from) / (to - from),
+      position: scale.position(atMs),
       level: hour === 0 ? 'day' : hour === 12 * HOUR ? 'half-day' : 'hour',
     });
     atMs += HOUR;
@@ -41,16 +45,26 @@ export function rulerDays(
   from: number,
   to: number,
   overscan = 0,
+  scale = fullCalendar.scale(from, to),
 ): { atMs: number; position: number; width: number; half: 'am' | 'pm' | null }[] {
-  if (!(to > from) || !Number.isFinite(to - from)) return [];
+  if (!(scale.duration > 0) || !Number.isFinite(scale.duration)) return [];
   const result: ReturnType<typeof rulerDays> = [];
-  for (let day = Math.floor(civilTime(from - overscan) / DAY); result.length < 100; day++) {
+  const first = Math.floor(civilTime(from - overscan) / DAY);
+  for (let day = first, attempts = 0; attempts < 100; day++, attempts++) {
     const atMs = slotTime(day * 2),
       noon = slotTime(day * 2 + 1),
       end = slotTime((day + 1) * 2);
     if (atMs >= to + overscan) break;
+    const next = scale.nextVisible(atMs);
+    if (next > atMs) {
+      day = Math.max(day, Math.floor(civilTime(next) / DAY) - 1);
+      continue;
+    }
     const visibleFrom = atMs < to && end > from ? Math.max(atMs, from) : atMs;
     const visibleTo = atMs < to && end > from ? Math.min(end, to) : end;
+    const left = scale.position(visibleFrom),
+      right = scale.position(visibleTo);
+    if (right <= left) continue;
     result.push({
       atMs,
       half:
@@ -59,8 +73,8 @@ export function rulerDays(
           : visibleFrom === noon && visibleTo === end
             ? 'pm'
             : null,
-      position: ((visibleFrom + visibleTo) / 2 - from) / (to - from),
-      width: (visibleTo - visibleFrom) / (to - from),
+      position: (left + right) / 2,
+      width: right - left,
     });
   }
   return result;
@@ -77,11 +91,12 @@ export function rulerLabels(
   now: number,
   ticks: RulerTick[],
   overscan = 0,
+  scale = fullCalendar.scale(from, to),
 ) {
   const estimate = (label: string, size: number): number =>
     [...label].reduce((sum, char) => sum + (/^[\x00-\x7F]$/.test(char) ? size * 0.65 : size), 0);
   const gap = 3;
-  const dates = rulerDays(from, to, overscan).flatMap((day) => {
+  const dates = rulerDays(from, to, overscan, scale).flatMap((day) => {
     const available = day.width * width - gap;
     if (available < 34) return [];
     const full = dayLabel(day.atMs, now);
@@ -122,9 +137,10 @@ export function rulerTicks(
   width: number,
   labelInset = 0,
   overscanMs = 0,
+  scale = fullCalendar.scale(from, to),
 ): RulerTick[] {
-  if (!(to > from) || !Number.isFinite(width) || width < 45) return [];
-  const duration = to - from,
+  if (!(scale.duration > 0) || !Number.isFinite(width) || width < 45) return [];
+  const duration = scale.duration,
     crossesDay = dayKey(from) !== dayKey(to);
   const daily = duration >= 3 * DAY,
     monthly = duration >= 90 * DAY,
@@ -181,15 +197,14 @@ export function rulerTicks(
       month = Date.UTC(current.getUTCFullYear(), current.getUTCMonth() + 1, 1);
     }
   } else if (step >= DAY) {
-    for (
-      let local = Math.ceil(civilTime(from - overscanMs) / step) * step;
-      fromCivilTime(local) <= to + overscanMs && candidates.length < 100;
-      local += step
-    )
-      candidates.push(fromCivilTime(local));
+    const dates = rulerDays(from, to, overscanMs, scale);
+    const stride = Math.max(1, Math.round(step / DAY));
+    candidates.push(
+      ...dates.filter((_date, index) => index % stride === 0).map((date) => date.atMs),
+    );
   } else if (step >= HOUR) {
     candidates.push(
-      ...calendarDivisions(from, to, overscanMs)
+      ...calendarDivisions(from, to, overscanMs, scale)
         .filter((tick) => (((civilTime(tick.atMs) % DAY) + DAY) % DAY) % step === 0)
         .map((tick) => tick.atMs),
     );
@@ -197,10 +212,14 @@ export function rulerTicks(
     const start = from - overscanMs;
     let next = fromCivilTime(Math.ceil(civilTime(start) / step) * step);
     while (next < start) next += step;
-    for (; next <= to + overscanMs && candidates.length < 100; next += step) candidates.push(next);
+    for (; next <= to + overscanMs && candidates.length < 100; next += step) {
+      next = scale.nextVisible(next);
+      if (next <= to + overscanMs) candidates.push(next);
+    }
   }
   for (const next of candidates) {
-    const position = (next - from) / duration;
+    if (next < from - overscanMs || next > to + overscanMs || scale.hidden(next)) continue;
+    const position = scale.position(next);
     if (
       (position >= inset + labelInset / width && position <= 1 - inset) ||
       position < 0 ||
@@ -219,7 +238,7 @@ export function rulerTicks(
       });
   }
   if (!ticks.length) {
-    const atMs = Math.round((from + to) / 2);
+    const atMs = Math.round(scale.at(0.5));
     ticks.push({
       atMs,
       label: daily

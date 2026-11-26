@@ -1041,6 +1041,7 @@ it('reports a domain mismatch distinctly and preserves existing subjects on fail
 
 it.each([
   [new ProviderError('upstream-request'), 'account_network_unavailable', false],
+  [new ProviderError('incomplete-account-list'), 'list_import_failed', false],
   [new ProviderError('request-deadline'), 'account_sync_timeout', false],
   [
     new ProviderError('upstream-http', 403, false, undefined, true),

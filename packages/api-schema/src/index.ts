@@ -1,5 +1,15 @@
-import { z } from 'zod';
+import type { AccountSyncConfig } from './validation.js';
+import type { MediaTimeRange, SnapshotCell } from './recording-layout.js';
+export {
+  accountSyncConfigSchema,
+  playbackSchema,
+  policySchema,
+  subjectIdSchema,
+  timelineSchema,
+  type AccountSyncConfig,
+} from './validation.js';
 export { recordingLayout, recordingDisplayEnd } from './recording-layout.js';
+export type { MediaTimeRange, SnapshotCell };
 export { maxTimelineSubjectIds, syncTopics, type SyncChange, type SyncTopic } from './sync.js';
 
 /** Read-only task snapshots; absent totals are intentionally indeterminate. */
@@ -187,6 +197,8 @@ export interface Subject {
   lastRecordedAtMs?: number | null;
   /** Start of the most recent confirmed PUBLIC or PRIVATE interval. */
   lastOnlineAtMs?: number | null;
+  /** Earliest observation in the latest continuous online session shown in the directory. */
+  onlineSinceMs?: number;
   captureState?: CaptureState;
   captureError?: string | null;
   lastCapturedAtMs?: number | null;
@@ -289,10 +301,6 @@ export interface FavoriteRange {
   fromMs: number;
   toMs: number;
 }
-export interface MediaTimeRange {
-  fromMs: number;
-  toMs: number;
-}
 /** Request payload bound for unit IDs, independent of the number of video files. */
 export const MAX_SNAPSHOT_SELECTION = 100000;
 export interface FavoriteRemovalResult {
@@ -369,6 +377,7 @@ export interface MediaSelectionPatch {
   excludeUnitIds?: string[];
 }
 export type MediaSelectionMode = 'unliked' | 'all' | 'explicit';
+export type FavoriteChange = boolean | 'toggle';
 export interface MediaSelectionOptions extends MediaSelectionPatch {
   baseSelectionId?: string;
 }
@@ -376,15 +385,6 @@ export interface MediaSelectionResult {
   subjectId: string;
   revision: number;
   count: number;
-}
-export interface SnapshotCell {
-  index: number;
-  kind: 'unit' | 'gap' | 'pending';
-  fromMs: number;
-  toMs: number;
-  unitId?: string;
-  part?: number;
-  parts?: number;
 }
 export interface SnapshotSession {
   selectionFromMs?: number;
@@ -440,7 +440,7 @@ export interface AccountProfile {
 export interface MediaDeletionJob {
   id: string;
   subjectId: string;
-  state: 'preparing' | 'queued' | 'running' | 'retry' | 'completed' | 'failed';
+  state: 'waiting' | 'preparing' | 'queued' | 'running' | 'retry' | 'completed' | 'failed';
   phase?: 'units' | 'extras' | 'plan' | 'delete';
   scannedUnits?: number;
   selectedUnits?: number;
@@ -453,6 +453,10 @@ export interface MediaDeletionJob {
   createdAtMs: number;
   updatedAtMs: number;
   error: string | null;
+}
+export interface MediaDeletionQueue {
+  jobs: MediaDeletionJob[];
+  waiting: number;
 }
 export type MediaDeletionTarget = MediaTimeRange &
   (
@@ -489,42 +493,3 @@ export interface AccountDisconnectResult {
   draft: AccountSyncConfig | null;
   status: AccountSyncStatus;
 }
-export const accountSyncConfigSchema = z
-  .object({
-    cookiesText: z.string().min(1).max(65536),
-    origin: z.string().url().max(2048).optional(),
-  })
-  .strict();
-export type AccountSyncConfig = z.infer<typeof accountSyncConfigSchema>;
-export const policySchema = z
-  .object({ monitorEnabled: z.boolean().optional(), autoRecord: z.boolean().optional() })
-  .strict()
-  .refine((v) => Object.keys(v).length > 0);
-export const playbackSchema = z
-  .object({
-    subjectId: z.string().regex(/^stripchat:[1-9]\d*$/),
-    targetUtcMs: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
-    gapPolicy: z.enum(['report', 'next', 'previous', 'next-or-previous']).default('report'),
-    fromMs: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
-    toMs: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
-    openUnitId: z.string().uuid().optional(),
-    unitId: z.string().uuid().optional(),
-  })
-  .strict()
-  .refine(
-    (value) =>
-      (value.fromMs === undefined && value.toMs === undefined) ||
-      (value.fromMs !== undefined &&
-        value.toMs !== undefined &&
-        value.toMs > value.fromMs &&
-        value.toMs - value.fromMs <= 9 * 86400000 &&
-        value.targetUtcMs >= value.fromMs &&
-        value.targetUtcMs < value.toMs),
-  );
-export const timelineSchema = z
-  .object({
-    from: z.coerce.number().int().nonnegative(),
-    to: z.coerce.number().int().positive(),
-    limit: z.coerce.number().int().min(1).max(2000).default(1000),
-  })
-  .refine((v) => v.to > v.from && v.to - v.from <= 9 * 86400000);

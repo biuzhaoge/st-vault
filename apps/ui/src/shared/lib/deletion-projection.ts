@@ -12,6 +12,7 @@ export interface DeletionProjection {
   ranges: MediaTimeRange[];
   protectedIds: string[];
   protectedRanges?: MediaTimeRange[];
+  unconfirmed?: boolean;
 }
 let entries: DeletionProjection[] = [];
 const listeners = new Set<() => void>();
@@ -73,17 +74,23 @@ export function adoptDeletionProjection(job: MediaDeletionJob): void {
     ['completed', 'failed', 'retry'].includes(state) ? state : 'active';
   if (
     !previous ||
-    (lifecycle(previous.job.state) === lifecycle(job.state) &&
+    (!previous.unconfirmed &&
+      lifecycle(previous.job.state) === lifecycle(job.state) &&
       previous.job.error === job.error &&
       previous.job.deletionRevision === job.deletionRevision)
   )
     return;
-  publish(entries.map((entry) => (entry.job.id === job.id ? { ...entry, job } : entry)));
+  publish(
+    entries.map((entry) =>
+      entry.job.id === job.id ? { ...entry, job, unconfirmed: false } : entry,
+    ),
+  );
 }
-export function uncertainDeletionProjection(id: string, error: string): void {
-  const entry = entries.find((entry) => entry.job.id === id);
-  if (entry)
-    adoptDeletionProjection({ ...entry.job, error, state: 'retry', updatedAtMs: Date.now() });
+export function uncertainDeletionProjection(id: string): void {
+  publish(entries.map((entry) => (entry.job.id === id ? { ...entry, unconfirmed: true } : entry)));
+}
+export function withdrawDeletionProjection(id: string): void {
+  publish(entries.filter((entry) => entry.job.id !== id));
 }
 export function failDeletionProjection(id: string, error: string): void {
   const entry = entries.find((entry) => entry.job.id === id);
@@ -97,6 +104,7 @@ export function pendingProjection(
 ): boolean {
   return (
     entry.job.subjectId === subjectId &&
+    !entry.unconfirmed &&
     entry.job.state !== 'failed' &&
     (entry.job.deletionRevision === undefined || revision < entry.job.deletionRevision)
   );
@@ -146,6 +154,7 @@ export function protectionSubjects(ids: string[]): string[] {
     entries.some(
       (entry) =>
         entry.job.subjectId === id &&
+        !entry.unconfirmed &&
         entry.target.kind === 'range' &&
         entry.target.mode === 'unliked' &&
         entry.job.deletionRevision === undefined &&

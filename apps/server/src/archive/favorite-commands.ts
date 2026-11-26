@@ -2,6 +2,12 @@ import { randomUUID } from 'node:crypto';
 import type { SqlDatabase } from '../database/sql.js';
 import type { MediaSelectionResult } from '@st-vault/api-schema';
 import type { MediaSelectionStore } from './media-selection-store.js';
+
+export interface FavoriteSelectionChange {
+  selectionId: string;
+  liked: boolean;
+}
+
 /** The accepted command is the logical truth; the physical favorite table is a resumable projection. */
 export class FavoriteCommands {
   private readonly db: SqlDatabase;
@@ -27,23 +33,38 @@ export class FavoriteCommands {
   }
   async accept(
     subject: string,
-    selection: string,
-    liked: boolean,
+    changes: readonly FavoriteSelectionChange[],
     revision: number,
   ): Promise<MediaSelectionResult> {
-    const current = await this.selections.summary(subject, selection);
-    if (revision !== current.personalRevision) throw Error('PERSONAL_REVISION_STALE');
-    if (!current.count) return { subjectId: subject, revision, count: 0 };
-    const id = randomUUID(),
-      seq = revision + 1;
-    await this.selections.pin(selection, id);
-    await this.db
-      .prepare(
-        'INSERT INTO favorite_commands(id,seq,subject,selection,liked,total,created) VALUES(?,?,?,?,?,?,?)',
-      )
-      .run(id, seq, subject, selection, Number(liked), current.count, Date.now());
-    await this.db.prepare('UPDATE personal_owner SET revision=? WHERE id=1').run(seq);
-    return { subjectId: subject, revision: seq, count: current.count };
+    const commands: (FavoriteSelectionChange & { count: number })[] = [];
+    for (const change of changes) {
+      const selection = await this.selections.summary(subject, change.selectionId);
+      if (revision !== selection.personalRevision) throw Error('PERSONAL_REVISION_STALE');
+      if (selection.count) commands.push({ ...change, count: selection.count });
+    }
+    if (!commands.length) return { subjectId: subject, revision, count: 0 };
+
+    // Reserve the version inside the caller's transaction. A concurrent command
+    // cannot invalidate the partition between the version check and publication.
+    const committed = revision + commands.length;
+    const updated = await this.db
+      .prepare('UPDATE personal_owner SET revision=? WHERE id=1 AND revision=?')
+      .run(committed, revision);
+    if (!updated.changes) throw Error('PERSONAL_REVISION_STALE');
+
+    let seq = revision;
+    let count = 0;
+    for (const { selectionId, liked, count: size } of commands) {
+      const id = randomUUID();
+      await this.selections.pin(selectionId, id);
+      await this.db
+        .prepare(
+          'INSERT INTO favorite_commands(id,seq,subject,selection,liked,total,created) VALUES(?,?,?,?,?,?,?)',
+        )
+        .run(id, ++seq, subject, selectionId, Number(liked), size, Date.now());
+      count += size;
+    }
+    return { subjectId: subject, revision: committed, count };
   }
   /** Source targets and cursor are committed together; replay cannot lose or reorder an operation. */
   async subjects(limit = 1, excludedSubjects: readonly string[] = []): Promise<string[]> {

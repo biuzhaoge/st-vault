@@ -50,37 +50,77 @@ try {
     };
   };
 
+  const wireAtRowMidpoint = (subjectId) =>
+    page.waitForFunction(
+      (id) => {
+        const row = document.querySelector(`.track-row.selected[data-subject-id="${id}"]`);
+        const bounds = row?.getBoundingClientRect();
+        const connection = document.querySelector('.row-connection[data-offscreen="visible"]');
+        const wire = connection?.querySelector('.connection-bus');
+        const node = connection?.querySelector('circle.connection-node');
+        const matrix = wire?.getScreenCTM();
+        const nodeMatrix = node?.getScreenCTM();
+        if (!bounds || !matrix || !nodeMatrix) return false;
+        const end = wire.getPointAtLength(wire.getTotalLength()).matrixTransform(matrix);
+        const center = new DOMPoint(node.cx.baseVal.value, node.cy.baseVal.value).matrixTransform(
+          nodeMatrix,
+        );
+        const brand = getComputedStyle(wire).stroke;
+        const marker = getComputedStyle(node);
+        return (
+          Math.abs(end.x - bounds.left) < 1 &&
+          Math.abs(end.y - bounds.top - bounds.height / 2) < 1 &&
+          Math.hypot(center.x - end.x, center.y - end.y) < 1 &&
+          node.r.baseVal.value >= 3 &&
+          (marker.fill === brand || marker.stroke === brand) &&
+          marker.fill !== marker.stroke &&
+          marker.pointerEvents === 'none' &&
+          document.elementFromPoint(center.x, center.y) !== node
+        );
+      },
+      subjectId,
+      { timeout: 5000 },
+    );
+
   await connect();
-  const wireAtRecordingButton = () =>
+  const recordingButtonInIndex = () =>
     page.waitForFunction(() => {
       const track = document.querySelector('.track-row.selected');
-      const button = track?.querySelector('.record-button');
+      const index = track?.querySelector('.directory-row-index');
+      const button = index?.querySelector('.record-button');
+      const number = index?.querySelector('.directory-row-number');
       const cover = track?.querySelector('.track-cover-wrap');
-      const wire = document.querySelector(
-        '.row-connection[data-offscreen="visible"] .connection-bus',
-      );
-      const matrix = wire?.getScreenCTM();
-      if (!button || !cover || !matrix) return false;
-      const end = wire.getPointAtLength(wire.getTotalLength()).matrixTransform(matrix);
+      if (!button || !number || !cover) return false;
       const control = button.getBoundingClientRect();
+      const label = number.getBoundingClientRect();
       const picture = cover.getBoundingClientRect();
       const center = { x: control.left + control.width / 2, y: control.top + control.height / 2 };
       return (
-        control.width <= 24 &&
-        Math.abs(control.left - picture.left - 3) < 1 &&
-        Math.abs(control.top - picture.top - 3) < 1 &&
-        Math.abs(end.x - control.left) < 1 &&
-        Math.abs(end.y - center.y) < 1 &&
+        control.right <= picture.left + 0.5 &&
+        button.contains(number) &&
+        Math.abs(center.y - label.top - label.height / 2) < 1 &&
+        Math.abs(center.x - label.left - label.width / 2) < 1 &&
         button.contains(document.elementFromPoint(center.x, center.y))
       );
     });
-  await wireAtRecordingButton();
+  await recordingButtonInIndex();
+  await wireAtRowMidpoint(fixture.info.subjectId);
+
+  await page.locator('.connection-close').hover();
+  await page.waitForFunction(() => {
+    const close = document.querySelector('.connection-close:hover');
+    const wire = document.querySelector('.row-connection .connection-bus');
+    return close && wire && getComputedStyle(close).color === getComputedStyle(wire).stroke;
+  });
+  await page.mouse.move(0, 0);
+
   const list = page.locator('.track-table-scroll');
   const initialTop = await list.evaluate((node) => node.scrollTop);
   await list.evaluate((node) => node.scrollTo(0, node.scrollHeight));
   await page.locator('.row-connection[data-offscreen="above"] .connection-arrow').waitFor();
   await list.evaluate((node, top) => node.scrollTo(0, top), initialTop);
-  await wireAtRecordingButton();
+  await wireAtRowMidpoint(fixture.info.subjectId);
+  await recordingButtonInIndex();
   // A native event in the close click's turn must not resurrect the old cursor.
   await page.evaluate(() => {
     const video = document.querySelector('video[data-media-slot="active"]');
@@ -120,8 +160,21 @@ try {
   await releasePlayback();
   await page.waitForTimeout(250);
   await disconnected();
+
+  const filters = page.locator('.subject-filters');
+  await filters.getByRole('button', { name: '归档', exact: true }).click();
+  await filters.getByRole('button', { name: '在线', exact: true }).click();
+  const archived = page.locator('.track-row[data-subject-id="stripchat:300"]');
+  await archived.locator('.subject-preview').press('Enter');
+  await wireAtRowMidpoint('stripchat:300');
   console.log(
-    JSON.stringify({ nativeCloseRace: true, pendingBounds: true, pendingPlayback: true }),
+    JSON.stringify({
+      nativeCloseRace: true,
+      pendingBounds: true,
+      pendingPlayback: true,
+      visibleRowMidpoints: true,
+      connectionHoverMatchesLine: true,
+    }),
   );
 } finally {
   for (const release of releases) release();

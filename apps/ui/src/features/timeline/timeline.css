@@ -57,6 +57,16 @@
 .track-row .track-lane[data-track-state='ready'] .track-loading {
   transition-delay: var(--track-reveal-delay, 0ms);
 }
+.track-row:has(> .track-lane:focus-visible) > .track-label::after {
+  content: '';
+  position: absolute;
+  inset-inline-end: 0;
+  top: 50%;
+  height: 18px;
+  border-inline-end: 3px solid var(--accent-hover);
+  transform: translateY(-50%);
+  pointer-events: none;
+}
 @keyframes track-loading-sweep {
   from {
     transform: translateX(-65%);

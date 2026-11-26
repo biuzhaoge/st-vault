@@ -26,6 +26,16 @@ const job = (id: string, state: MediaDeletionJob['state'], updatedAtMs = 1): Med
   createdAtMs: 0,
   error: null,
 });
+it('delivers an exact old receipt even when newer jobs fill the bounded status inventory', () => {
+  const observer = new DeletionObserver();
+  observer.update(
+    Array.from({ length: 84 }, (_, index) => job(String(index), 'completed', index + 2)),
+  );
+  const old = job('old', 'completed');
+  const result = observer.remember(old);
+  expect(result.accepted).toEqual([old]);
+  expect(result.jobs).toHaveLength(84);
+});
 it('tracks concurrent submissions before the first heartbeat without losing completed acceptance', () => {
   const observer = new DeletionObserver();
   observer.submit('first');

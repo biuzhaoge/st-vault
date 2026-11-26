@@ -5,12 +5,17 @@ import type { PreviewsPort } from '../ports.js';
 import { PreviewError } from '../previews/index.js';
 import { previewImageType } from '../previews/image-type.js';
 import { createHash } from 'node:crypto';
+import { archiveWindows, type CalendarArchive } from '../archive/calendar-window.js';
 
 const subject = z
   .string()
   .regex(/^stripchat:[1-9]\d*$/)
   .refine((value) => Number.isSafeInteger(Number(value.slice(10))));
-export function registerPreviews(app: FastifyInstance, previews: PreviewsPort): void {
+export function registerPreviews(
+  app: FastifyInstance,
+  previews: PreviewsPort,
+  archive: CalendarArchive = {},
+): void {
   const operation = async <T>(
     request: FastifyRequest,
     reply: FastifyReply,
@@ -92,8 +97,8 @@ export function registerPreviews(app: FastifyInstance, previews: PreviewsPort): 
         to: z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER),
       })
       .strict()
-      .refine((value) => value.to > value.from && value.to - value.from <= 9 * 86400000)
       .parse(request.query);
+    await archiveWindows(archive, query.from, query.to);
     if (!previews.snapshotPages) throw new PreviewError('preview_unavailable');
     return operation(request, reply, (signal) =>
       previews.snapshotPages!(

@@ -1,4 +1,17 @@
-import type { MediaTimeRange, SnapshotCell } from './index.js';
+export interface MediaTimeRange {
+  fromMs: number;
+  toMs: number;
+}
+
+export interface SnapshotCell {
+  index: number;
+  kind: 'unit' | 'gap' | 'pending';
+  fromMs: number;
+  toMs: number;
+  unitId?: string;
+  part?: number;
+  parts?: number;
+}
 
 export const recordingGapParts = (from: number, to: number): number =>
   Math.min(3, Math.max(0, Math.floor((to - from) / 60000)));

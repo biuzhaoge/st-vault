@@ -35,10 +35,9 @@ describe('request schema contracts', () => {
     expect(policySchema.safeParse({ autoRecord: true, extra: true }).success).toBe(false);
   });
 
-  it('rejects unsafe timestamps, oversized windows, and targets outside a selection', () => {
+  it('rejects unsafe timestamps and targets outside a selection, and caps raw timeline reads', () => {
     const playback = { subjectId: 'stripchat:42', targetUtcMs: 0, fromMs: 0, toMs: 7 * day };
     for (const input of [
-      { ...playback, toMs: 10 * day },
       { ...playback, targetUtcMs: 7 * day },
       { ...playback, toMs: undefined },
       { ...playback, targetUtcMs: Number.MAX_SAFE_INTEGER + 1 },

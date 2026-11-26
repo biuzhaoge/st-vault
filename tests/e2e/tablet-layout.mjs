@@ -168,33 +168,22 @@ try {
       await row.and(page.locator('.selected')).waitFor();
     }
 
-    const hearts = page.locator('.snapshot-favorite:enabled');
-    const heart = hearts.first();
-    await heart.waitFor();
-    const thumb = await heart.evaluate((node) => {
-      const button = node.getBoundingClientRect(),
-        tile = node.parentElement.getBoundingClientRect();
-      return {
-        size: button.width,
-        height: tile.height,
-        atLeftCorner: button.left - tile.left <= 3 && button.top - tile.top <= 3,
-        extendedHit:
-          document
-            .elementFromPoint(button.right + 2, button.top + button.height / 2)
-            ?.closest('.snapshot-favorite') === node,
-        centerSeeks: !!document
-          .elementFromPoint(tile.x + tile.width / 2, tile.y + tile.height / 2)
-          ?.closest('[data-unit-index]'),
-      };
-    });
-    assert(
-      thumb.size <= 22 &&
-        thumb.size < thumb.height * 0.5 &&
-        thumb.atLeftCorner &&
-        thumb.extendedHit &&
-        thumb.centerSeeks,
-      JSON.stringify(thumb),
+    const cards = page.locator(
+      '.snapshot-grid button[data-unit-index][data-favorite-ready="true"]',
     );
+    const card = cards.first();
+    await card.waitFor();
+    const cardReachable = await card.evaluate((node) => {
+      const box = node.querySelector('div').getBoundingClientRect();
+      return (
+        [
+          [box.left + 6, box.top + 6],
+          [box.left + box.width / 2, box.top + box.height / 2],
+        ].every(([x, y]) => document.elementFromPoint(x, y)?.closest('button') === node) &&
+        node.parentElement.querySelectorAll('button').length === 1
+      );
+    });
+    assert(cardReachable, 'The corner and center belong to the same unobstructed touch target');
 
     let favoriteWrites = 0;
     page.on('request', (request) => {
@@ -210,21 +199,25 @@ try {
           number,
         );
       await pageNumber(1);
-      const button = await hearts.nth(10).boundingBox();
+      const button = await cards.nth(10).boundingBox();
       await swipe(cdp, button.x + button.width / 2, button.y + button.height / 2, 0, -68);
       await pageNumber(2);
-      assert.equal(favoriteWrites, 0, 'A swipe starting on a heart must not turn it on');
+      assert.equal(favoriteWrites, 0, 'A paging swipe starting on a card must not favorite it');
     }
     await Promise.all([
       page.waitForResponse(
         (response) => response.url().endsWith('/unit-favorites') && response.ok(),
       ),
-      heart.tap(),
+      (async () => {
+        await card.tap();
+        await card.tap();
+      })(),
     ]);
     await page.waitForFunction(
       () =>
-        document.querySelector('.snapshot-favorite:enabled')?.getAttribute('aria-pressed') ===
-        'true',
+        document
+          .querySelector('.snapshot-grid button[data-unit-index]')
+          ?.getAttribute('data-liked') === 'true',
     );
     assert.equal(favoriteWrites, 1);
     if (cdp && (await page.evaluate(() => document.fullscreenEnabled))) {

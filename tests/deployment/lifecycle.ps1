@@ -62,8 +62,15 @@ try {
 # Exercise the actual supervisor, NSS wrapper and embedded database, using only
 # disposable named volumes. No production bind mount or host port is involved.
 function Assert-RuntimeReady([string]$Name) {
+  $readinessProbe = @'
+const { get } = require('node:http');
+const request = get('http://127.0.0.1:10002/health/ready', { signal: AbortSignal.timeout(1000) }, ({ statusCode }) => {
+  process.exit(statusCode >= 200 && statusCode < 300 ? 0 : 1);
+});
+request.on('error', () => process.exit(1));
+'@
   for ($attempt = 0; $attempt -lt 240; $attempt++) {
-    & docker exec $Name node -e 'fetch("http://127.0.0.1:10002/health/ready",{signal:AbortSignal.timeout(1000)}).then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))' 2>&1 | Out-Null
+    & docker exec $Name node -e $readinessProbe 2>&1 | Out-Null
     if ($LASTEXITCODE -eq 0) { return }
     if ((Invoke-Docker @('inspect', '--format', '{{.State.Running}}', $Name)).Trim() -ne 'true') { break }
     Start-Sleep -Milliseconds 250

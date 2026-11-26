@@ -3,3 +3,5 @@
 *.jpg binary
 *.mp4 binary
 *.m4s binary
+# Preserve the upstream patch's context lines and checksummed bytes.
+deploy/ffmpeg-*.patch -text -whitespace

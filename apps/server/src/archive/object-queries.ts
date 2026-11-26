@@ -15,11 +15,20 @@ export const longSegmentIndexSql = `CREATE INDEX IF NOT EXISTS segment_long_over
   ON segments(subject,"end",start) WHERE deleted=0 AND ${longSpan}`;
 
 /** Preserve overlap with rare long fragments without a day-wide scan for normal HLS. */
-export function overlappingSegmentsSql(source: 'segments' | 'visible_segments'): string {
-  return `WITH bounds AS (SELECT ?::text subject,?::double precision lo,?::double precision hi)
-    SELECT s.start,s."end",s.id FROM bounds b JOIN ${source} s ON s.subject=b.subject
+const overlappingSegments = (source: 'segments' | 'visible_segments') =>
+  `SELECT s.start,s."end",s.id FROM bounds b JOIN ${source} s ON s.subject=b.subject
     WHERE s.deleted=0 AND s.start>=b.lo-60000 AND s.start<b.hi AND s."end">b.lo
     UNION ALL
     SELECT s.start,s."end",s.id FROM bounds b JOIN ${source} s ON s.subject=b.subject
     WHERE s.deleted=0 AND s.start<b.lo-60000 AND s."end">b.lo AND ${longSpan}`;
-}
+
+export const overlappingSegmentsSql = (source: 'segments' | 'visible_segments') =>
+  `WITH bounds AS (SELECT ?::text subject,?::double precision lo,?::double precision hi)
+   ${overlappingSegments(source)}`;
+
+export const deletionMinuteOverlapSql = `SELECT m.minute,s.start,s."end"
+  FROM (SELECT ?::text AS subject,value::bigint AS minute FROM json_array_elements_text(?::json)) m
+  CROSS JOIN LATERAL (
+    WITH bounds AS (SELECT m.subject,m.minute::double precision lo,(m.minute+60000)::double precision hi)
+    ${overlappingSegments('segments')}
+  ) s`;

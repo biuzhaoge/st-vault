@@ -122,7 +122,9 @@ export function checkSourceBoundaries(root, files) {
 export function checkRepository(root) {
   const sources = ['apps', 'packages'].flatMap((directory) => filesUnder(root, directory));
   const markdown = [
-    ...['README.md'].filter((file) => existsSync(path.join(root, file))),
+    ...readdirSync(root, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && /^README(?:\.[\w-]+)?\.md$/.test(entry.name))
+      .map((entry) => entry.name),
     ...['docs', 'deploy', 'tests', 'scripts', 'apps', 'packages']
       .flatMap((directory) => filesUnder(root, directory))
       .filter((file) => file.endsWith('.md')),

@@ -4,7 +4,7 @@ import { systemRetryTargets } from '@st-vault/api-schema';
 import type {
   ArchiveHealthStatus,
   BackgroundTask,
-  MediaDeletionJob,
+  MediaDeletionQueue,
   SiteRoutesStatus,
   SnapshotJobsStatus,
   SystemRetry,
@@ -22,7 +22,11 @@ import type { createSyncHub } from './sync.js';
 interface SystemOptions {
   archive: Pick<
     ArchivePort,
-    'backgroundTasks' | 'deletionJobs' | 'withBackgroundReads' | 'retryDeletions'
+    | 'backgroundTasks'
+    | 'deletionJobs'
+    | 'deletionInventory'
+    | 'withBackgroundReads'
+    | 'retryDeletions'
   >;
   supervisor: Pick<SupervisorPort, 'states'>;
   clock: Pick<SyncClock, 'status' | 'runNow'>;
@@ -124,9 +128,13 @@ export function registerSystem(app: FastifyInstance, options: SystemOptions): vo
           () => previews.backgroundTasks?.() ?? Promise.resolve(previewFallback),
           previewFallback,
         ),
-        readStatus<MediaDeletionJob[] | null>(
+        readStatus<MediaDeletionQueue | null>(
           'deletions',
-          () => archive.deletionJobs?.() ?? Promise.resolve([]),
+          async () => {
+            if (archive.deletionInventory) return archive.deletionInventory();
+            const jobs = (await archive.deletionJobs?.()) ?? [];
+            return { jobs, waiting: jobs.filter((job) => job.state === 'waiting').length };
+          },
           null,
         ),
       ]);
@@ -264,7 +272,8 @@ export function registerSystem(app: FastifyInstance, options: SystemOptions): vo
     taskReading ??= inspectTasks().finally(() => {
       taskReading = undefined;
     });
-    const [snapshotJobs, archiveTasks, previewTasks, deletions] = await taskReading;
+    const [snapshotJobs, archiveTasks, previewTasks, deletionQueue] = await taskReading;
+    const deletions = deletionQueue?.jobs ?? null;
     const capturedAtMs = now(),
       states = Object.values(supervisor.states()),
       network = options.network?.status(),
@@ -275,6 +284,7 @@ export function registerSystem(app: FastifyInstance, options: SystemOptions): vo
       sites: siteRoutes,
       snapshots: snapshotJobs,
       deletions,
+      deletionWaiting: deletionQueue?.waiting,
       tasks: [
         ...archiveTasks,
         ...previewTasks,
@@ -292,6 +302,7 @@ export function registerSystem(app: FastifyInstance, options: SystemOptions): vo
       settings,
       recordAll: options.recordAll(),
       deletionJobs: deletions,
+      deletionWaiting: deletionQueue?.waiting ?? null,
       snapshotJobs,
       disk: options.resources?.get() ?? {
         freeBytes: 0,

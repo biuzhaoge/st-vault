@@ -5,6 +5,7 @@ import type { TrackData } from './track-data';
 export type { TrackData } from './track-data';
 import { coverageBands, coverageGeometry, coverageSurface, coverageTones } from './coverage-bands';
 import { formatDateTime } from './timeline';
+import { fullCalendar, type TimelineScale } from './archive-calendar';
 import './timeline.css';
 import { memo, useId, useMemo, useRef, type ReactNode, type Ref } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -49,6 +50,7 @@ export const TimelineBands = memo(function TimelineBands({
   animateWindow = false,
   widthPx = 0,
   nowMs = Date.now(),
+  scale: suppliedScale,
 }: {
   data?: TrackData;
   fromMs: number;
@@ -57,6 +59,7 @@ export const TimelineBands = memo(function TimelineBands({
   animateWindow?: boolean;
   widthPx?: number;
   nowMs?: number;
+  scale?: TimelineScale;
 }): JSX.Element {
   useTranslation();
   const sheenId = useId();
@@ -71,8 +74,11 @@ export const TimelineBands = memo(function TimelineBands({
         .flatMap((entry) => projectionRanges(entry, data?.coverage.protectedSpans)),
     [deletions, data],
   );
-  const duration = Math.max(1, toMs - fromMs),
-    position = (at: number): string => `${(100 * (at - fromMs)) / duration}%`;
+  const scale = useMemo(
+    () => suppliedScale ?? fullCalendar.scale(fromMs, toMs),
+    [suppliedScale, fromMs, toMs],
+  );
+  const position = (at: number): string => `${100 * scale.position(at)}%`;
   const clips = useMemo(
     () =>
       subtractRanges(
@@ -80,15 +86,15 @@ export const TimelineBands = memo(function TimelineBands({
           data?.coverage.buckets ?? [],
           fromMs - overscanMs,
           toMs + overscanMs,
-          widthPx > 0 ? duration / widthPx : 0,
+          widthPx > 0 ? scale.duration / widthPx : 0,
         ),
         holes,
       ).map((band) => ({ ...band, key: band.fromMs })),
-    [data?.coverage.buckets, fromMs, toMs, overscanMs, duration, widthPx, holes],
+    [data?.coverage.buckets, fromMs, toMs, overscanMs, scale.duration, widthPx, holes],
   );
   const now = nowMs,
     bands = data?.bands.flatMap((band) => {
-      if (band.fromMs >= now) return [];
+      if (scale.coordinate(Math.min(now, band.toMs)) <= scale.coordinate(band.fromMs)) return [];
       if (band.toMs <= now) return [band];
       // The API counts future status time as UNKNOWN. Remove that time before
       // choosing the visible status and tooltip, keeping historical unknowns.
@@ -112,12 +118,22 @@ export const TimelineBands = memo(function TimelineBands({
         data?.coverage.favoriteSpans,
       ).map(({ tone, bands }) => ({
         tone,
-        surface: coverageSurface(bands, fromMs, toMs, widthPx || 600),
+        surface: coverageSurface(
+          bands
+            .map((band) => ({
+              ...band,
+              fromMs: scale.coordinate(band.fromMs),
+              toMs: scale.coordinate(band.toMs),
+            }))
+            .filter((band) => band.toMs > band.fromMs),
+          0,
+          scale.duration,
+          widthPx || 600,
+        ),
       })),
     [
       clips,
-      fromMs,
-      toMs,
+      scale,
       widthPx,
       data?.coverage.seenSpans,
       data?.coverage.unreadSpans,
@@ -130,8 +146,17 @@ export const TimelineBands = memo(function TimelineBands({
     fromMs,
     toMs,
     widthPx,
-    clips.map(({ fromMs, toMs, level }) => [fromMs, toMs, level]),
-    bands?.map(({ fromMs, toMs, status }) => [fromMs, toMs, status]),
+    scale.duration,
+    clips.map(({ fromMs, toMs, level }) => [
+      scale.coordinate(fromMs),
+      scale.coordinate(toMs),
+      level,
+    ]),
+    bands?.map(({ fromMs, toMs, status }) => [
+      scale.coordinate(fromMs),
+      scale.coordinate(toMs),
+      status,
+    ]),
   ]);
   // A color can represent different UTC intervals after its classification changes.
   // Reset its placement instead of moving old colors in time.
@@ -153,7 +178,7 @@ export const TimelineBands = memo(function TimelineBands({
           key={band.fromMs}
           data-motion-key={`status:${band.fromMs}`}
           className={`status-band status-band-${band.status.toLowerCase()}`}
-          aria-label={`${formatDateTime(band.fromMs)} · ${(
+          aria-label={`${formatDateTime(scale.restore(scale.coordinate(band.fromMs)))} · ${(
             Object.entries(band.durationsMs) as [PublicStatus, number][]
           )
             .filter(([, ms]) => ms > 0)
@@ -163,7 +188,7 @@ export const TimelineBands = memo(function TimelineBands({
             .join(' / ')}`}
           style={{
             left: position(band.fromMs),
-            width: `${(100 * (band.toMs - band.fromMs)) / duration}%`,
+            width: `${100 * (scale.position(band.toMs) - scale.position(band.fromMs))}%`,
           }}
         />
       ))}
@@ -181,11 +206,11 @@ export const TimelineBands = memo(function TimelineBands({
               role="img"
               aria-label={
                 tr('{{v0}} · 录像 {{v1}} 秒', {
-                  v0: formatDateTime(surface.extent.fromMs),
+                  v0: formatDateTime(scale.restore(surface.extent.fromMs)),
                   v1: Math.round(surface.extent.coveredMs) / 1000,
                 }) + (tone === 'favorite' ? ` · ${tr('喜欢')}` : '')
               }
-              style={coverageGeometry(surface.extent, fromMs, toMs)}
+              style={coverageGeometry(surface.extent, 0, scale.duration)}
             >
               <defs>
                 <linearGradient id={`${sheenId}:${tone}`} x1="0" y1="0" x2="0" y2="1">

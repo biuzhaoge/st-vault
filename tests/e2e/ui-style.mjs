@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { chromium } from 'playwright-core';
+import { snapshotMarks } from './support/snapshot-frame.mjs';
 
 const styles = await Promise.all(
   [
@@ -38,18 +39,39 @@ const content = `<style>${styles.join('\n')}</style>
         <div class="recording-line"><span class="track-clip" style="left:0;width:24%;opacity:.35"></span><span class="track-clip" style="left:25%;width:24%;opacity:.7"></span><span class="track-clip" style="left:50%;width:24%"></span><span class="track-clip" style="left:90%;width:1px"></span></div>
       </div>
     </div>
-    <div class="subject-filters" style="width:200px"><span class="glass-selection"></span><button class="active">在线</button><button>离线</button><button>归档</button></div>
+    <div class="subject-filters" style="width:200px">
+      <button aria-pressed="true">在线</button>
+      <button aria-pressed="false">离线</button>
+      <button aria-pressed="true">归档</button>
+    </div>
     <nav class="snapshot-pages" style="--snapshot-toolbar-height:26px;width:320px">
-      <span class="snapshot-total">30 张</span>
-      <div class="snapshot-actions"><button><svg class="ui-icon"></svg><span>取消所有喜欢</span></button></div>
+      <div class="snapshot-toolbar-controls"><span class="snapshot-total">30 张</span>
+      <div class="snapshot-actions"><button><svg class="ui-icon"></svg><span>取消所有喜欢</span></button></div></div>
     </nav>
-    <div class="record-policy-fixture" style="position:relative;z-index:5;min-height:44px">
-      <button class="recording-toggle record-button" aria-checked="false" aria-label="Auto off"><i></i></button>
-      <button class="recording-toggle record-button" aria-checked="true" aria-label="Auto on"><i></i></button>
+    <div class="record-policy-fixture aligned-track-board" style="position:relative;z-index:5;flex-direction:row;min-height:72px">
+      <div class="directory-row-index" style="width:var(--subject-number-width)">
+        <span class="recording-mode recording-number"><button class="recording-toggle record-button" role="switch" aria-checked="false" aria-label="Auto off">
+          <span class="directory-row-number" aria-hidden="true"><span style="--row-number-digits:1">1</span></span><span class="record-action" aria-hidden="true"></span>
+        </button></span>
+      </div>
+      <div class="directory-row-index" style="width:var(--subject-number-width)">
+        <span class="recording-mode recording-number"><button class="recording-toggle record-button" role="switch" aria-checked="true" aria-label="Auto on">
+          <span class="directory-row-number" aria-hidden="true"><span style="--row-number-digits:1">2</span></span><span class="record-action" aria-hidden="true"></span>
+        </button></span>
+      </div>
     </div>
     <div class="player-picture geometry-player" style="position:relative;width:400px;height:230px">
       <span class="player-mode-badge is-live"></span>
       <div class="playback-status playback-status--brief"><div class="playback-status-content"><strong>正在定位画面…</strong></div></div>
+    </div>
+    <div class="connection-rail" style="width:110px;height:72px" data-connected="true">
+      <svg class="row-connection" data-offscreen="above">
+        <path class="connection-halo" d="M 8 58 H 48 V 14 H 96" />
+        <path class="connection-bus" d="M 8 58 H 48 V 14 H 96" />
+        <path class="connection-signal" d="M 8 58 H 48 V 14 H 96" />
+        <circle cx="96" cy="14" r="2.5" />
+        <path class="connection-arrow" d="M 92 10 L 96 6 L 100 10" />
+      </svg>
     </div>
     <button class="tool-trigger" disabled>Unavailable</button>
     <button class="primary" disabled>Unavailable primary</button>
@@ -64,11 +86,17 @@ const content = `<style>${styles.join('\n')}</style>
       <label class="field"><input aria-label="Setting"></label>
       <button class="primary">Save</button>
       <span class="recording-mode"><button class="recording-toggle"><i></i></button></span>
+      <span class="panel-badge is-warning">Waiting</span>
+      <span class="routing-metric is-fair">120 ms</span>
+      <span class="routing-metric is-good">20 ms</span>
     </section>
     <div class="player-actions"><button class="player-control">Play</button></div>
     <section class="snapshot-section" style="position:relative;width:200px;height:100px;min-height:0">
       <div class="snapshot-grid" style="position:relative;left:0;transform:none;width:200px;height:100px;display:block">
-        <div class="snapshot-cell test-cell" style="width:200px;height:100px"><button data-unit-index="0" class="selected"><div><span class="minute-image"></span></div></button><button class="snapshot-favorite" aria-label="Like"></button></div>
+        <div class="snapshot-cell test-cell" data-liked="true" data-selected="true" style="width:200px;height:100px"><button class="selected" aria-current="time" data-unit-index="0" data-liked="true" aria-pressed="true"><div><span class="minute-image"></span></div>
+          <span class="snapshot-mark snapshot-favorite-mark" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24"><path d="M12 20 4 12C-2 5 8 1 12 7c4-6 14-2 8 5Z" /></svg></span>
+          <span class="snapshot-mark snapshot-playing-mark" aria-hidden="true"><svg class="ui-icon" viewBox="0 0 24 24"><path d="m9 5 10 7-10 7Z" fill="currentColor" /></svg></span>
+        </button></div>
       </div>
     </section>
     <div class="view-position-window" style="position:relative;width:100px;height:26px">
@@ -130,6 +158,73 @@ try {
     'Forced-color fallback stays consistent for every base surface',
   );
   await page.emulateMedia({ forcedColors: 'none' });
+  const palette = await page.evaluate(() => {
+    const root = getComputedStyle(document.documentElement);
+    const sample = document.createElement('span');
+    document.body.append(sample);
+    const colors = Object.fromEntries(
+      ['accent', 'warning', 'success', 'favorite'].map((role) => {
+        const token = `--${role}`;
+        sample.style.color = `var(${token})`;
+        return [role, root.getPropertyValue(token).trim() ? getComputedStyle(sample).color : null];
+      }),
+    );
+    sample.remove();
+    return colors;
+  });
+  assert(Object.values(palette).every(Boolean), JSON.stringify(palette));
+  const connection = await page.locator('.row-connection').evaluate((node) => {
+    const svgStyle = getComputedStyle(node);
+    const [halo, bus, signal, endpoint, arrow] = [
+      '.connection-halo',
+      '.connection-bus',
+      '.connection-signal',
+      'circle',
+      '.connection-arrow',
+    ].map((selector) => getComputedStyle(node.querySelector(selector)));
+    return {
+      line: svgStyle.color,
+      hitTesting: svgStyle.pointerEvents,
+      halo: { width: parseFloat(halo.strokeWidth), opacity: Number(halo.opacity) },
+      bus: {
+        stroke: bus.stroke,
+        width: parseFloat(bus.strokeWidth),
+        dash: bus.strokeDasharray,
+        opacity: Number(bus.opacity),
+      },
+      signal: { dash: signal.strokeDasharray, animation: signal.animationName },
+      endpoint: endpoint.fill,
+      arrow: arrow.stroke,
+    };
+  });
+  assert.equal(connection.line, palette.accent, 'The playback connection uses the brand accent');
+  assert.equal(connection.bus.stroke, palette.accent);
+  assert.equal(connection.bus.dash, 'none', 'The red route stays visible between signal dashes');
+  assert(connection.bus.width >= 2.5 && connection.bus.opacity === 1, JSON.stringify(connection));
+  assert(
+    connection.halo.width > connection.bus.width &&
+      connection.halo.opacity > 0 &&
+      connection.halo.opacity < connection.bus.opacity,
+    JSON.stringify(connection),
+  );
+  assert.notEqual(connection.signal.dash, 'none');
+  assert.notEqual(connection.signal.animation, 'none');
+  assert.equal(connection.endpoint, palette.accent);
+  assert.equal(connection.arrow, palette.accent);
+  assert.equal(
+    connection.hitTesting,
+    'none',
+    'The route leaves the controls underneath interactive',
+  );
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  assert.equal(
+    await page
+      .locator('.connection-signal')
+      .evaluate((node) => getComputedStyle(node).animationName),
+    'none',
+    'The connection signal respects reduced motion',
+  );
+  await page.emulateMedia({ reducedMotion: 'no-preference' });
   assert(
     await page.evaluate(() => CSS.supports('corner-shape', 'superellipse(1.5)')),
     'The browser acceptance image must exercise native continuous corners',
@@ -147,9 +242,14 @@ try {
     JSON.stringify(shapes),
   );
   const circles = await page
-    .locator('.subject-filters, .snapshot-pages, .record-policy-fixture i, .player-mode-badge')
+    .locator('.subject-filters, .snapshot-pages, .player-mode-badge')
     .evaluateAll((nodes) =>
-      nodes.map((node) => getComputedStyle(node).getPropertyValue('corner-shape')),
+      nodes.map((node) =>
+        getComputedStyle(
+          node,
+          node.matches('.snapshot-pages') ? '::before' : null,
+        ).getPropertyValue('corner-shape'),
+      ),
     );
   assert(
     circles.every((shape) => shape === 'superellipse(1)'),
@@ -157,10 +257,10 @@ try {
   );
   assert.equal(
     await page
-      .locator('.test-cell button > div')
-      .evaluate((node) => getComputedStyle(node, '::after').getPropertyValue('corner-shape')),
+      .locator('.test-cell')
+      .evaluate((node) => getComputedStyle(node, '::before').getPropertyValue('corner-shape')),
     'superellipse(1.5)',
-    'The playback ring must use the same curve as its image',
+    'The selection frame must use the same curve as its image',
   );
   const fallback = await browser.newPage();
   await fallback.setContent(content.replace(/corner-shape\s*:[^;}]+;/g, ''));
@@ -263,18 +363,26 @@ try {
     'visible',
     'The playhead must remain outside track clipping',
   );
-  assert.equal(
-    await page
-      .locator('.test-cell button > div')
-      .evaluate((node) => getComputedStyle(node, '::after').borderTopLeftRadius),
-    await page
-      .locator('.test-cell button > div')
-      .evaluate((node) => getComputedStyle(node).borderTopLeftRadius),
-    'Playback highlight follows the image corners',
-  );
+  const marks = await page.locator('.test-cell button').evaluate(snapshotMarks);
+  assert.equal(marks.playing?.fill, palette.success);
+  assert.equal(marks.favorite?.fill, palette.favorite);
+  for (const [selector, expected] of [
+    ['.panel-badge.is-warning', palette.warning],
+    ['.routing-metric.is-fair', palette.warning],
+    ['.routing-metric.is-good', palette.success],
+  ]) {
+    assert.equal(
+      await page.locator(selector).evaluate((node) => getComputedStyle(node).color),
+      expected,
+      `${selector} uses its shared semantic color`,
+    );
+  }
+  assert(Math.abs(marks.playing.left - marks.playing.right) <= 1);
+  assert(Math.abs(marks.playing.top - marks.playing.bottom) <= 1);
+  assert(marks.playing.height > marks.favorite.height);
   const surfaces = await page.locator('.subject-filters, .snapshot-pages').evaluateAll((nodes) =>
     nodes.map((node) => {
-      const style = getComputedStyle(node);
+      const style = getComputedStyle(node, node.matches('.snapshot-pages') ? '::before' : null);
       return { fill: style.background, shadow: style.boxShadow, radius: style.borderRadius };
     }),
   );
@@ -284,6 +392,16 @@ try {
     'Screenshot tools and directory filters share one light glass control surface',
   );
   assert.match(surfaces[1].shadow, /inset/);
+  const filterButtons = await page.locator('.subject-filters button').evaluateAll((buttons) =>
+    buttons.map((button) => ({
+      fill: getComputedStyle(button).background,
+      shadow: getComputedStyle(button).boxShadow,
+    })),
+  );
+  assert.deepEqual(filterButtons[0], filterButtons[2]);
+  assert.notEqual(filterButtons[0].fill, filterButtons[1].fill);
+  assert.match(filterButtons[0].shadow, /inset/);
+  assert.notEqual(filterButtons[0].shadow, filterButtons[1].shadow);
   const idleAction = page.locator('.snapshot-actions button').first();
   const actionBounds = await idleAction.boundingBox();
   const idleFill = await idleAction.evaluate((node) => getComputedStyle(node).background);
@@ -321,27 +439,44 @@ try {
   const policies = await page.locator('.record-policy-fixture button').evaluateAll((nodes) =>
     nodes.map((node) => {
       const box = node.getBoundingClientRect(),
-        style = getComputedStyle(node);
+        number = getComputedStyle(node.querySelector('.directory-row-number > span')),
+        action = getComputedStyle(node.querySelector('.record-action')),
+        button = getComputedStyle(node);
       return {
         width: box.width,
         height: box.height,
-        color: style.color,
-        fill: getComputedStyle(node.querySelector('i')).backgroundColor,
+        glass: number.backgroundImage,
+        buttonFill: button.backgroundColor,
+        buttonShadow: button.boxShadow,
+        actionRadius: action.borderRadius,
+        actionFill: action.backgroundColor,
       };
     }),
   );
   assert.equal(policies[0].width, policies[1].width);
   assert.equal(policies[0].height, policies[1].height);
   assert.notEqual(
-    policies[0].color,
-    policies[1].color,
+    policies[0].glass,
+    policies[1].glass,
     'Auto policy must be legible before capture starts',
   );
-  assert.notEqual(
-    policies[0].fill,
-    policies[1].fill,
-    'Enabled and disabled shapes must differ as well as color',
+  assert(policies.every((policy) => policy.buttonFill === 'rgba(0, 0, 0, 0)'));
+  assert(
+    policies.every((policy) => policy.buttonShadow === 'none'),
+    'The recording number must have no recessed backing',
   );
+  assert.match(
+    await page
+      .locator('.recording-toggle:not(.record-button)')
+      .evaluate((node) => getComputedStyle(node).boxShadow),
+    /inset/,
+  );
+  assert.notEqual(
+    policies[0].actionRadius,
+    policies[1].actionRadius,
+    'The available recording and stop actions have different shapes',
+  );
+  assert.notEqual(policies[0].actionFill, policies[1].actionFill);
   const picture = await page.locator('.geometry-player').boundingBox();
   const badge = await page.locator('.player-mode-badge').boundingBox();
   assert(Math.abs(badge.x - picture.x - 10) < 1, 'Media identity belongs at the upper left');
@@ -398,7 +533,6 @@ try {
     if (!focus.visible || focus.style === 'none' || focus.width < 2)
       problems.push(`${selector}: keyboard focus is not visible`);
   }
-  const favoriteSize = await page.locator('.snapshot-favorite').boundingBox();
   const noticeLayout = await page.evaluate(() => {
     const issues = [];
     for (const width of [320, 560, 800]) {
@@ -449,14 +583,22 @@ try {
     return issues;
   });
   problems.push(...noticeLayout);
-  if (favoriteSize.width > 22 || favoriteSize.height !== favoriteSize.width)
-    problems.push('Snapshot heart must fit the image and keep its circular shape');
+  if (
+    marks.favorite?.fill !== 'rgb(255, 158, 184)' ||
+    marks.favorite.left < 0 ||
+    marks.favorite.left >= marks.favorite.right ||
+    marks.favorite.top < 0 ||
+    marks.favorite.top >= marks.favorite.bottom
+  )
+    problems.push(
+      'The pink favorite heart must remain visible at the top left of the playing card',
+    );
   const gridGesture = await page
     .locator('.snapshot-grid')
     .first()
     .evaluate((node) => getComputedStyle(node).touchAction);
-  if (!gridGesture.includes('pan-x') || !gridGesture.includes('pinch-zoom'))
-    problems.push('Screenshot grid must reserve vertical swipes and allow native pinch zoom');
+  if (gridGesture !== 'pinch-zoom')
+    problems.push('Screenshot grid must reserve both drag axes and allow native pinch zoom');
   const cell = page.locator('.test-cell');
   const resting = await cell.boundingBox();
   await cell.hover();
@@ -470,6 +612,7 @@ try {
   for (const [selector, minimum] of [
     ['.player-control', 24],
     ['.recording-toggle:not(.record-button)', 44],
+    ['.recording-toggle.record-button', 44],
   ]) {
     for (const button of await touchPage.locator(selector).all()) {
       const bounds = await button.boundingBox();
@@ -477,16 +620,20 @@ try {
         problems.push(`${selector}: touch hit area must be at least ${minimum}px`);
     }
   }
-  const compactTouchTarget = await touchPage
+  const touchTargetInIndex = await touchPage
     .locator('.record-policy-fixture button')
     .last()
     .evaluate((button) => {
       const bounds = button.getBoundingClientRect();
-      const hit = document.elementFromPoint(bounds.left + 35, bounds.top + 35);
-      return bounds.width === 24 && hit === button;
+      const column = button.closest('.directory-row-index').getBoundingClientRect();
+      const y = bounds.top + bounds.height / 2;
+      const hit = document.elementFromPoint(bounds.right - 2, y);
+      const outside = document.elementFromPoint(column.right + 2, y);
+      return (
+        bounds.right <= column.right + 0.5 && button.contains(hit) && !button.contains(outside)
+      );
     });
-  if (!compactTouchTarget)
-    problems.push('Touch must retain a compact recording icon and a larger hit area');
+  if (!touchTargetInIndex) problems.push('The recording hit area must stay in the index column');
   await touch.close();
   for (const width of [320, 768, 1280]) {
     await page.setViewportSize({ width, height: 900 });
@@ -571,6 +718,27 @@ try {
     if (!outline.focused || outline.outline !== 'none')
       problems.push(`${className || tag}: passive focus must not draw a container selection frame`);
   }
+  const track = await page.evaluateHandle(() => {
+    const row = document.createElement('div');
+    row.className = 'track-row';
+    row.innerHTML =
+      '<div class="track-label"><button>Subject</button></div><div class="track-lane" role="group" tabindex="0"></div>';
+    document.body.append(row);
+    row.querySelector('button').focus();
+    return row;
+  });
+  const markerVisible = () =>
+    track.evaluate((row) => {
+      const mark = getComputedStyle(row.querySelector('.track-label'), '::after');
+      return mark.content !== 'none' && parseFloat(mark.borderInlineEndWidth) >= 2;
+    });
+  assert.equal(await markerVisible(), false);
+  await page.keyboard.press('Tab');
+  assert(await track.evaluate((row) => row.querySelector('.track-lane').matches(':focus-visible')));
+  assert(await markerVisible(), 'Keyboard focus on the timeline must mark its row');
+  await page.keyboard.press('Tab');
+  assert.equal(await markerVisible(), false);
+  await track.evaluate((row) => row.remove());
   const panelLayout = await page.evaluate(() => {
     const issues = [];
     for (const [kind, body] of [

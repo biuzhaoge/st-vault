@@ -2,6 +2,7 @@ import type { MediaDeletionJob, Subject } from '@st-vault/api-schema';
 import { systemRetryTargets } from '@st-vault/api-schema';
 import { useState, type CSSProperties, type ReactNode } from 'react';
 import { tr } from '../../shared/lib/i18n';
+import { useDeletionProjections } from '../../shared/lib/deletion-projection';
 import { PanelStatus } from '../../shared/ui/PanelContent';
 import { ArchiveHealth } from './ArchiveHealth';
 import { statusGroups, type StatusLine, type StatusValue } from './background-status';
@@ -109,10 +110,21 @@ export function SystemSummary({
   const disk = system?.disk;
   const recording = system?.capture;
   const empty = { text: '—' };
+  const latestSubmission = useDeletionProjections().at(-1)?.job;
+  const submissionError =
+    latestSubmission?.state === 'failed' && latestSubmission.deletionRevision === undefined
+      ? latestSubmission.error
+      : null;
+  const deletion = deletionStatus(deletions, subjects, system?.deletionWaiting ?? undefined);
   const groups = statusGroups(
     tasks,
     system?.capturedAtMs ?? Date.now(),
-    deletionStatus(deletions, subjects),
+    submissionError
+      ? {
+          ...(deletion ?? { text: tr('删除提交已拒绝'), tone: 'warning' as const }),
+          note: submissionError,
+        }
+      : deletion,
     new Set(
       system?.retries?.filter((attempt) => attempt.state === 'running').map(({ target }) => target),
     ),

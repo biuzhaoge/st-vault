@@ -24,7 +24,7 @@ it('keeps confirmed online membership through expired or failed polls, until con
     { id: '5', handle: 'E', providerStatus: 'UNKNOWN', lastKnownStatus: 'PUBLIC', archived: true },
   ] as Subject[];
   expect(subjectCounts(rows)).toEqual({ ONLINE: 2, OFFLINE: 2, ARCHIVED: 1 });
-  expect(visibleSubjects(rows, 'ONLINE').map((row) => row.id)).toEqual(['1', '2']);
+  expect(visibleSubjects(rows, ['ONLINE']).map((row) => row.id)).toEqual(['1', '2']);
 });
 it('partitions online, offline and archived without duplicates and counts the same membership', () => {
   const subjects = [
@@ -37,10 +37,14 @@ it('partitions online, offline and archived without duplicates and counts the sa
     { id: '7', handle: 'Archived offline', providerStatus: 'OFFLINE', archived: true },
   ] as Subject[];
   expect(subjectCounts(subjects)).toEqual({ ONLINE: 3, OFFLINE: 2, ARCHIVED: 2 });
-  expect(visibleSubjects(subjects, 'ONLINE').map((subject) => subject.id)).toEqual(['4', '3', '5']);
+  expect(visibleSubjects(subjects, ['ONLINE']).map((subject) => subject.id)).toEqual([
+    '4',
+    '3',
+    '5',
+  ]);
   expect(subjects.map((subject) => subject.id)).toEqual(['1', '2', '3', '4', '5', '6', '7']);
-  expect(visibleSubjects(subjects, 'OFFLINE').map((s) => s.id)).toEqual(['1', '2']);
-  expect(visibleSubjects(subjects, 'ARCHIVED').map((s) => s.id)).toEqual(['6', '7']);
+  expect(visibleSubjects(subjects, ['OFFLINE']).map((s) => s.id)).toEqual(['1', '2']);
+  expect(visibleSubjects(subjects, ['ARCHIVED']).map((s) => s.id)).toEqual(['6', '7']);
 });
 it('orders offline subjects by existing recording first, then online history and deterministic ties', () => {
   const subjects = [
@@ -72,8 +76,8 @@ it('orders offline subjects by existing recording first, then online history and
     },
   ] as Subject[];
   const expected = ['7', '5', '6', '4', '3', '2', '8', '1'];
-  expect(visibleSubjects(subjects, 'OFFLINE').map((s) => s.id)).toEqual(expected);
-  expect(visibleSubjects([...subjects].reverse(), 'OFFLINE').map((s) => s.id)).toEqual(expected);
+  expect(visibleSubjects(subjects, ['OFFLINE']).map((s) => s.id)).toEqual(expected);
+  expect(visibleSubjects([...subjects].reverse(), ['OFFLINE']).map((s) => s.id)).toEqual(expected);
 });
 it('treats missing, invalid and zero activity as absent rather than inventing recency', () => {
   const subjects = [
@@ -87,5 +91,60 @@ it('treats missing, invalid and zero activity as absent rather than inventing re
       lastOnlineAtMs: Infinity,
     },
   ] as Subject[];
-  expect(visibleSubjects(subjects, 'OFFLINE').map((s) => s.id)).toEqual(['1', '2', '3']);
+  expect(visibleSubjects(subjects, ['OFFLINE']).map((s) => s.id)).toEqual(['1', '2', '3']);
+});
+
+it('combines selected groups with public before private and newest first within each online status', () => {
+  const subjects = [
+    {
+      id: 'old-live',
+      handle: 'A',
+      providerStatus: 'PUBLIC',
+      onlineSinceMs: 1000,
+      lastOnlineAtMs: 8000,
+    },
+    { id: 'new-live', handle: 'Z', providerStatus: 'PRIVATE', onlineSinceMs: 6000 },
+    {
+      id: 'old-private',
+      handle: 'A',
+      providerStatus: 'UNKNOWN',
+      lastKnownStatus: 'PRIVATE',
+      onlineSinceMs: 5000,
+      lastOnlineAtMs: 9000,
+    },
+    { id: 'legacy-live', handle: 'C', providerStatus: 'PUBLIC', lastOnlineAtMs: 3000 },
+    { id: 'offline-history', handle: 'A', providerStatus: 'OFFLINE', lastOnlineAtMs: 9999 },
+    { id: 'offline-recorded', handle: 'B', providerStatus: 'OFFLINE', lastRecordedAtMs: 1000 },
+    {
+      id: 'archived-history',
+      handle: 'A',
+      providerStatus: 'OFFLINE',
+      archived: true,
+      lastOnlineAtMs: 9999,
+    },
+    {
+      id: 'archived-recorded',
+      handle: 'Z',
+      providerStatus: 'OFFLINE',
+      archived: true,
+      lastRecordedAtMs: 1000,
+    },
+  ] as Subject[];
+  expect(visibleSubjects(subjects, ['ARCHIVED', 'ONLINE', 'OFFLINE']).map(({ id }) => id)).toEqual([
+    'legacy-live',
+    'old-live',
+    'new-live',
+    'old-private',
+    'offline-recorded',
+    'offline-history',
+    'archived-recorded',
+    'archived-history',
+  ]);
+  expect(visibleSubjects(subjects, ['ARCHIVED', 'OFFLINE']).map(({ id }) => id)).toEqual([
+    'offline-recorded',
+    'offline-history',
+    'archived-recorded',
+    'archived-history',
+  ]);
+  expect(visibleSubjects(subjects, [])).toEqual([]);
 });

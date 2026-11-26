@@ -53,6 +53,7 @@ export class PortableTransactions {
   private checkpointWork: Promise<void> | undefined;
   private readonly checkpointAbort = new AbortController();
   private checkpointFailed = false;
+  private baselineVerified = false;
   private checkpointAt = Date.now();
   private checkpointRetryAt = 0;
   private sequence = 0;
@@ -125,21 +126,18 @@ export class PortableTransactions {
         keys: keys.map((row) => row.name),
       });
     }
-    const [prior] = await db.query<{ present: boolean }>(
-      "SELECT to_regclass('stv_library_state') IS NOT NULL AS present",
-    );
-    const priorState = prior.present
-      ? (
-          await db.query<{ sequence: number }>('SELECT sequence FROM stv_library_state WHERE id=1')
-        )[0]
-      : undefined;
     await db.query(`CREATE TABLE IF NOT EXISTS stv_library_state(
-      id SMALLINT PRIMARY KEY CHECK(id=1),library UUID NOT NULL,sequence BIGINT NOT NULL)`);
-    await db.query('INSERT INTO stv_library_state VALUES(1,$1,0) ON CONFLICT(id) DO NOTHING', [
-      options.libraryId,
-    ]);
-    const [state] = await db.query<{ library: string }>(
-      'SELECT library FROM stv_library_state WHERE id=1',
+      id SMALLINT PRIMARY KEY CHECK(id=1),library UUID NOT NULL,sequence BIGINT NOT NULL,
+      recovered BOOLEAN NOT NULL DEFAULT false)`);
+    await db.query(
+      'ALTER TABLE stv_library_state ADD COLUMN IF NOT EXISTS recovered BOOLEAN NOT NULL DEFAULT false',
+    );
+    await db.query(
+      'INSERT INTO stv_library_state(id,library,sequence) VALUES(1,$1,0) ON CONFLICT(id) DO NOTHING',
+      [options.libraryId],
+    );
+    const [state] = await db.query<{ library: string; sequence: number; recovered: boolean }>(
+      'SELECT library,sequence,recovered FROM stv_library_state WHERE id=1',
     );
     if (state.library !== options.libraryId) throw Error('PORTABLE_LIBRARY_MISMATCH');
     const filename = path.join(journalRoot, 'active.log');
@@ -157,11 +155,52 @@ export class PortableTransactions {
     const journal = new PortableTransactions(db, options, tables, file, lease);
     try {
       await journal.installCapture();
-      await journal.recover(priorState !== undefined);
+      // Old builds could skip checkpoint zero, then append ordinary writes to the empty
+      // projection. Rebuild that ambiguous generation only with its entire durable tail.
+      const previousZero =
+        !state.recovered &&
+        options.checkpoint?.baselineVerified !== true &&
+        (options.checkpoint?.sequence ?? 0) > 0 &&
+        options.previous?.sequence === 0
+          ? options.previous
+          : undefined;
+      // A fresh projection can still use an independently valid current checkpoint if
+      // its fallback artifact is absent. An ambiguous existing hot projection is preserved.
+      const ancestor =
+        previousZero &&
+        (state.sequence > 0 || (await validCheckpoint(options.mediaRoot, previousZero)))
+          ? previousZero
+          : undefined;
+      const verifyProjection =
+        !state.recovered &&
+        (options.checkpoint?.sequence === 0 ||
+          !!ancestor ||
+          options.checkpoint?.baselineVerified === true);
+      const recover = () =>
+        journal.recover(
+          state.sequence,
+          !state.recovered && (state.sequence === 0 || verifyProjection),
+          ancestor,
+        );
+      const changed =
+        verifyProjection && (state.sequence > 0 || ancestor)
+          ? await db.transaction(recover, { lane: 'background' })
+          : await recover();
+      // setval is nontransactional. Repair identities after the rebuild commits and
+      // before publishing the marker, so an interrupted reset is retried on attach.
+      if (changed || (!state.recovered && state.sequence > 0)) await journal.resetSequences();
+      const base = journal.currentCheckpoint;
+      journal.baselineVerified =
+        !base ||
+        ((base.sequence === 0 || base.baselineVerified === true) && (changed || state.recovered));
+      // Replace an ambiguous positive artifact before declaring the projection ready.
+      if (ancestor && options.publishCheckpoint) await journal.checkpoint();
+      if (!state.recovered)
+        await db.query('UPDATE stv_library_state SET recovered=true WHERE id=1');
       await journal.cleanupTemporaryCheckpoints();
       return journal;
     } catch (error) {
-      await file.close();
+      await journal.file.close();
       throw error;
     }
   }
@@ -315,14 +354,20 @@ export class PortableTransactions {
     }
     return offset;
   }
-  private async recover(hadState: boolean): Promise<void> {
-    let [state] = await this.db.query<{ sequence: number }>(
-      'SELECT sequence FROM stv_library_state WHERE id=1',
-    );
+  private async recover(
+    sequence: number,
+    restoreBaseline: boolean,
+    ancestor?: PortableCheckpoint,
+  ): Promise<boolean> {
+    // If the current artifact was produced from an unverified zero baseline, the
+    // original checkpoint and journal must reproduce its advertised head as well.
+    const requiredSequence = Math.max(sequence, ancestor ? this.currentCheckpoint!.sequence : 0);
     let restored = false;
-    if (this.currentCheckpoint && (!hadState || state.sequence < this.currentCheckpoint.sequence)) {
+    if (this.currentCheckpoint && (restoreBaseline || sequence < this.currentCheckpoint.sequence)) {
       let selected: PortableCheckpoint | undefined;
-      for (const checkpoint of [this.currentCheckpoint, this.previousCheckpoint]) {
+      for (const checkpoint of ancestor
+        ? [ancestor]
+        : [this.currentCheckpoint, this.previousCheckpoint]) {
         if (checkpoint && (await validCheckpoint(this.options.mediaRoot, checkpoint))) {
           selected = checkpoint;
           break;
@@ -336,17 +381,16 @@ export class PortableTransactions {
         library: this.options.libraryId,
         tables: [...this.tables.values()],
       });
-      state = { sequence: selected.sequence };
+      sequence = selected.sequence;
       restored = true;
       this.currentCheckpoint = selected;
-      // If the newest artifact is unusable, retain the valid fallback as the
-      // current checkpoint. A successful replacement will publish a new pair.
+      // Retain the chosen fallback until a verified replacement has been published.
       if (selected.file === this.previousCheckpoint?.file) {
         this.previousCheckpoint = undefined;
         this.checkpointFailed = true;
       }
     }
-    let applied = state.sequence,
+    let applied = sequence,
       head = this.currentCheckpoint?.sequence ?? 0;
     const sealed: (PortableCheckpoint & { start: number; end: number })[] = [];
     for (const name of await readdir(this.journalRoot)) {
@@ -365,7 +409,7 @@ export class PortableTransactions {
       const info = await lstat(path.join(this.journalRoot, file.file));
       if (!info.isFile() || info.isSymbolicLink()) throw Error('UNSAFE_PORTABLE_JOURNAL');
       sealedEnd = file.end;
-      if (file.end <= state.sequence) {
+      if (file.end <= sequence) {
         head = Math.max(head, file.end);
         continue;
       }
@@ -386,12 +430,13 @@ export class PortableTransactions {
       true,
       sealedEnd || (this.currentCheckpoint?.sequence ?? 0),
       applied,
+      requiredSequence,
     );
     if (active.first !== undefined && active.first > applied + 1)
       throw Error('PORTABLE_JOURNAL_CORRUPT');
     head = Math.max(head, active.last);
     applied = Math.max(applied, active.last);
-    if (state.sequence > head) throw Error('PORTABLE_JOURNAL_BEHIND_DATABASE');
+    if (requiredSequence > head) throw Error('PORTABLE_JOURNAL_BEHIND_DATABASE');
     this.sequence = applied;
     this.activeStart =
       active.first ?? Math.max(sealedEnd, this.currentCheckpoint?.sequence ?? 0) + 1;
@@ -399,7 +444,7 @@ export class PortableTransactions {
     for (const file of sealed)
       if (file.end > (this.currentCheckpoint?.sequence ?? 0))
         this.journalBytes += (await lstat(path.join(this.journalRoot, file.file))).size;
-    if (restored || this.replayed) await this.resetSequences();
+    return restored || this.replayed > 0;
   }
   private async openJournal(name: string): Promise<FileHandle> {
     const { constants } = await import('node:fs');
@@ -418,6 +463,7 @@ export class PortableTransactions {
     active: boolean,
     previous: number,
     applied: number,
+    requiredThrough = 0,
   ): Promise<{ first?: number; last: number }> {
     let position = 0,
       last = previous,
@@ -427,6 +473,7 @@ export class PortableTransactions {
       const header = Buffer.alloc(HEADER);
       if ((await this.read(header, position, file)) < HEADER) {
         if (!active) throw Error('PORTABLE_JOURNAL_CORRUPT');
+        if (last < requiredThrough) throw Error('PORTABLE_JOURNAL_BEHIND_DATABASE');
         await file.truncate(position);
         await file.sync();
         break;
@@ -443,6 +490,7 @@ export class PortableTransactions {
       const payload = Buffer.alloc(size);
       if ((await this.read(payload, position + HEADER, file)) < size) {
         if (!active) throw Error('PORTABLE_JOURNAL_CORRUPT');
+        if (last < requiredThrough) throw Error('PORTABLE_JOURNAL_BEHIND_DATABASE');
         await file.truncate(position);
         await file.sync();
         break;
@@ -618,6 +666,7 @@ export class PortableTransactions {
         tables: [...this.tables.values()],
         signal: this.checkpointAbort.signal,
       });
+      if (this.baselineVerified) checkpoint.baselineVerified = true;
       this.checkpointAbort.signal.throwIfAborted();
       await this.options.fault?.('before-checkpoint-publish');
       const previous = this.currentCheckpoint;

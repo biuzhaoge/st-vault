@@ -25,7 +25,11 @@ async function openPage(extraCookies = []) {
         window.__pinErrorAnimations++;
     });
   });
-  await page.goto(origin);
+  const document = await page.goto(origin);
+  const headers = document.headers();
+  assert.match(headers['content-security-policy'] ?? '', /frame-ancestors 'self'/);
+  assert.match(headers['content-security-policy'] ?? '', /script-src 'self'/);
+  assert.equal(headers['referrer-policy'], 'same-origin');
 }
 async function cookieHeader(name) {
   const cookie = (await context.cookies()).find((item) => item.name === name);

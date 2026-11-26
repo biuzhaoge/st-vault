@@ -2,6 +2,26 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { expect, it } from 'vitest';
 import { SystemSummary } from './SystemSummary';
 import type { SystemInfo } from './system';
+import {
+  beginDeletionProjection,
+  clearDeletionProjections,
+  failDeletionProjection,
+} from '../../shared/lib/deletion-projection';
+
+it('shows the most recent local deletion rejection in the status panel', () => {
+  const target = { kind: 'range', mode: 'unliked', fromMs: 60000, toMs: 120000 } as const;
+  try {
+    beginDeletionProjection('rejected', 'stripchat:42', target, [], []);
+    failDeletionProjection('rejected', '删除任务队列已满，请等待已有任务完成。');
+    const render = () =>
+      renderToStaticMarkup(<SystemSummary system={null} autoRecordingCount={0} />);
+    expect(render()).toMatch(/data-status-row="deletion"[^>]*>.*?删除任务队列已满/);
+    beginDeletionProjection('next', 'stripchat:42', target, [], []);
+    expect(render()).not.toContain('删除任务队列已满');
+  } finally {
+    clearDeletionProjections();
+  }
+});
 const system: SystemInfo = {
   version: 'test',
   capturedAtMs: 1000,

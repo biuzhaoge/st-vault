@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { checkMarkdown, checkSourceBoundaries } from './check-repository.mjs';
+import { checkMarkdown, checkRepository, checkSourceBoundaries } from './check-repository.mjs';
 
 async function fixture(files, run) {
   const root = await mkdtemp(path.join(tmpdir(), 'stv-repository-'));
@@ -31,6 +31,11 @@ test('rejects broken and machine-specific documentation links', async () => {
   await fixture({ 'README.md': '[missing](missing.md) [local](D:/private/notes.md)' }, (root) =>
     assert.equal(checkMarkdown(root, 'README.md').length, 2),
   );
+});
+test('includes the English root guide in repository link checks', async () => {
+  await fixture({ 'README.en.md': '[guide](missing.md)' }, (root) => {
+    assert.deepEqual(checkRepository(root), ['README.en.md: broken link missing.md']);
+  });
 });
 
 test('checks HTML language switches and hero images as local documentation links', async () => {

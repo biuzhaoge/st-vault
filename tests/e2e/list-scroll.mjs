@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
 import { chromium } from 'playwright-core';
 import { startFixture } from './support/fixture.mjs';
+import { createRouteDrain } from './support/route-drain.mjs';
 
 const fixture = await startFixture();
+const routes = createRouteDrain();
 const days = Number(process.env.STV_QA_SCROLL_DAYS ?? 7);
 assert([1, 7].includes(days));
-let browser, page;
+let browser;
 let releaseTimeline = () => undefined;
 let releaseFirstTrack = () => undefined;
 try {
@@ -13,7 +15,7 @@ try {
     executablePath: process.env.STV_QA_BROWSER_EXECUTABLE ?? '/usr/bin/chromium',
     headless: true,
   });
-  page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+  const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
   const errors = [];
   const timelineReads = [];
   let timelineGate = Promise.resolve();
@@ -30,7 +32,7 @@ try {
   await page.route('**/*', (route) =>
     new URL(route.request().url()).hostname === '127.0.0.1' ? route.continue() : route.abort(),
   );
-  await page.route('**/api/workbench?**', async (route) => {
+  await routes.route(page, '**/api/workbench?**', async (route) => {
     await timelineGate;
     const ids = new URL(route.request().url()).searchParams.get('ids')?.split(',') ?? [];
     if (firstTrackGate && ids.includes(firstTrackGate.id)) await firstTrackGate.ready;
@@ -435,6 +437,22 @@ try {
   await assertRevealOrder([previousId]);
   assert.deepEqual(await page.evaluate(() => window.__trackContinuityErrors), []);
   await visit(target);
+  const positions = await scroller.locator('.track-table > .track-row').evaluateAll((nodes) =>
+    nodes.map((row) => {
+      const box = row.getBoundingClientRect();
+      const table = row.parentElement.getBoundingClientRect();
+      return {
+        number: row.querySelector('.directory-row-number')?.textContent.trim(),
+        position: 1 + Math.round((box.top - table.top) / box.height),
+      };
+    }),
+  );
+  assert(
+    positions.length > 0 && positions[0].position > 1,
+    'The mounted rows start deep in the list',
+  );
+  for (const { number, position } of positions)
+    assert.equal(number, String(position), 'Virtual rows keep their absolute filtered positions');
   const rows = await page.locator('.track-row').evaluateAll((nodes) =>
     nodes.map((node) => ({
       height: Math.round(node.getBoundingClientRect().height),
@@ -456,7 +474,7 @@ try {
   // An offline broadcaster losing its latest recording moves down the sort,
   // but the viewport must stay with the neighboring rows, not follow that ID.
   let movedId = null;
-  await page.route('**/api/subjects', async (route) => {
+  await routes.route(page, '**/api/subjects', async (route) => {
     const response = await route.fetch();
     const subjects = await response.json();
     return route.fulfill({
@@ -499,7 +517,10 @@ try {
 } finally {
   releaseTimeline();
   releaseFirstTrack();
-  await page?.unrouteAll({ behavior: 'wait' });
-  await browser?.close();
-  await fixture.close();
+  try {
+    await routes.drain();
+  } finally {
+    await browser?.close();
+    await fixture.close();
+  }
 }

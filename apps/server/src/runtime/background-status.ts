@@ -13,6 +13,7 @@ interface Input {
   sites?: SiteRoutesStatus;
   snapshots: SnapshotJobsStatus | null;
   deletions: MediaDeletionJob[] | null;
+  deletionWaiting?: number;
   tasks: BackgroundTask[];
   client: {
     clients: number;
@@ -53,6 +54,8 @@ export function backgroundOverview(input: Input): BackgroundTask[] {
       job.state !== 'completed' &&
       !(job.state === 'failed' && job.error === 'media_selection_stale'),
   );
+  const waitingInView = active.filter((job) => job.state === 'waiting').length;
+  const deletionPending = active.length + Math.max(0, (input.deletionWaiting ?? 0) - waitingInView);
   const boundOrigin = account.connected ? account.origin : undefined;
   const access = sites && boundOrigin && sites.access?.origin === boundOrigin ? sites.access : null;
   const siteError = access?.error;
@@ -178,7 +181,7 @@ export function backgroundOverview(input: Input): BackgroundTask[] {
                 : active.length
                   ? 'waiting'
                   : 'idle',
-      pending: active.length,
+      pending: deletionPending,
       processed: active.length ? active.reduce((sum, job) => sum + job.processed, 0) : undefined,
       total: active.length ? active.reduce((sum, job) => sum + job.total, 0) : undefined,
       lastRunAtMs:

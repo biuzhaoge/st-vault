@@ -12,5 +12,9 @@ export default defineConfig({
       '/health': 'http://127.0.0.1:10002',
     },
   },
-  build: { outDir: 'dist', emptyOutDir: true },
+  build: {
+    outDir: 'dist',
+    emptyOutDir: true,
+    license: { fileName: 'assets/third-party-licenses.md' },
+  },
 });

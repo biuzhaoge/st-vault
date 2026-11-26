@@ -22,6 +22,33 @@ try {
     new URL(route.request().url()).hostname === '127.0.0.1' ? route.continue() : route.abort(),
   );
   await page.goto('http://127.0.0.1:10085');
+  const brand = await page.locator('.auth-card img').evaluate(async (image) => {
+    await image.decode();
+    const favicon = new Image();
+    favicon.src = document.querySelector('link[rel="icon"]').href;
+    await favicon.decode();
+    return [image, favicon].map((asset) => {
+      const canvas = document.createElement('canvas');
+      canvas.width = asset.naturalWidth;
+      canvas.height = asset.naturalHeight;
+      const context = canvas.getContext('2d');
+      context.drawImage(asset, 0, 0);
+      const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+      const alpha = pixels.filter((_, index) => index % 4 === 3);
+      return {
+        width: canvas.width,
+        height: canvas.height,
+        transparent: alpha.includes(0),
+        opaque: alpha.includes(255),
+      };
+    });
+  });
+  assert.equal(brand[0].width, 88 * 3, 'the largest supported brand rendering has a 3x PNG');
+  assert.equal(brand[1].width, 64, 'the favicon uses a separately sized image');
+  for (const asset of brand) {
+    assert.equal(asset.width, asset.height);
+    assert(asset.transparent && asset.opaque, 'the original brand transparency is preserved');
+  }
   for (const [width, height] of [
     [390, 844],
     [844, 390],
@@ -145,13 +172,15 @@ try {
       const directory = await page.evaluate(() => {
         const label = document.querySelector('.track-label');
         const cell = label.getBoundingClientRect();
-        const cover = label.querySelector('.track-cover-wrap').getBoundingClientRect();
-        const style = getComputedStyle(label);
+        const coverCell = label.querySelector('.track-cover-cell');
+        const bounds = coverCell.getBoundingClientRect();
+        const cover = coverCell.querySelector('.track-cover-wrap').getBoundingClientRect();
+        const style = getComputedStyle(coverCell);
         const gaps = [
-          cover.left - cell.left - parseFloat(style.borderLeftWidth),
-          cell.right - cover.right - parseFloat(style.borderRightWidth),
-          cover.top - cell.top - parseFloat(style.borderTopWidth),
-          cell.bottom - cover.bottom - parseFloat(style.borderBottomWidth),
+          cover.left - bounds.left - parseFloat(style.borderLeftWidth),
+          bounds.right - cover.right - parseFloat(style.borderRightWidth),
+          cover.top - bounds.top - parseFloat(style.borderTopWidth),
+          bounds.bottom - cover.bottom - parseFloat(style.borderBottomWidth),
         ];
         const filters = [...document.querySelectorAll('.subject-filters button')].map((button) => {
           const name = [...button.querySelectorAll('.filter-label,.filter-label-compact')]
@@ -193,9 +222,10 @@ try {
             .height,
         };
       });
+      const [leadingGap, ...coverInsets] = directory.gaps;
       assert(
-        Math.max(...directory.gaps) - Math.min(...directory.gaps) < 0.75,
-        `Cover insets must match on all four sides: ${JSON.stringify(directory)}`,
+        Math.abs(leadingGap) < 0.75 && Math.max(...coverInsets) - Math.min(...coverInsets) < 0.75,
+        `The cover should start at the number column and keep even insets elsewhere: ${JSON.stringify(directory)}`,
       );
       assert(
         directory.width < 150 && Math.abs(directory.width - directory.headerWidth) < 0.5,
@@ -228,11 +258,14 @@ try {
       );
       for (const [selector, size] of Object.entries(sizes)) {
         const key = `${width}:${selector}`;
+        const axes = ['.snapshot-pages', '.snapshot-actions button'].includes(selector)
+          ? ['height']
+          : ['width', 'height'];
         if (language === 'zh-CN') geometry.set(key, size);
         else if (
           size &&
           geometry.get(key) &&
-          ['width', 'height'].some((axis) => Math.abs(size[axis] - geometry.get(key)[axis]) > 1)
+          axes.some((axis) => Math.abs(size[axis] - geometry.get(key)[axis]) > 1)
         )
           problems.push({
             language,
@@ -657,10 +690,10 @@ try {
         });
     }
     await page.setViewportSize({ width: 1920, height: 900 });
-    assert.equal(
+    assert.match(
       (await page.locator('.record-button').first().textContent()).trim(),
-      '',
-      'Cover recording controls have no visible labels',
+      /^\d+$/,
+      'Row recording controls use the language-independent row number',
     );
     assert(await page.locator('.record-button').first().getAttribute('aria-description'));
     await page.getByRole('button', { name: '00 演示直播', exact: true }).click();
@@ -682,12 +715,6 @@ try {
         await page.waitForFunction(() => !!document.fullscreenElement);
         await page.locator('.inline-player:fullscreen .media-review').waitFor();
       }
-      const sizes = await page.locator('.snapshot-pages').evaluate((node) =>
-        [...node.querySelectorAll('button'), node].map((item) => {
-          const rect = item.getBoundingClientRect();
-          return { width: rect.width, height: rect.height };
-        }),
-      );
       await page.waitForTimeout(400);
       assert.equal(
         await page.locator('.snapshot-pages').isVisible(),
@@ -734,14 +761,33 @@ try {
       );
       if (language === 'zh-CN')
         await page.screenshot({ path: `.local/qa/snapshot-tools-${mode}.png` });
-      const key = `actions:${mode}`;
-      if (language === 'zh-CN') geometry.set(key, sizes);
-      else
-        assert.deepEqual(
-          sizes,
-          geometry.get(key),
-          `${mode} range actions must keep bilingual dimensions`,
+      const layout = await page.locator('.snapshot-pages').evaluate((nav) => {
+        const bounds = nav.getBoundingClientRect();
+        const section = nav.closest('.snapshot-section').getBoundingClientRect();
+        const buttons = [...nav.querySelectorAll('button')].filter((button) =>
+          button.checkVisibility({ visibilityProperty: true }),
         );
+        return {
+          height: bounds.height,
+          centered: Math.abs(bounds.left + bounds.right - section.left - section.right) <= 2,
+          fits: bounds.left >= section.left - 1 && bounds.right <= section.right + 1,
+          hitTargets: buttons
+            .filter((button) => !button.disabled)
+            .every((button) => {
+              const rect = button.getBoundingClientRect();
+              return button.contains(
+                document.elementFromPoint(rect.x + rect.width / 2, rect.y + rect.height / 2),
+              );
+            }),
+        };
+      });
+      assert(
+        layout.centered && layout.fits && layout.hitTargets,
+        JSON.stringify({ language, mode, layout }),
+      );
+      const key = `actions:${mode}`;
+      if (language === 'zh-CN') geometry.set(key, layout.height);
+      else assert.equal(layout.height, geometry.get(key), `${mode}: bilingual toolbar height`);
       const clipping = await page.locator('.snapshot-actions button > span').evaluateAll((labels) =>
         labels.flatMap((node) => {
           if (!node.getBoundingClientRect().width) return [];

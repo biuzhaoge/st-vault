@@ -11,6 +11,7 @@ import {
 import { SqlDatabase } from './sql.js';
 import { initializeCatalogSchema } from './catalog-schema.js';
 import { initializeScreenshotSchema } from '../previews/job-schema.js';
+import { recountJobStatistics } from '../previews/job-statistics.js';
 import { LibraryStorage } from '../library/storage.js';
 
 async function present(filename: string): Promise<boolean> {
@@ -142,7 +143,11 @@ export async function migrateDeployment(
     const canonical = await SqlDatabase.open(path.join(dataRoot, 'indexes', manifest.id));
     opened.push(canonical);
     await initializeCatalogSchema(canonical, manifest.createdAtMs);
-    const transfer = async (source: string, target: SqlDatabase, omit: readonly string[] = []) => {
+    const transfer = async (
+      source: string,
+      target: SqlDatabase,
+      options: { omit?: readonly string[]; afterCopy?: (db: SqlDatabase) => Promise<void> } = {},
+    ) => {
       signal?.throwIfAborted();
       const staging =
         target.schema + '_m' + createHash('sha256').update(source).digest('hex').slice(0, 12);
@@ -166,7 +171,7 @@ export async function migrateDeployment(
         )
         .all<{ name: string }>(staging, '\\_import%');
       const names = tables
-        .filter((table) => !table.name.startsWith('_import') && !omit.includes(table.name))
+        .filter((table) => !table.name.startsWith('_import') && !options.omit?.includes(table.name))
         .map((table) => table.name);
       const targets = await target
         .prepare('SELECT tablename AS name FROM pg_tables WHERE schemaname=?')
@@ -208,6 +213,7 @@ export async function migrateDeployment(
           if (counts.actual !== counts.expected) throw Error('MIGRATION_ROW_COUNT_MISMATCH');
           log('table_verified', { table: name, rows: counts.actual });
         }
+        await options.afterCopy?.(target);
         for (const trigger of triggerRows)
           await target.exec(
             `ALTER TABLE ${quote(trigger.relation)} ENABLE TRIGGER ${quote(trigger.name)}`,
@@ -230,7 +236,7 @@ export async function migrateDeployment(
             targets.map((table) => `${quote(target.schema)}.${quote(table.name)}`).join(','),
         );
     };
-    await transfer(catalogSource, canonical, ['library_state']);
+    await transfer(catalogSource, canonical, { omit: ['library_state'] });
     const privateSource = path.join(dataRoot, 'app.sqlite');
     if (await present(privateSource)) {
       const frozen = path.join(backups, 'private.sqlite');
@@ -250,7 +256,7 @@ export async function migrateDeployment(
       const target = await SqlDatabase.open(path.join(queueRoot, 'jobs'));
       opened.push(target);
       await initializeScreenshotSchema(target);
-      await transfer(frozen, target);
+      await transfer(frozen, target, { omit: ['job_statistics'], afterCopy: recountJobStatistics });
     }
     signal?.throwIfAborted();
     for (const target of opened) {

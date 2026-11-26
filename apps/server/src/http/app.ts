@@ -42,6 +42,7 @@ import { registerPersonal } from './personal.js';
 import { registerMediaSelection } from './media-selection.js';
 import { recordingRange } from './recording-range.js';
 import { registerPlayback } from './playback.js';
+import { archiveWindows } from '../archive/calendar-window.js';
 import { SyncClock } from '../runtime/sync-clock.js';
 import { drainServices } from '../runtime/lifecycle.js';
 import { runBackground } from '../runtime/background.js';
@@ -146,7 +147,8 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     logContext.run({ requestId: request.id }, done);
   });
   app.addHook('onResponse', async (request, reply) => {
-    request.log.info({
+    const level = reply.statusCode >= 500 ? 'error' : 'info';
+    request.log[level]({
       event: 'http_completed',
       method: request.method,
       route: request.routeOptions.url,
@@ -266,8 +268,6 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       ['METADATA_READ_BUSY', 'METADATA_STORAGE_BUSY', 'MEDIA_SELECTION_QUEUE_FULL'].includes(code)
     )
       return reply.header('retry-after', 1).code(503).send({ error: 'archive_busy' });
-    if (code === 'MEDIA_DELETION_QUEUE_FULL')
-      return reply.code(429).send({ error: 'media_deletion_queue_full' });
     if (code === 'INVALID_MEDIA_SELECTION')
       return reply.code(400).send({ error: 'invalid_request' });
     if (code === 'INVALID_CURSOR') return reply.code(400).send({ error: 'invalid_cursor' });
@@ -491,6 +491,10 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   app.get('/api/account-sync', () => accountSync.status());
   registerAccountAvatar(app, accountSync);
   registerEvents(app, archive);
+  app.get('/api/archive-calendar', async (_request, reply) => {
+    reply.header('cache-control', 'private, no-store');
+    return { emptyDays: (await archive.emptyRecordingDays?.()) ?? [] };
+  });
   const execution = getExecutionPolicy();
   registerWorkbench(app, archive, {
     maxRequests: Math.max(4, Math.min(16, Math.floor(execution.networkConcurrency / 4))),
@@ -584,14 +588,11 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   app.put('/api/subjects/recording-default', async (request) => {
     const { enabled } = z.object({ enabled: z.boolean() }).strict().parse(request.body);
     const requestedAtMs = Date.now();
-    await archive.setGlobalRecording(enabled);
+    const ids = await archive.setGlobalRecording(enabled);
     recordAll = enabled;
     sync.notify(['subjects', 'system']);
     runBackground(
       (async () => {
-        const ids = (await archive.listSubjects({ activity: false }))
-          .filter((s) => !s.archived)
-          .map((s) => s.id);
         await supervisor.requestRecording?.(ids, requestedAtMs);
         await supervisor.reconcile();
       })(),
@@ -644,8 +645,8 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
         to: z.coerce.number().int().positive().max(Number.MAX_SAFE_INTEGER),
       })
       .strict()
-      .refine((value) => value.to > value.from && value.to - value.from <= 9 * 86400000)
       .parse(request.query);
+    await archiveWindows(archive, query.from, query.to);
     const range = await recordingRange(archive, id, query.from, query.to);
     return {
       subjectId: id,
@@ -653,7 +654,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       toMs: range?.toMs ?? null,
     };
   });
-  registerPreviews(app, previews);
+  registerPreviews(app, previews, archive);
   const playback = registerPlayback(app, {
     archive,
     clock,
@@ -769,9 +770,15 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   };
   app.get('/', async (_request, reply) => {
     const file = await sendUiFile('index.html');
-    return file
-      ? reply.type(file.type).send(createReadStream(file.file))
-      : reply.code(503).send({ error: 'ui_not_built' });
+    if (!file) return reply.code(503).send({ error: 'ui_not_built' });
+    return reply
+      .header(
+        'content-security-policy',
+        "script-src 'self'; worker-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'self'",
+      )
+      .header('referrer-policy', 'same-origin')
+      .type(file.type)
+      .send(createReadStream(file.file));
   });
   app.get('/assets/*', async (request, reply) => {
     const file = await sendUiFile(`assets/${(request.params as { '*': string })['*']}`);

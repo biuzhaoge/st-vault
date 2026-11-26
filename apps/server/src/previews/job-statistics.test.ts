@@ -99,3 +99,23 @@ it('rolls counts and oldest state back with failed or interrupted transactions',
     await db.close();
   }
 });
+
+it('repairs a previously imported queue with an existing stale statistics row only once', async () => {
+  const db = await fixture();
+  try {
+    await db.exec(`INSERT INTO jobs VALUES(1,'running',10,0),(2,'failed',20,0),(3,'done',30,0);
+      CREATE TABLE job_statistics(id BIGINT PRIMARY KEY,pending BIGINT NOT NULL,running BIGINT NOT NULL,
+        failed BIGINT NOT NULL,completed BIGINT NOT NULL);
+      INSERT INTO job_statistics VALUES(1,0,0,0,0)`);
+    await initializeJobStatistics(db);
+    await assertExact(db);
+    await db.exec("UPDATE jobs SET state='pending' WHERE state='running'");
+    await assertExact(db);
+    const exec = vi.spyOn(db, 'exec');
+    await initializeJobStatistics(db);
+    expect(exec.mock.calls.some(([sql]) => /COUNT\(\*\)/i.test(sql))).toBe(false);
+    exec.mockRestore();
+  } finally {
+    await db.close();
+  }
+});

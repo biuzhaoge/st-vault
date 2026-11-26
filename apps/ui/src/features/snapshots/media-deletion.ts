@@ -13,6 +13,9 @@ export class DeletionObserver {
   private jobs = new Map<string, MediaDeletionJob>();
   private initialized = false;
   private readonly submissions = new Set<string>();
+  has(id: string): boolean {
+    return this.jobs.has(id);
+  }
   submit(id: string): void {
     if (!this.initialized) this.submissions.add(id);
   }
@@ -40,7 +43,7 @@ export class DeletionObserver {
     const previous = this.jobs.get(job.id);
     const jobs = this.merge([job]);
     this.jobs = new Map(jobs.map((item) => [item.id, item]));
-    return { jobs, accepted: previous ? [] : [this.jobs.get(job.id)!] };
+    return { jobs, accepted: previous ? [] : [this.jobs.get(job.id) ?? job] };
   }
   update(jobs: MediaDeletionJob[]): {
     jobs: MediaDeletionJob[];

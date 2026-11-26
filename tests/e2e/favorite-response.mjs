@@ -5,6 +5,7 @@ import { startFixture } from './support/fixture.mjs';
 const fixture = await startFixture();
 let browser;
 let release;
+let releaseInitialRead;
 let arrived;
 const nextWrite = () => new Promise((resolve) => (arrived = resolve));
 try {
@@ -21,13 +22,17 @@ try {
   await page.goto('http://127.0.0.1:10085');
   await page.getByLabel('6 位 PIN', { exact: true }).fill('012345');
   await page.getByRole('button', { name: '00 演示直播', exact: true }).click();
-  const heart = page.locator('.snapshot-favorite').first();
-  const nextHeart = page.locator('.snapshot-favorite').nth(1);
+  const card = page
+    .locator('.snapshot-grid button[data-unit-index][data-favorite-ready="true"]')
+    .first();
+  const nextCard = page
+    .locator('.snapshot-grid button[data-unit-index][data-favorite-ready="true"]')
+    .nth(1);
   await page.waitForFunction(() => {
-    const button = document.querySelector('.snapshot-favorite');
-    return button && !button.disabled;
+    const button = document.querySelector('.snapshot-grid button[data-unit-index][data-liked]');
+    return button?.dataset.favoriteReady === 'true';
   });
-  assert.equal(await heart.getAttribute('aria-pressed'), 'false');
+  assert.equal(await card.getAttribute('data-liked'), 'false');
   let reads = 0;
   let writes = 0;
   page.on('request', (request) => {
@@ -46,28 +51,28 @@ try {
   const waitVisual = (liked, busy) =>
     page.waitForFunction(
       ({ liked, busy }) => {
-        const button = document.querySelector('.snapshot-favorite');
+        const button = document.querySelector('.snapshot-grid button[data-unit-index][data-liked]');
         return (
-          button?.getAttribute('aria-pressed') === String(liked) &&
+          button?.getAttribute('data-liked') === String(liked) &&
           (button.getAttribute('aria-busy') === 'true') === busy &&
-          (busy || !button.disabled)
+          (busy || (!button.disabled && button.dataset.favoriteReady === 'true'))
         );
       },
       { liked, busy },
     );
   const noOverlay = async () => assert.equal(await page.locator('.snapshot-feedback').count(), 0);
   const firstWrite = nextWrite();
-  await heart.click();
+  await card.dblclick();
   await waitVisual(true, true);
   await firstWrite;
   await page.waitForFunction(
     () => document.querySelector('.snapshot-pages')?.getAttribute('aria-busy') === 'true',
   );
   assert.equal(reads, 0, 'known page facts must skip the preparatory query');
-  assert.equal(await nextHeart.isEnabled(), true, 'another heart must remain clickable');
-  await nextHeart.click();
-  assert.equal(await nextHeart.getAttribute('aria-pressed'), 'true');
-  assert.equal(await nextHeart.getAttribute('aria-busy'), 'true');
+  assert.equal(await nextCard.isEnabled(), true, 'another card must remain clickable');
+  await nextCard.dblclick();
+  assert.equal(await nextCard.getAttribute('data-liked'), 'true');
+  assert.equal(await nextCard.getAttribute('aria-busy'), 'true');
   assert.equal(writes, 1, 'queued writes must wait for the committed revision');
   await noOverlay();
   const committed = page.waitForResponse(
@@ -84,14 +89,17 @@ try {
   release();
   await queuedCommitted;
   await page.waitForFunction(
-    () => document.querySelectorAll('.snapshot-favorite')[1]?.getAttribute('aria-busy') !== 'true',
+    () =>
+      document
+        .querySelectorAll('.snapshot-grid button[data-unit-index][data-liked]')[1]
+        ?.getAttribute('aria-busy') !== 'true',
   );
-  assert.equal(await nextHeart.getAttribute('aria-pressed'), 'true');
+  assert.equal(await nextCard.getAttribute('data-liked'), 'true');
 
-  // A rejected optimistic unlike returns to the persisted heart without replaying a write.
+  // A rejected optimistic unlike returns to the persisted card without replaying a write.
   reject = true;
   const secondWrite = nextWrite();
-  await heart.click();
+  await card.dblclick();
   await waitVisual(false, true);
   await secondWrite;
   release();
@@ -109,7 +117,7 @@ try {
 
   reject = false;
   const thirdWrite = nextWrite();
-  await heart.click();
+  await card.dblclick();
   await waitVisual(false, true);
   await thirdWrite;
   release();
@@ -118,18 +126,80 @@ try {
   await page.reload();
   await waitVisual(false, false);
   await noOverlay();
+  const previouslyLiked = await nextCard.getAttribute('data-key');
+  assert.equal(await nextCard.getAttribute('data-liked'), 'true');
+  await page.unroute('**/unit-favorites');
+  const held = new Promise((resolve) => {
+    releaseInitialRead = resolve;
+  });
+  let initialSeen,
+    holding = true;
+  const seen = new Promise((resolve) => {
+    initialSeen = resolve;
+  });
+  const exactReads = [],
+    unknownWrites = [],
+    playbacks = [];
+  await page.route('**/unit-favorites/query', async (route) => {
+    const { unitIds } = route.request().postDataJSON();
+    if (unitIds.length === 1) exactReads.push(unitIds[0]);
+    if (holding && unitIds.length > 1) {
+      holding = false;
+      const original = await route.fetch();
+      initialSeen();
+      await held;
+      await route.fulfill({ response: original });
+    } else await route.continue();
+  });
+  page.on('request', (request) => {
+    if (request.method() !== 'POST') return;
+    if (request.url().endsWith('/unit-favorites')) unknownWrites.push(request.postDataJSON());
+    if (new URL(request.url()).pathname === '/api/playback') playbacks.push(request.postDataJSON());
+  });
+  await page.reload();
+  await seen;
+  const unknown = page.locator(`.snapshot-grid button[data-key="${previouslyLiked}"]`);
+  await unknown.waitFor();
+  assert.equal(await unknown.getAttribute('data-favorite-ready'), 'false');
+  const beforePlayback = playbacks.length;
+  const committedUnknown = page.waitForResponse(
+    (r) => r.request().method() === 'POST' && r.url().endsWith('/unit-favorites'),
+    { timeout: 4_000 },
+  );
+  const [reply] = await Promise.all([committedUnknown, unknown.dblclick()]).catch((cause) => {
+    throw Error('A double click while the page favorite query is held must toggle the exact unit', {
+      cause,
+    });
+  });
+  assert.equal(reply.status(), 200);
+  assert.deepEqual(exactReads, [previouslyLiked]);
+  assert.equal(unknownWrites.length, 1);
+  assert.deepEqual(unknownWrites[0].unitIds, [previouslyLiked]);
+  assert.equal(unknownWrites[0].liked, false, 'The real saved favorite was already on');
+  releaseInitialRead();
+  await page.waitForFunction((id) => {
+    const card = document.querySelector(`.snapshot-grid button[data-key="${id}"]`);
+    return (
+      card?.dataset.favoriteReady === 'true' &&
+      card.dataset.liked === 'false' &&
+      card.getAttribute('aria-busy') !== 'true'
+    );
+  }, previouslyLiked);
+  assert.equal(playbacks.length, beforePlayback);
   assert.deepEqual(errors, []);
   console.log(
     JSON.stringify({
-      immediateHeart: true,
-      rapidDifferentHearts: true,
+      immediateCard: true,
+      rapidDifferentCards: true,
       redundantRead: false,
       rollback: true,
       persisted: true,
+      unknownInitialFavoriteSafelyToggled: true,
       overlay: false,
     }),
   );
 } finally {
+  releaseInitialRead?.();
   release?.();
   await browser?.close();
   await fixture.close();

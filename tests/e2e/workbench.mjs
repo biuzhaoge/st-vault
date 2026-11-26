@@ -118,6 +118,18 @@ try {
     };
   });
   const lane = () => page.locator(`[data-subject-id="${info.subjectId}"] .track-lane`);
+  const directoryFilters = page.locator('.subject-filters');
+  const selectedDirectoryFilters = () =>
+    directoryFilters
+      .locator('button[aria-pressed="true"]')
+      .evaluateAll((items) => items.map((item) => item.getAttribute('aria-label')));
+  const showDirectoryGroups = async (...names) => {
+    const selected = await selectedDirectoryFilters();
+    const enable = names.filter((name) => !selected.includes(name));
+    const disable = selected.filter((name) => !names.includes(name));
+    for (const name of [...enable, ...disable])
+      await directoryFilters.getByRole('button', { name, exact: true }).click();
+  };
   const view = () =>
     lane().evaluate((element) => ({
       from: Number(element.dataset.from),
@@ -219,12 +231,12 @@ try {
   await lane().waitFor();
   await page.locator('.account-trigger-name').filter({ hasText: 'qa_user' }).waitFor();
   assert.equal(await page.locator('.account-tool .tool-trigger').innerText(), 'qa_user');
-  assert.equal(await page.locator('.subject-filters button').count(), 3);
-  await page.locator('.subject-filters').getByRole('button', { name: '归档', exact: true }).click();
+  assert.equal(await directoryFilters.getByRole('button').count(), 3);
+  await showDirectoryGroups('归档');
   await page.waitForSelector('[data-subject-id="stripchat:300"]');
   assert.equal(await page.locator('.track-row').count(), 1);
   assert.equal(await page.locator('.track-row').getByRole('switch').count(), 0);
-  await page.locator('.subject-filters').getByRole('button', { name: '在线', exact: true }).click();
+  await showDirectoryGroups('在线');
   await lane().waitFor();
   await page
     .locator('.directory')
@@ -558,13 +570,21 @@ try {
     return [css.getPropertyValue('--orange').trim(), css.getPropertyValue('--private').trim()];
   });
   assert.notEqual(eventColors[0], eventColors[1]);
-  const longHistory = page.locator('.history-subject .overflow-text.is-overflowing').first();
-  await longHistory.hover();
+  const historyName = page
+    .getByRole('button', { name: '在列表中定位 00 演示直播', exact: true })
+    .first()
+    .locator('.overflow-text');
+  assert.equal(await historyName.textContent(), '00 演示直播');
+  assert.equal(await historyName.getAttribute('title'), '00 演示直播');
+  // Keep the marquee regression independent of the lengths of fixture names.
+  await historyName.evaluate((node) => node.style.setProperty('max-width', '32px'));
+  await historyName.hover();
   await page.waitForFunction(() =>
     [...document.querySelectorAll('.history-subject .overflow-text.is-overflowing > span')].some(
       (node) => getComputedStyle(node).animationName === 'history-cell-pan',
     ),
   );
+  await historyName.evaluate((node) => node.style.removeProperty('max-width'));
   assert.equal(
     await page
       .locator('.history-event-line')
@@ -583,6 +603,7 @@ try {
     unreadBoldAfterAck: true,
     normalAfterReopen: true,
     avatarColumn: true,
+    currentNameOnly: true,
   };
   const navigationStarted = Date.now();
   // The fixture briefly re-follows 300 to create a confirmed history event,
@@ -601,11 +622,11 @@ try {
       document.querySelector('.subject-filters button[aria-label="归档"] .filter-count')
         ?.textContent === '1',
   );
-  for (const [id, filter] of [
-    [299, '在线'],
-    [299, '在线'],
-    [297, '离线'],
-    [300, '归档'],
+  for (const [id, groups] of [
+    [299, ['在线']],
+    [299, ['在线']],
+    [297, ['在线', '离线']],
+    [300, ['在线', '离线', '归档']],
   ]) {
     await page.locator('.track-table-scroll').evaluate((node) => {
       node.scrollTop = 0;
@@ -623,10 +644,7 @@ try {
         `stripchat:${id}`,
       id,
     );
-    assert.equal(
-      await page.locator('.subject-filters button.active').getAttribute('aria-label'),
-      filter,
-    );
+    assert.deepEqual(await selectedDirectoryFilters(), groups);
     const visible = await row.evaluate((node) => {
       const box = node.getBoundingClientRect(),
         viewport = node.closest('.track-table-scroll').getBoundingClientRect();
@@ -660,7 +678,7 @@ try {
       'false',
     );
   }
-  await page.locator('.subject-filters').getByRole('button', { name: '在线', exact: true }).click();
+  await showDirectoryGroups('在线');
   await lane().waitFor();
   report.checks.historyNavigation = {
     deepVirtualRow: true,
@@ -907,12 +925,26 @@ try {
     await statusPanel.getByRole('heading', { name: '关注清单', exact: true }).count(),
     0,
   );
-  const recordingStats = statusPanel.locator('[data-status-row="recording"]');
-  assert.match(await recordingStats.innerText(), /\d+ 录制 · \d+ 自动录制/);
-  const statsAlignment = await recordingStats
-    .locator('span')
-    .evaluateAll((nodes) => nodes.map((node) => node.getBoundingClientRect().left));
-  assert(statsAlignment[1] > statsAlignment[0], 'Recording counters belong on the right');
+  const recordingCounts = await page.evaluate(async () => {
+    const [system, subjects] = await Promise.all(
+      ['/api/system', '/api/subjects'].map(async (url) => (await fetch(url)).json()),
+    );
+    return [system.capture.active, subjects.filter((subject) => subject.autoRecord).length];
+  });
+  for (const [index, [id, label]] of [
+    ['recording', '录制中'],
+    ['auto-recording', '自动录制'],
+  ].entries()) {
+    const row = statusPanel.locator(`[data-status-row="${id}"]`);
+    const title = row.locator('.panel-row-label');
+    const badge = row.locator('.panel-badge');
+    assert.equal((await title.innerText()).trim(), label);
+    assert.equal((await badge.innerText()).trim(), String(recordingCounts[index]));
+    assert(
+      (await badge.boundingBox()).x > (await title.boundingBox()).x,
+      'Counter belongs on the right',
+    );
+  }
   assert.equal(await statusPanel.locator('.runtime-settings').count(), 0);
   await settleGlass();
   await verifyPanel();
@@ -922,6 +954,8 @@ try {
       .locator('[data-status-row]')
       .evaluateAll((nodes) => nodes.map((row) => row.dataset.statusRow));
   const normalStatusRows = await statusRows();
+  const siteAccess = statusPanel.locator('[data-status-row="site-access"]');
+  await siteAccess.locator('.panel-badge').filter({ hasText: 'fast.invalid' }).waitFor();
   archiveFault = true;
   await page.evaluate(() =>
     window.dispatchEvent(new CustomEvent('stv-sync', { detail: ['system'] })),
@@ -929,10 +963,8 @@ try {
   await statusPanel.locator('.archive-health.is-error').waitFor();
   await page.locator('.header-tool:nth-child(2) .tool-alert').waitFor();
   assert.match(await statusPanel.locator('.archive-health').innerText(), /工作线程响应超时/);
-  await statusPanel
-    .locator('[data-status-row="sync"]')
-    .filter({ hasText: 'fast.invalid' })
-    .waitFor();
+  assert.equal(await siteAccess.locator('.panel-badge').innerText(), '异常');
+  assert.match(await siteAccess.locator('.system-row-note').innerText(), /绑定站点访问失败/);
   assert.deepEqual(await statusRows(), normalStatusRows);
   await page.screenshot({ path: path.join(outputRoot, 'status-panel-error.png') });
   archiveFault = false;
@@ -1158,7 +1190,7 @@ try {
     { id: info.subjectId, before: originalRecording },
   );
   assert.equal(await page.locator('video').count(), 0);
-  await record.click();
+  await record.press('Space');
   await page.waitForFunction(
     ({ id, before }) => {
       const button = document.querySelector('[data-subject-id="' + id + '"] .record-button');
@@ -1170,17 +1202,20 @@ try {
     .locator('[data-subject-id="' + info.subjectId + '"] .track-label')
     .evaluate((node) => {
       const preview = node.querySelector('.track-cover-wrap').getBoundingClientRect();
-      const icon = node.querySelector('.record-button').getBoundingClientRect();
+      const index = node.querySelector('.directory-row-index');
+      const control = index.querySelector('.record-button');
+      const numeral = control.querySelector('.directory-row-number');
+      const icon = control.getBoundingClientRect();
+      const number = numeral.getBoundingClientRect();
       return {
         width: node.getBoundingClientRect().width,
         headerWidth: document.querySelector('.directory').getBoundingClientRect().width,
         background: getComputedStyle(node).backgroundColor,
         name: getComputedStyle(node.querySelector('.subject-name')).color,
-        inside:
-          icon.left >= preview.left &&
-          icon.right <= preview.right &&
-          icon.top >= preview.top &&
-          icon.bottom <= preview.bottom,
+        centeredRecordingNumber:
+          icon.right <= preview.left + 0.5 &&
+          Math.abs(icon.top + icon.bottom - number.top - number.bottom) < 2 &&
+          Math.abs(icon.left + icon.right - number.left - number.right) < 2,
       };
     });
   assert.equal(previewStyle.width, previewStyle.headerWidth);
@@ -1267,7 +1302,7 @@ try {
     .first()
     .evaluate((row) => Math.round(row.getBoundingClientRect().height));
   assert.equal(subjectRowHeight, 72);
-  assert.equal(previewStyle.inside, true);
+  assert.equal(previewStyle.centeredRecordingNumber, true);
   assert.equal(await page.locator('.timeline-filmstrip').count(), 0);
   report.checks.preview = {
     ...previewStyle,
@@ -1557,20 +1592,24 @@ try {
       );
   }
   report.checks.stablePlayer = { idleFrame, playingFrame };
-  assert.equal(await page.locator('.player-heading input').count(), 0);
-  await page
-    .locator('.subject-former-names')
-    .getByText('曾用名：旧名 Synthetic', { exact: true })
-    .waitFor();
-  await page
-    .locator('[data-subject-id="' + info.subjectId + '"] .subject-name small')
-    .getByText('旧名 Synthetic', { exact: true })
-    .waitFor();
+  const previousName = '旧名 Synthetic';
+  const playerHeading = page.locator('.player-heading');
+  const playerFormerNames = playerHeading.getByText(`曾用名：${previousName}`, { exact: true });
+  const subjectCover = page.locator(`[data-subject-id="${info.subjectId}"] .subject-preview`);
+  assert.equal(await playerHeading.locator('input').count(), 0);
+  await playerFormerNames.waitFor();
+  assert.equal(await playerFormerNames.getAttribute('title'), previousName);
+  assert.equal(await subjectCover.locator('.subject-name').textContent(), '00 演示直播');
+  assert.equal(await subjectCover.getAttribute('title'), `00 演示直播 · ${info.subjectId}`);
   const savedProfile = await (await context.request.get(origin + '/api/subjects')).json();
   assert.deepEqual(savedProfile.find((row) => row.id === info.subjectId).formerNames, [
-    '旧名 Synthetic',
+    previousName,
   ]);
-  report.checks.formerNames = { automaticallyRecorded: true, readOnly: true, visibleInList: true };
+  report.checks.formerNames = {
+    automaticallyRecorded: true,
+    readOnly: true,
+    playerHeadingOnly: true,
+  };
   report.checks.playerLayout.liveGap = await playerSpacing();
   assert((await playerSpacing()) <= 16);
   await assertSelectedSpan();
@@ -1631,9 +1670,9 @@ try {
     }));
   assert.equal(publicCell.name, privateCell.name);
   assert.notEqual(publicCell.background, privateCell.background);
-  await page.locator('.subject-filters').getByRole('button', { name: '离线', exact: true }).click();
+  await showDirectoryGroups('离线');
   await page.waitForSelector('.row-connection[data-offscreen="filtered"]');
-  await page.locator('.subject-filters').getByRole('button', { name: '在线', exact: true }).click();
+  await showDirectoryGroups('在线');
   await lane().waitFor();
   await page.locator('.track-table-scroll').evaluate((node) => {
     node.scrollTop = 600;
@@ -2127,7 +2166,14 @@ try {
   await wakeChrome();
   await page.getByRole('button', { name: '退出全屏', exact: true }).click();
   await page.waitForFunction(() => !document.fullscreenElement);
-  const heart = page.locator('.snapshot-favorite').first();
+  const card = page
+    .locator('.snapshot-grid button[data-unit-index][data-favorite-ready="true"]')
+    .first();
+  const waitFavorite = (liked) =>
+    page.waitForFunction((liked) => {
+      const card = document.querySelector('.snapshot-grid button[data-unit-index]');
+      return card?.dataset.liked === String(liked) && card.getAttribute('aria-busy') !== 'true';
+    }, liked);
   // Lose a completed write's response, hold its readback, then start a newer
   // operation. The old reconciliation must not release its lock or selection.
   let holdReads = false,
@@ -2150,7 +2196,7 @@ try {
   await page.route('**/api/subjects/*/unit-favorites/query', delayedRead);
   await page.route('**/api/subjects/*/unit-favorites', lostLike);
   try {
-    await heart.click();
+    await card.dblclick();
     await reading;
     await page
       .locator('.snapshot-actions')
@@ -2170,9 +2216,7 @@ try {
       .getByRole('button', { name: '取消', exact: true })
       .click();
     await wakeSnapshots();
-    await page.waitForFunction(
-      () => document.querySelector('.snapshot-favorite')?.getAttribute('aria-pressed') === 'true',
-    );
+    await waitFavorite(true);
     report.checks.uncertainMutation = {
       completedWriteRecovered: true,
       oldReadPreservesRangeDialog: true,
@@ -2182,20 +2226,14 @@ try {
     await page.unroute('**/api/subjects/*/unit-favorites/query', delayedRead);
     await page.unroute('**/api/subjects/*/unit-favorites', lostLike);
   }
-  await heart.click();
-  await page.waitForFunction(
-    () => document.querySelector('.snapshot-favorite')?.getAttribute('aria-pressed') === 'false',
-  );
-  await heart.click();
-  await page.waitForFunction(
-    () => document.querySelector('.snapshot-favorite')?.getAttribute('aria-pressed') === 'true',
-  );
-  await heart.click();
-  await page.waitForFunction(
-    () => document.querySelector('.snapshot-favorite')?.getAttribute('aria-pressed') === 'false',
-  );
+  await card.dblclick();
+  await waitFavorite(false);
+  await card.dblclick();
+  await waitFavorite(true);
+  await card.dblclick();
+  await waitFavorite(false);
   assert.equal(
-    await page.locator('.snapshot-cell button[data-unit-index][aria-pressed]').count(),
+    await page.locator('.snapshot-cell button[data-unit-index][aria-pressed="true"]').count(),
     0,
   );
 
@@ -2358,21 +2396,24 @@ try {
   report.checks.reloadArchiveConnection = true;
   assert.equal(await page.getByRole('button', { name: '喜欢此刻', exact: true }).count(), 0);
   assert.equal(
-    await page.locator('.snapshot-cell button[data-unit-index][aria-pressed]').count(),
+    await page.locator('.snapshot-cell button[data-unit-index][aria-pressed="true"]').count(),
     0,
   );
   await wakeSnapshots();
-  await page.locator('.snapshot-favorite').first().click();
-  await page.locator('.snapshot-favorite[aria-pressed="true"]').first().waitFor();
+  await page
+    .locator('.snapshot-grid button[data-unit-index][data-favorite-ready="true"]')
+    .first()
+    .dblclick();
+  await page.locator('.snapshot-grid button[data-unit-index][data-liked="true"]').first().waitFor();
   assert.equal(await page.locator('.track-favorite-range').count(), 0);
   await page.waitForFunction(
     () => document.querySelector('.snapshot-pages')?.getAttribute('aria-busy') === 'false',
   );
   await page.getByRole('button', { name: '取消所有喜欢', exact: true }).click();
   await page.waitForFunction(
-    () => !document.querySelector('.snapshot-favorite[aria-pressed="true"]'),
+    () => !document.querySelector('.snapshot-grid button[data-unit-index][data-liked="true"]'),
   );
-  report.checks.rangeFavorites = { individualHeart: true, unlikeRange: true };
+  report.checks.rangeFavorites = { individualDoubleClick: true, unlikeRange: true };
   const snapshot = await context.request.get(
     `${origin}/api/subjects/${encodeURIComponent(info.subjectId)}/snapshots/${info.archiveStart + 1000}.jpg`,
   );
@@ -2443,6 +2484,7 @@ try {
   );
   await page.waitForFunction(() => !document.querySelector('video'));
   assert.equal(await page.locator('video').count(), 0);
+  await playerFormerNames.waitFor({ state: 'detached' });
   await wakeChrome();
   assert.deepEqual(await frameBounds(), idleFrame);
   report.checks.unplug = { closed: true, layoutRetained: true };
@@ -2492,8 +2534,7 @@ try {
   await refreshSubjects();
   assert.deepEqual(await scrollAnchor(), anchored);
   refreshedSubjects = refreshedSubjects.map((subject) =>
-    // PUBLIC → PRIVATE reorders within Online; OFFLINE now intentionally leaves this filter.
-    subject.id === anchored.id ? { ...subject, providerStatus: 'PRIVATE' } : subject,
+    subject.id === anchored.id ? { ...subject, onlineSinceMs: 1 } : subject,
   );
   await refreshSubjects();
   let afterRefresh = await scrollAnchor();
@@ -2524,11 +2565,23 @@ try {
   await page.waitForFunction(() => !document.querySelector('[data-row-motion="true"]'));
   assert.deepEqual(await scrollAnchor(), afterRefresh);
   report.checks.reloadListAnchor = true;
-  const dragBox = await scroller.boundingBox();
-  await page.mouse.move(dragBox.x + 20, dragBox.y + 200);
+  const dragPoint = await scroller.evaluate((root) => {
+    const viewport = root.getBoundingClientRect();
+    for (const preview of root.querySelectorAll('.subject-preview')) {
+      const box = preview.getBoundingClientRect();
+      if (box.top < viewport.top + 40 || box.bottom > viewport.bottom) continue;
+      const x = box.left + box.width / 2,
+        y = box.top + box.height / 2;
+      if (preview.contains(document.elementFromPoint(x, y))) return { x, y };
+    }
+    throw Error('No visible subject preview available to start a drag');
+  });
+  await page.mouse.move(dragPoint.x, dragPoint.y);
   await page.mouse.down();
-  await page.mouse.move(dragBox.x + 20, dragBox.y + 180, { steps: 4 });
-  await page.waitForTimeout(100);
+  await page.mouse.move(dragPoint.x, dragPoint.y - 20, { steps: 4 });
+  await page.waitForFunction(
+    () => document.querySelector('.track-table-scroll').dataset.gesture === 'scroll',
+  );
   const heldAnchor = await scrollAnchor();
   const removedId = refreshedSubjects.find((subject) => subject.providerStatus === 'PUBLIC').id;
   refreshedSubjects = refreshedSubjects.filter((subject) => subject.id !== removedId);
@@ -2536,7 +2589,7 @@ try {
   const heldAfter = await scrollAnchor();
   assert.equal(heldAfter.id, heldAnchor.id);
   assert.equal(heldAfter.offset, heldAnchor.offset);
-  await page.mouse.move(dragBox.x + 20, dragBox.y + 170, { steps: 2 });
+  await page.mouse.move(dragPoint.x, dragPoint.y - 30, { steps: 2 });
   await page.waitForTimeout(100);
   assert.equal((await scrollAnchor()).top, heldAfter.top + 10);
   await page.mouse.up();
@@ -2555,7 +2608,7 @@ try {
   }));
   await context.route('**/api/subjects', (route) => route.fulfill({ json: ranked }));
   await refreshSubjects();
-  await page.locator('.subject-filters').getByRole('button', { name: '离线', exact: true }).click();
+  await showDirectoryGroups('离线');
   assert.equal(await scroller.evaluate((root) => root.scrollTop), 0);
   const rankedIds = () =>
     scroller.locator('.track-row').evaluateAll((rows) => rows.map((row) => row.dataset.subjectId));
@@ -2571,7 +2624,7 @@ try {
     onlineHistoryFallback: true,
     stableAcrossRefresh: true,
   };
-  await page.locator('.subject-filters').getByRole('button', { name: '在线', exact: true }).click();
+  await showDirectoryGroups('在线');
   report.checks.scrollStability = {
     unchangedRefresh: true,
     statusReorder: true,
@@ -2612,6 +2665,9 @@ try {
   await page.setViewportSize({ width: 1440, height: 900 });
   await lane().waitFor();
   await page.getByRole('button', { name: '00 演示直播', exact: true }).click();
+  await wakeChrome();
+  await playerFormerNames.waitFor();
+  report.checks.formerNames.visibleAfterReselect = true;
   await page.locator('.snapshot-cell').first().waitFor();
   const cells = page.locator('.snapshot-cell');
   assert((await cells.count()) >= 2);

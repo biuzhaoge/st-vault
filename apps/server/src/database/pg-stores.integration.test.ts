@@ -117,7 +117,7 @@ describe.skipIf(process.env.STV_TEST_POSTGRES !== '1')('PostgreSQL archive store
       { fromMs: 48000, toMs: 72000 },
     ]);
     expect((await personal.readUnits('stripchat:1', ['a'])).favorites).toHaveLength(1);
-    await db.transaction(() => units.deleted('a'));
+    await db.transaction(() => units.retireSegments([{ id: 'a', visible: true }]));
     expect(
       (await units.list('stripchat:1', { fromMs: 0, toMs: 120000 })).map((unit) => unit.id),
     ).toEqual(['b']);

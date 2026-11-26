@@ -101,11 +101,11 @@
   color: var(--success);
 }
 .routing-metric.is-fair {
-  color: var(--private);
+  color: var(--warning);
 }
 .routing-metric.is-poor,
 .routing-metric.is-unavailable {
-  color: var(--accent);
+  color: var(--accent-hover);
 }
 .routing-item:disabled:has(.is-unavailable) {
   cursor: not-allowed;

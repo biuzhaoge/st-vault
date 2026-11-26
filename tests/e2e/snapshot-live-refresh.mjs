@@ -131,8 +131,8 @@ try {
     page.waitForFunction(
       ({ at, pressed }) =>
         document
-          .querySelector(`.snapshot-cell[data-at="${at}"] .snapshot-favorite`)
-          ?.getAttribute('aria-pressed') === String(pressed),
+          .querySelector(`.snapshot-cell[data-at="${at}"] button[data-unit-index][data-liked]`)
+          ?.getAttribute('data-liked') === String(pressed),
       { at, pressed },
     );
   await favoriteState(first.atMs, true);

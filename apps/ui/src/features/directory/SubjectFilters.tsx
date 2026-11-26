@@ -2,38 +2,26 @@ import type { SubjectFilter } from './subjects';
 import { tr } from '../../shared/lib/i18n';
 
 export function SubjectFilters({
-  statusFilter,
-  setStatusFilter,
+  filters,
+  onToggle,
   counts,
 }: {
-  statusFilter: string;
-  setStatusFilter: (value: SubjectFilter) => void;
+  filters: readonly SubjectFilter[];
+  onToggle: (value: SubjectFilter) => void;
   counts: Record<SubjectFilter, number>;
 }): JSX.Element {
-  const filters: { id: SubjectFilter; label: string; compact: string }[] = [
+  const options: { id: SubjectFilter; label: string; compact: string }[] = [
     { id: 'ONLINE', label: tr('在线'), compact: tr('在线', { context: 'compact' }) },
     { id: 'OFFLINE', label: tr('离线'), compact: tr('离线', { context: 'compact' }) },
     { id: 'ARCHIVED', label: tr('归档'), compact: tr('归档', { context: 'compact' }) },
   ];
   return (
     <div className="subject-filters" role="group" aria-label={tr('主播状态筛选')}>
-      <span
-        className="glass-selection"
-        aria-hidden="true"
-        style={{
-          transform: `translateX(${
-            Math.max(
-              0,
-              filters.findIndex((item) => item.id === statusFilter),
-            ) * 100
-          }%)`,
-        }}
-      />
-      {filters.map((item) => (
+      {options.map((item) => (
         <button
           key={item.id}
-          className={statusFilter === item.id ? 'active' : ''}
-          aria-pressed={statusFilter === item.id}
+          type="button"
+          aria-pressed={filters.includes(item.id)}
           aria-label={item.label}
           title={
             item.id === 'ARCHIVED'
@@ -42,7 +30,7 @@ export function SubjectFilters({
                 )
               : item.label
           }
-          onClick={() => setStatusFilter(item.id)}
+          onClick={() => onToggle(item.id)}
         >
           <span className="filter-label">{item.id === 'ARCHIVED' ? item.compact : item.label}</span>
           <span className="filter-label-compact">{item.compact}</span>

@@ -42,6 +42,7 @@ const errors: Record<string, string> = {
   screenshot_claim_failed: '截图任务未能更新，将再次尝试。',
   archive_integrity_check_failed: '归档完整性巡检失败，请检查归档状态并确认已有备份。',
   retention_cleanup_failed: '保留期自动清理失败，请检查存储空间和目录权限。',
+  empty_day_cleanup_failed: '无录像日期的历史清理未完成，将再次尝试。',
   deletion_retry: '文件回收已暂停，存储恢复后继续。',
 };
 
@@ -65,6 +66,7 @@ const groups = {
   ],
   storage: [
     ['retention', '保留期清理'],
+    ['empty-day-cleanup', '无录像日期清理', true],
     ['integrity-scan', '完整性巡检'],
     ['library-checkpoint', '媒体库检查点', true],
     ['orphan-sweep', '遗留文件检查', true],

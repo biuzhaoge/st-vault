@@ -5,6 +5,46 @@ import { expect, it } from 'vitest';
 import { openArchive } from './index.js';
 
 const subject = { id: 'stripchat:1', providerId: 1, handle: 'selection' };
+
+it('flips mixed favorite states on exact units once, rejecting a stale replay', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'stv-selection-toggle-'));
+  const archive = await openArchive({ root });
+  try {
+    await archive.upsertSubjects([subject]);
+    const ids: string[] = [];
+    for (const sequence of [1, 2, 3, 4]) {
+      const unit = await archive.commit({
+        subjectId: subject.id,
+        sourceEpoch: 'e',
+        sourceSequence: String(sequence),
+        init: null,
+        bytes: new Uint8Array([1]),
+        durationSeconds: 2,
+        wallStartMs: sequence * 60000,
+        timeBasis: 'source-pdt',
+        uncertaintyMs: 0,
+        discontinuity: false,
+      });
+      ids.push(unit.id);
+    }
+    const [first, second, third, outside] = ids;
+    await archive.unitFavorites!(subject.id, [first, outside], true, 0);
+    const request = [first, second, third, first];
+    const result = await archive.unitFavorites!(subject.id, request, 'toggle', 1);
+    expect(result.favorites.map((favorite) => favorite.id).sort()).toEqual([second, third].sort());
+    await expect(archive.unitFavorites!(subject.id, request, 'toggle', 1)).rejects.toThrow(
+      'PERSONAL_REVISION_STALE',
+    );
+    const favorites = await archive.unitFavoriteQuery!(subject.id, ids);
+    expect(favorites.favorites.map((favorite) => favorite.id).sort()).toEqual(
+      [second, third, outside].sort(),
+    );
+  } finally {
+    await archive.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 it('freezes a whole-range unliked selection without returning its full catalog', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'stv-selection-'));
   const a = await openArchive({ root });

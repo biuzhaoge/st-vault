@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import { chromium } from 'playwright-core';
 import { startFixture } from './support/fixture.mjs';
+import { dragRecordedTimeline, showRecordedTimeline } from './support/recorded-timeline.mjs';
 
-const fixture = await startFixture();
+const fixture = await startFixture({ archiveBeforeMidnight: true });
 let browser, releaseSubmit;
 const submitGate = new Promise((resolve) => {
   releaseSubmit = resolve;
@@ -22,12 +23,8 @@ try {
   await page.goto('http://127.0.0.1:10085');
   await page.getByLabel('6 位 PIN', { exact: true }).fill('012345');
   const row = page.locator(`.track-row[data-subject-id="${fixture.info.subjectId}"]`);
-  await row.waitFor();
-  const lane = await row.locator('.track-lane').boundingBox();
-  await page.mouse.move(lane.x + 1, lane.y + 40);
-  await page.mouse.down();
-  await page.mouse.move(lane.x + lane.width - 1, lane.y + 40, { steps: 6 });
-  await page.mouse.up();
+  const recordingLane = await showRecordedTimeline(page, row, fixture.info);
+  await dragRecordedTimeline(page, recordingLane);
   await page.waitForFunction(
     () => document.querySelector('video[data-media-slot="active"]')?.readyState >= 2,
   );

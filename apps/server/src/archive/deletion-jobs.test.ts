@@ -1,9 +1,10 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { expect, it, vi } from 'vitest';
 import { spawn } from 'node:child_process';
-import { openArchive } from './index.js';
+import { openArchive, type ArchiveFaultPoint } from './index.js';
 it('keeps recording the same subject while retired immutable files wait for physical GC', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'stv-gc-recording-'));
   let release!: () => void, entered!: () => void;
@@ -192,6 +193,76 @@ it('recovers a confirmed deletion after interruption without deleting later reco
   }
 });
 
+it('credits a replayed unlink once and automatically retries unrelated GC separately', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'stv-scoped-delete-gc-'));
+  let interruptAt: ArchiveFaultPoint | undefined;
+  const archive = await openArchive({
+    root,
+    fault(point) {
+      if (point !== interruptAt) return;
+      interruptAt = undefined;
+      throw new Error('simulated interrupted GC');
+    },
+  });
+  try {
+    const id = 'stripchat:42';
+    await archive.upsertSubjects([{ id, providerId: 42, handle: 'fixture' }]);
+    const commit = (sourceSequence: string, wallStartMs: number | null, bytes: Uint8Array) =>
+      archive.commit({
+        subjectId: id,
+        sourceEpoch: 'one',
+        sourceSequence,
+        init: null,
+        bytes,
+        durationSeconds: 2,
+        wallStartMs,
+        timeBasis: wallStartMs === null ? 'unknown' : 'source-pdt',
+        uncertaintyMs: 0,
+        discontinuity: false,
+      });
+    const old = await commit('1', null, Uint8Array.of(1));
+    const selected = await commit('2', 60000, Uint8Array.of(2, 3));
+    const oldPath = (await archive.media(old.mediaObjectId))!.path;
+    const selectedPath = (await archive.media(selected.mediaObjectId))!.path;
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    interruptAt = 'before-unlink';
+    await expect(archive.deleteUnlocated(id)).rejects.toThrow('simulated interrupted GC');
+
+    const commandId = randomUUID();
+    interruptAt = 'after-unlink';
+    await archive.admitDeletion!(id, commandId, {
+      kind: 'range',
+      mode: 'all',
+      fromMs: 60000,
+      toMs: 62000,
+    });
+    await archive.resumeDeletions!();
+    expect(await archive.deletionJob!(commandId)).toMatchObject({
+      state: 'retry',
+      processed: 0,
+      reclaimedBytes: 0,
+    });
+    await expect(readFile(selectedPath)).rejects.toMatchObject({ code: 'ENOENT' });
+
+    await archive.retryDeletions!();
+    expect(await archive.deletionJob!(commandId)).toMatchObject({
+      state: 'completed',
+      processed: 1,
+      reclaimedBytes: 2,
+    });
+    expect(await readFile(oldPath)).toEqual(Buffer.of(1));
+    await vi.advanceTimersByTimeAsync(30000);
+    vi.useRealTimers();
+    await vi.waitFor(async () => {
+      await expect(readFile(oldPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    });
+  } finally {
+    vi.useRealTimers();
+    await archive.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 it('resumes the frozen deletion after a process exits between tombstone commit and progress checkpoint', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'stv-crashed-delete-'));
   const script = `import {openArchive} from ${JSON.stringify(new URL('./index.ts', import.meta.url).href)};
@@ -226,6 +297,7 @@ it('resumes the frozen deletion after a process exits between tombstone commit a
       expect((await archive.deletionJobs!())[0]).toMatchObject({
         total: 129,
         processed: 129,
+        reclaimedBytes: 129,
         state: 'completed',
       });
       expect((await archive.timeline('stripchat:42', 0, 400000)).segments).toHaveLength(0);

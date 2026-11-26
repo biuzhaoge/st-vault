@@ -33,6 +33,8 @@ function parseJson(text: string): Record<string, unknown> {
 function validId(value: unknown): value is number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
 }
+const accountPageSize = 100;
+const maxAccountPages = 101;
 
 export function createProvider(options: ProviderOptions = {}): Pick<
   ProviderPort,
@@ -134,17 +136,29 @@ export function createProvider(options: ProviderOptions = {}): Pick<
     onValidated?.();
     const subjects = new Map<number, SubjectInput>();
     for (const route of ['favorites', 'favorites/offline']) {
-      for (let offset = 0; offset <= 10000; offset += 100) {
+      const received = new Set<number>();
+      let expectedTotal: number | undefined;
+      for (let page = 1; ; page++) {
         aborted(signal);
-        const url = `${source}/api/front/models/${route}?limit=100&offset=${offset}&stv_refresh=${now()}`;
+        const offset = received.size;
+        const url = `${source}/api/front/models/${route}?limit=${accountPageSize}&offset=${offset}&stv_refresh=${now()}`;
         const body = parseJson(await accountHttp.text(url, signal, cookie, token));
+        const total = Number(body.totalCount);
         if (
           !Array.isArray(body.models) ||
           !Number.isSafeInteger(body.totalCount) ||
-          Number(body.totalCount) < 0 ||
-          Number(body.totalCount) > 10100
+          total < 0 ||
+          total > accountPageSize * maxAccountPages
         )
           throw new ProviderError('invalid-account-list');
+        // Each route has its own count. Overlap between routes is legitimate.
+        expectedTotal ??= total;
+        if (
+          total !== expectedTotal ||
+          body.models.length > accountPageSize ||
+          offset + body.models.length > total
+        )
+          throw new ProviderError('incomplete-account-list');
         for (const value of body.models) {
           const row = object(value);
           if (
@@ -154,6 +168,8 @@ export function createProvider(options: ProviderOptions = {}): Pick<
             row.username.length > 256
           )
             throw new ProviderError('invalid-account-list');
+          if (received.has(row.id)) throw new ProviderError('incomplete-account-list');
+          received.add(row.id);
           const preview =
             accountAvatarSource(row.previewUrlThumbSmall) ??
             accountAvatarSource(row.previewUrlThumbBig) ??
@@ -167,8 +183,8 @@ export function createProvider(options: ProviderOptions = {}): Pick<
             ...(avatar ? { avatarSourceUrl: avatar } : {}),
           });
         }
-        if (offset + body.models.length >= Number(body.totalCount)) break;
-        if (!body.models.length || offset === 10000)
+        if (received.size === total) break;
+        if (!body.models.length || page === maxAccountPages)
           throw new ProviderError('incomplete-account-list');
       }
     }

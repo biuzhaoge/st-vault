@@ -15,7 +15,7 @@ export function connectionGeometry(rail: Rail, port: Port, targetY: number, targ
   const relative = (y: number): number =>
     stacked ? y - rail.top : Math.max(12, Math.min(rail.height - 12, y - rail.top));
   const y = relative(port.top + port.height / 2),
-    endY = relative(targetY);
+    endY = targetX === undefined ? relative(targetY) : targetY - rail.top;
   const bendX = stacked ? rail.width - 12 : rail.width / 2,
     endX = targetX === undefined ? rail.width - 2 : targetX - rail.left;
   return { startX, y, endY, bendX, endX, route: `M ${startX} ${y} H ${bendX} V ${endY} H ${endX}` };
