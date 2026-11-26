@@ -1515,11 +1515,17 @@ const handlers: Record<string, (input: RequestInput) => unknown> = {
     await apply(record, recovery);
     return true;
   },
-  applyQueuedDeletion: async ({ record }) => {
-    if (record.kind !== 'delete') throw Error('INVALID_DELETION_RECORD');
-    await apply(record);
-    return true;
-  },
+  applyQueuedDeletion: async ({ record, commandId }) =>
+    await transaction(async () => {
+      if (record.kind !== 'delete' || !commandId) throw Error('INVALID_DELETION_RECORD');
+      await apply(record);
+      await db
+        .prepare(
+          "UPDATE media_deletions SET state='running',error=NULL,retry_at=0,updated=? WHERE id=? AND subject=? AND state IN ('queued','retry')",
+        )
+        .run(Date.now(), commandId, record.subject.id);
+      return true;
+    }),
   beginSession: async () => {
     const clean =
       (

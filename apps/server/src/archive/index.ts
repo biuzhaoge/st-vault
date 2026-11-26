@@ -1568,7 +1568,7 @@ class Archive implements ArchiveHandle {
         { segmentIds: job.segmentIds },
         true,
         false,
-        true,
+        job.id,
       );
       const checkpointStarted = performance.now();
       advanced = await this.db.call<MediaDeletionJob>('advanceMediaDeletion', {
@@ -1705,7 +1705,7 @@ class Archive implements ArchiveHandle {
     filter: DeleteFilter & { segmentIds: string[] },
     accepted: boolean,
     publishChange: boolean,
-    deferGcCheckpoint: true,
+    queuedJobId: string,
   ): Promise<DeferredRemovalResult>;
   private remove(
     id: string,
@@ -1718,7 +1718,7 @@ class Archive implements ArchiveHandle {
     filter: DeleteFilter,
     accepted = false,
     publishChange = true,
-    deferGcCheckpoint = false,
+    queuedJobId?: string,
   ): Promise<RemovalResult | DeferredRemovalResult> {
     const started = performance.now();
     const publish = this.serial(
@@ -1744,8 +1744,8 @@ class Archive implements ArchiveHandle {
         await this.fault?.('before-journal-write');
         try {
           const applied = await this.db.call<boolean>(
-            deferGcCheckpoint ? 'applyQueuedDeletion' : 'apply',
-            { record, retentionDays: filter.retentionDays },
+            queuedJobId ? 'applyQueuedDeletion' : 'apply',
+            { record, retentionDays: filter.retentionDays, commandId: queuedJobId },
           );
           if (!applied) return null;
           await this.fault?.('after-tombstone-sync');
@@ -1776,7 +1776,7 @@ class Archive implements ArchiveHandle {
     return publish.then(async (deletedSegments) => {
       if (deletedSegments === null)
         return { deletedSegments: 0, reclaimedBytes: 0, retentionChanged: true };
-      if (!deferGcCheckpoint) return { deletedSegments, reclaimedBytes: await this.collect(id) };
+      if (!queuedJobId) return { deletedSegments, reclaimedBytes: await this.collect(id) };
 
       const tombstoned = performance.now();
       const objects = await this.db.call<ObjectRecord[]>('pendingGc', {
