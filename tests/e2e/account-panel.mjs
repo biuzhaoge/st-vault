@@ -19,6 +19,10 @@ try {
   const secret = 'session=synthetic-account-panel';
   await open();
   assert.equal(await panel.locator('.account-profile').count(), 0);
+  const sites = panel.locator('.routing-sites .routing-list');
+  await sites.getByText('stripchat.com', { exact: true }).waitFor();
+  assert.equal(await sites.getByText('stripchat.com', { exact: true }).count(), 1);
+  assert.equal(await sites.getByText('zh.stripchat.com', { exact: true }).count(), 0);
   await page.getByLabel('Cookies', { exact: true }).fill(secret);
   await page.getByRole('button', { name: '连接并同步', exact: true }).click();
   await page.getByRole('button', { name: '更换 Cookies', exact: true }).waitFor();

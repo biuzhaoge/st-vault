@@ -7,6 +7,7 @@
 - 录像删除按页生成清单并分批回收空间。已确认任务可排队，重启后继续处理。
 - 截图区支持点击播放、双击切换收藏和拖动批量反选。历史空白日期自动清理，当天保留。
 - 主播筛选支持多选。点击列表序号切换录制，曾用名集中显示在播放器标题栏。
+- 登录站点列表把 Stripchat 的主域名和中文子域名合并为一项。已有账户继续使用原绑定域名。
 - 升级沿用现有数据、媒体和 PostgreSQL 挂载。
 
 ### English
@@ -14,6 +15,7 @@
 - Recording deletion reclaims files as durable plan pages become available. Confirmed jobs queue and resume after restart.
 - Click a screenshot to play, double-click to toggle its favorite status, or drag to toggle a range. Empty historical days are cleaned up while today is retained.
 - Directory filters support multiple statuses. Click a row number to toggle recording. Former names appear in the player header.
+- The sign-in list groups the main Stripchat domain and its Chinese subdomain. Existing accounts keep their bound host.
 - Keep existing data, media, and PostgreSQL mounts when upgrading.
 
 ## 0.1.1

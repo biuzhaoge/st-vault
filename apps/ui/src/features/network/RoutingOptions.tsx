@@ -8,6 +8,9 @@ import { PanelFeedback } from '../../shared/ui/PanelContent';
 import { Icon } from '../../design/Icon';
 import './routing-options.css';
 
+const stripchatOrigin = 'https://stripchat.com';
+const localizedStripchatOrigin = 'https://zh.stripchat.com';
+
 type Measurement = {
   testing?: boolean;
   error?: string | null;
@@ -124,13 +127,22 @@ export function RoutingOptions({
   const probing = kind === 'sites' ? status?.sites.probing : cdn?.running;
   const progress = kind === 'sites' ? status?.sites.probeProgress : cdn;
   const marked = selected ?? (kind === 'sites' ? status?.sites.selectedOrigin : null);
+  const siteCandidates = status?.sites.candidates ?? [];
+  const alternateStripchatOrigin =
+    marked === localizedStripchatOrigin &&
+    siteCandidates.some((site) => site.origin === localizedStripchatOrigin)
+      ? stripchatOrigin
+      : localizedStripchatOrigin;
   const items = sortRoutes<Measurement & { key: string; label: string }>(
     kind === 'sites'
-      ? (status?.sites.candidates ?? []).map((site) => ({
-          ...site,
-          key: site.origin,
-          label: new URL(site.origin).hostname,
-        }))
+      ? siteCandidates
+          .filter((site) => site.origin !== alternateStripchatOrigin)
+          .map((site) => ({
+            ...site,
+            key: site.origin,
+            label: new URL(site.origin === localizedStripchatOrigin ? stripchatOrigin : site.origin)
+              .hostname,
+          }))
       : (status?.cdnHosts ?? []).map((host) => ({
           key: host,
           label: host.replace('edge-hls.', ''),
