@@ -16,7 +16,6 @@
 - Directory filters support multiple statuses. Click a row number to toggle recording. Former names appear in the player header.
 - Keep existing data, media, and PostgreSQL mounts when upgrading.
 
-
 ## 0.1.1
 
 ### 简体中文

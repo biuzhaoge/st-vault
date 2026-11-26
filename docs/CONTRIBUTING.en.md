@@ -6,8 +6,6 @@ This guide covers building, testing, releasing and recovering the project. See t
 
 Include reproduction steps, relevant tests and risks with changes, and update documentation when behavior changes. Report security issues privately as described in [SECURITY](SECURITY.en.md). The canonical CONTRIBUTING.md and SECURITY.md files stay in docs using [GitHub-supported names and locations](https://docs.github.com/en/communities/setting-up-your-project-for-healthy-contributions/creating-a-default-community-health-file), without duplicate root documents.
 
-The [project audit report](audit/REPORT.md) records source evidence, regression results and rollback procedures in Chinese.
-
 ## Repository layout
 
 | Path                      | Contents                                                                                                                        |

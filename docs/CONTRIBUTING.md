@@ -6,8 +6,6 @@
 
 参与修改时请附复现、相关测试及风险说明，行为变更同步修改对应文档。安全问题按 [SECURITY.md](SECURITY.md)私密反馈。两份文件集中在 docs，并沿用 [GitHub 支持的标准命名和位置](https://docs.github.com/en/communities/setting-up-your-project-for-healthy-contributions/creating-a-default-community-health-file)，不在根目录保留重复入口。
 
-本轮全项目审查的源码证据、回归结果和回滚说明见[项目审查报告](audit/REPORT.md)。
-
 ## 仓库结构
 
 | 路径                      | 内容                                                                                     |
