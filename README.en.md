@@ -25,6 +25,14 @@ Screenshots use synthetic test data.
 
 ![Site selection and the Cookies field in the Account panel](docs/assets/screenshots/account.png)
 
+**Watch multiple live rooms.** Open **Monitor wall** in the broadcaster list toolbar. Public rooms play muted, private rooms show their covers, and each tile keeps the username in the upper-left corner. The grid rearranges as broadcasters come and go. Each user can open 8–64 live streams depending on the CPU available to the container. The floating return button takes you back to your previous playback position.
+
+**Manage follows and archived recordings.** Combine the online, offline and archived filters. Click a broadcaster’s row number to toggle automatic recording. The unfollow button beneath it removes the follow on Stripchat. Once the site confirms the change, broadcasters with footage move to the archive for replay. If there is no footage, local records are cleared after pending cleanup finishes. Archived covers show the reason. Region-restricted broadcasters whose status cannot be checked stay followed and keep their local records, even without footage.
+
+**Choose a network route.** Under **Settings → SOCKS5 proxy**, enable the proxy, enter a server address reachable from the container, and save. Add a username and password if required. Following sync, image downloads, live playback and recording use this route. The player’s CDN menu also lets you test and select a media node.
+
+**Review history and background activity.** History groups broadcaster status changes by date and shows around 20 entries on desktop. The status panel reports recording, sync and deletion progress. The first two consecutive sync failures appear inline. A third raises a toolbar alert, which clears after a successful sync.
+
 **Live and replay in the same workspace.** Click a cover to watch a public stream. Enable automatic recording to save the highest available source quality. Select a recorded range and click an image to jump into it. Short gaps remain visible and long gaps are compressed. Hover over a thumbnail to see its recording's start and end times.
 
 **Skip dates without recordings.** Dates follow the deployment time zone. Today stays visible even before its first recording. A past date stays visible if any broadcaster has footage. Empty past dates are skipped so neighboring recorded dates touch. Selection and playback keep the original recording timestamps.
@@ -86,7 +94,7 @@ Open `http://NAS-address:10002` after starting, or <http://127.0.0.1:10002> on t
 
 - **Port.** If the port is in use, change the left side of `10002:10002`, for example to `10003:10002`.
 - **Storage.** `data` holds settings, credentials, and the `postgres` database directory. `media` holds recordings and the portable library. Edit their host paths as needed. PostgreSQL requires a local filesystem. On Windows Docker Desktop, place `data` on the WSL Linux filesystem or mount a local Docker volume at `/data/postgres` as described in the [storage guide](docs/CONTRIBUTING.en.md#postgresql-storage).
-- **Time zone and version.** The default time zone is `Asia/Shanghai`. To change it, add `TZ: America/New_York` under Compose `environment` or pass `-e TZ=America/New_York` to Docker. Replace `latest` with `0.1.1` to pin this release.
+- **Time zone and version.** The default time zone is `Asia/Shanghai`. To change it, add `TZ: America/New_York` under Compose `environment` or pass `-e TZ=America/New_York` to Docker. Replace `latest` with `0.3.0` to pin this release.
 - **Empty-date cleanup.** By default, the archive clears broadcaster status history, historical events, recording coverage summaries, and completed program runs wholly inside the skipped period. Set `STV_CLEAN_EMPTY_DAYS=0` to retain this history while still skipping empty dates on the timeline.
 - **Use an existing reverse proxy.** Join the app and proxy to the same Docker network. Point the proxy at the app's network name or alias on port `10002`. Omit `ports` if all access goes through the proxy.
 
