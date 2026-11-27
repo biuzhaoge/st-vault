@@ -2242,7 +2242,10 @@ try {
 
   // Exercise real unit pagination with 90 recording units, reusing a decoded JPEG.
   const historyWindow = await fixture.seedSnapshotHistory();
-  if (historyWindow.fromMs < (await view()).from) await setDays(2);
+  const beforeHistory = await view();
+  const laneWidth = (await lane().boundingBox()).width;
+  const pointerMarginMs = (4 * (beforeHistory.to - beforeHistory.from)) / laneWidth;
+  if (historyWindow.fromMs - beforeHistory.from < pointerMarginMs) await setDays(2);
   const historyView = await view(),
     historyBox = await lane().boundingBox();
   const historyX = (at) =>
@@ -2253,9 +2256,9 @@ try {
   );
   // At a multi-day scale one second is subpixel; leave a real pointer-sized
   // margin so browser coordinate quantization cannot land inside the first fragment.
-  await page.mouse.move(historyX(historyWindow.fromMs) - 2, historyBox.y + 40);
+  await page.mouse.move(historyX(historyWindow.toMs) + 3, historyBox.y + 40);
   await page.mouse.down();
-  await page.mouse.move(historyX(historyWindow.toMs) + 2, historyBox.y + 40, { steps: 8 });
+  await page.mouse.move(historyX(historyWindow.fromMs) - 2, historyBox.y + 40, { steps: 8 });
   await page.mouse.up();
   const historyBoundsValue = await (await historyBounds).json();
   assert.deepEqual(

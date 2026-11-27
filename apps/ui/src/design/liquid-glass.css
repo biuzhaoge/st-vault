@@ -209,11 +209,6 @@ button:disabled {
 .subject-filters {
   gap: 2px;
 }
-@container track-header (min-width: 561px) {
-  .subject-filters:lang(en) {
-    flex-basis: 240px;
-  }
-}
 .subject-filters button {
   border-radius: var(--radius-pill);
   corner-shape: round;
