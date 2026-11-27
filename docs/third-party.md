@@ -8,6 +8,7 @@ ST-Vault 原创源码采用 Apache-2.0。依赖和系统组件仍适用其各自
 
 - Node.js 与 npm：遵循官方 Node 镜像随附的上游声明。
 - Fastify、React、Vite、Zod、Prettier、i18next、react-i18next：MIT。
+- Undici（MIT）用于 SOCKS5 传输，运行镜像保留安装包内的上游许可。
 - 时区计算使用 `@date-fns/tz`（MIT），随应用保留[上游许可](../licenses/date-fns-tz.txt)。
 - node-postgres（pg）及其运行依赖：保留安装包内的上游声明。PostgreSQL 内置于运行和 QA 镜像，采用 PostgreSQL License；重新分发数据库镜像或二进制时保留 `/usr/share/doc` 中的声明。
 - Hls.js、Playwright、TypeScript：Apache-2.0。

@@ -22,6 +22,7 @@ const archive = {
         autoRecord: false,
       })),
     ),
+  subjectPreview: (id: string) => Promise.resolve(`https://static-cdn.strpst.com/previews/${id}`),
   locate: vi.fn(),
   timeline: vi.fn(),
   media: vi.fn(),
@@ -35,12 +36,14 @@ it('serves a cached cover while both anonymous network workers are stalled', asy
     release = resolve;
   });
   let stall = false;
-  const fetch = vi.fn(async (input) => {
-    const url = String(input);
-    if (stall && url.includes('/broadcasts/')) await gate;
-    return url.includes('/broadcasts/')
-      ? Response.json({ item: { snapshotTimestamp: 123 } })
-      : new Response(bytes);
+  let waiting = 0;
+  const fetch = vi.fn(async () => {
+    if (stall) {
+      waiting++;
+      await gate;
+      waiting--;
+    }
+    return new Response(bytes);
   });
   const previews = createPreviews({ archive, cacheRoot: root, fetch, decoder: vi.fn() });
   const requests: Promise<Uint8Array>[] = [];
@@ -48,7 +51,7 @@ it('serves a cached cover while both anonymous network workers are stalled', asy
     await previews.cover('stripchat:42');
     stall = true;
     requests.push(previews.cover('stripchat:43'), previews.cover('stripchat:44'));
-    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(4));
+    await vi.waitFor(() => expect(waiting).toBe(2));
     const cached = previews.cover('stripchat:42', undefined, true);
     requests.push(cached);
     const result = await Promise.race([
@@ -68,19 +71,13 @@ it('returns a stale local image immediately and schedules its refresh instead of
   const root = await mkdtemp(path.join(tmpdir(), 'stv-cover-stale-'));
   let now = Date.now();
   vi.spyOn(Date, 'now').mockImplementation(() => now);
-  const fetch = vi.fn((input) =>
-    Promise.resolve(
-      String(input).includes('/broadcasts/')
-        ? Response.json({ item: { snapshotTimestamp: 123 } })
-        : new Response(bytes),
-    ),
-  );
+  const fetch = vi.fn(() => Promise.resolve(new Response(bytes)));
   const previews = createPreviews({ archive, cacheRoot: root, fetch, decoder: vi.fn() });
   try {
     await previews.cover('stripchat:42');
     now += 16000;
     expect([...(await previews.cover('stripchat:42'))]).toEqual([...bytes]);
-    expect(fetch).toHaveBeenCalledTimes(2);
+    expect(fetch).toHaveBeenCalledTimes(1);
   } finally {
     await previews.close();
     await rm(root, { recursive: true, force: true });

@@ -5,7 +5,12 @@ import { tr } from '../../shared/lib/i18n';
 import { useDeletionProjections } from '../../shared/lib/deletion-projection';
 import { PanelStatus } from '../../shared/ui/PanelContent';
 import { ArchiveHealth } from './ArchiveHealth';
-import { statusGroups, type StatusLine, type StatusValue } from './background-status';
+import {
+  isPeriodicSyncTask,
+  statusGroups,
+  type StatusLine,
+  type StatusValue,
+} from './background-status';
 import { deletionStatus } from './deletion-status';
 import { systemHealthStatus } from './display';
 import { StatusRetry } from './StatusRetry';
@@ -83,12 +88,11 @@ function StatusRow({
       rowId={name}
       label={label}
       value={text}
+      note={note}
       kind={tone ?? 'neutral'}
       accessory={accessory}
       live={false}
-    >
-      {note && <p className="system-row-note">{note}</p>}
-    </PanelStatus>
+    />
   );
 }
 
@@ -130,6 +134,7 @@ export function SystemSummary({
     ),
   );
   const retryButton = (id: string, label: string) => {
+    if (isPeriodicSyncTask(id)) return null;
     const target = systemRetryTargets.find((item) => item === id);
     if (!onRefresh || !target) return null;
     return (
@@ -152,10 +157,11 @@ export function SystemSummary({
     : null;
   const diskChecking = tasks.some((task) => task.id === 'disk-check' && task.state === 'running');
   const describe = statusHelpFor(system);
-  const help = (id: StatusHelpId, label: string) => (
+  const help = (id: StatusHelpId, label: string, note?: string) => (
     <StatusHelp
       label={label}
       {...describe(id)}
+      note={note}
       open={helpOpen === id}
       onOpenChange={(open) => setHelpOpen((active) => (open ? id : active === id ? null : active))}
     />
@@ -167,7 +173,7 @@ export function SystemSummary({
       label={
         <>
           {label}
-          {help(id, label)}
+          {help(id, label, value.note)}
         </>
       }
       value={value}
@@ -226,7 +232,7 @@ export function SystemSummary({
         <ArchiveHealth
           health={archiveHealth}
           accessory={retryButton('archive-health', tr('归档服务'))}
-          help={help('archive-health', tr('归档服务'))}
+          help={(note) => help('archive-health', tr('归档服务'), note)}
         />
         {statusRow('disk-check', tr('存储空间'), storageValue(disk, diskChecking))}
         {statusRows(groups.storage)}

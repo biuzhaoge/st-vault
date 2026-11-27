@@ -1,13 +1,15 @@
-import { maxTimelineSubjectIds, type Subject } from '@st-vault/api-schema';
+import { maxTimelineSubjectIds, subjectDirectory, type Subject } from '@st-vault/api-schema';
 import type { AccountSyncPort, ArchivePort, MediaChange, SupervisorPort } from '../ports.js';
 import type { ResourceMonitor } from '../runtime/resources.js';
 import type { SettingsStore } from '../runtime/settings.js';
+import type { createArchiveReasons } from '../account/archive-reasons.js';
 import type { SyncSnapshot } from './sync.js';
 
 interface Options {
   archive: Pick<ArchivePort, 'listSubjects' | 'syncRevisions'>;
   supervisor: Pick<SupervisorPort, 'states'>;
   accountSync: Pick<AccountSyncPort, 'status'>;
+  archiveReasons?: Pick<ReturnType<typeof createArchiveReasons>, 'snapshot'>;
   resources?: Pick<ResourceMonitor, 'get'>;
   settings?: Pick<SettingsStore, 'get'>;
   keyCount: () => number;
@@ -40,6 +42,7 @@ export function createSyncState(options: Options) {
       ]);
       const states = options.supervisor.states();
       const account = options.accountSync.status();
+      const archiveReason = options.archiveReasons?.snapshot();
       const observations = new Map(
         subjects.map(({ id, observedAtMs, providerStatus }) => [
           id,
@@ -59,6 +62,7 @@ export function createSyncState(options: Options) {
             subject.providerStatus,
             subject.monitorEnabled,
             subject.archived,
+            subject.archiveReason ?? archiveReason?.(subject),
             subject.autoRecord,
             subject.lastKnownStatus,
             states[subject.id],
@@ -88,13 +92,13 @@ export function createSyncState(options: Options) {
       previous = { media: revisions.media, observations };
       onlineSubjects = new Set(
         subjects
-          .filter((subject) => subject.providerStatus === 'PUBLIC' && !subject.archived)
+          .filter((subject) => subjectDirectory(subject).group === 'ONLINE')
           .map((subject) => subject.id),
       );
       return snapshot;
     },
     affectsDirectory(change: MediaChange): boolean {
-      // Online ordering is alphabetical. Other groups sort by recent media activity.
+      // Recording recency can reorder offline and archive rows.
       return change.kind === 'delete' || !onlineSubjects.has(change.segment.subjectId);
     },
   };

@@ -87,6 +87,32 @@ it('publishes server clock ticks for all clients without creating another pollin
     vi.useRealTimers();
   }
 });
+it('keeps consecutive failed deliveries across reconnects until a snapshot succeeds', async () => {
+  vi.useFakeTimers();
+  const clock = new SyncClock({ intervalMs: () => 2000 });
+  const read = vi
+    .fn<() => Promise<SyncSnapshot>>()
+    .mockRejectedValueOnce(Error('first read failed'))
+    .mockRejectedValueOnce(Error('same-period reconnect failed'))
+    .mockRejectedValueOnce(Error('second read failed'))
+    .mockResolvedValue(values());
+  const hub = createSyncHub({ clock, read, authorized: () => true });
+  try {
+    for (const consecutiveFailures of [1, 1, 2, 0]) {
+      const client = new Response();
+      hub.open('owner', client as unknown as ServerResponse);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(hub.status()).toMatchObject({ consecutiveFailures });
+      expect(client.destroyed).toBe(consecutiveFailures > 0);
+      if (read.mock.calls.length > 1) await vi.advanceTimersByTimeAsync(2000);
+      expect(hub.status()).toMatchObject({ consecutiveFailures });
+    }
+  } finally {
+    await hub.close();
+    await clock.close();
+    vi.useRealTimers();
+  }
+});
 it('publishes the optional timeline scope while retaining the existing topics array', async () => {
   vi.useFakeTimers();
   let snapshot: SyncSnapshot = values();

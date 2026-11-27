@@ -8,6 +8,7 @@ The release build generates a license inventory from the dependencies bundled fo
 
 - Node.js and npm: upstream notices distributed with the official Node image.
 - Fastify, React, Vite, Zod, Prettier, i18next and react-i18next: MIT.
+- Undici (MIT) provides SOCKS5 transport. Its upstream license ships in the installed package in the runtime image.
 - Timezone calculations use `@date-fns/tz` (MIT); its [upstream license](../licenses/date-fns-tz.txt) ships with the application.
 - node-postgres (`pg`) and its runtime dependencies retain their upstream notices in the installed packages. PostgreSQL is embedded in the runtime and QA images and uses the PostgreSQL License. Preserve `/usr/share/doc` notices when redistributing the database image or binaries.
 - Hls.js, Playwright and TypeScript: Apache-2.0.

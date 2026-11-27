@@ -1,6 +1,6 @@
 import type { BackgroundTask, Segment, SnapshotItem } from '@st-vault/api-schema';
 import type { ArchivePort, PreviewsPort } from '../ports.js';
-import { createHttp, ProviderError, waitFor } from '../provider/http.js';
+import { createHttp, waitFor } from '../provider/http.js';
 import { MediaBudget } from '../provider/media-budget.js';
 import { createFfmpegDecoder, jpeg, SnapshotDecodeError, verifyJpeg } from './ffmpeg.js';
 import { ScreenshotJobs, SNAPSHOT_REQUEST_PRIORITY } from './jobs.js';
@@ -11,9 +11,7 @@ import { LibraryImages } from '../library/images.js';
 import { createSubjectAvatars } from './avatars.js';
 import type { SyncClock } from '../runtime/sync-clock.js';
 import path from 'node:path';
-import { broadcastCover, coverSource } from '../provider/cover-source.js';
-import { SiteRoutes } from '../provider/site-routes.js';
-import { broadcastResponse } from '../provider/public-api.js';
+import { coverSource } from '../provider/cover-source.js';
 import { DerivativeDiagnostics } from './derivative-diagnostics.js';
 
 export class PreviewError extends Error {
@@ -47,7 +45,6 @@ interface PreviewLane {
   admitted: number;
 }
 export interface PreviewOptions {
-  sites?: SiteRoutes;
   clock?: SyncClock;
   archive: Pick<
     ArchivePort,
@@ -80,17 +77,14 @@ export interface PreviewOptions {
   publishConcurrency?: number;
 }
 export function createPreviews(options: PreviewOptions): PreviewsPort {
-  const sites =
-    options.sites ??
-    new SiteRoutes({ origins: ['https://stripchat.com'], fetch: options.fetch, timeoutMs: 5000 });
   const avatars =
     options.cacheRoot && options.archive.getSetting && options.archive.setSetting
       ? createSubjectAvatars({
-          sites,
           root: options.cacheRoot,
           mediaRoot: options.mediaRoot,
           archive: {
             listSubjects: options.archive.listSubjects.bind(options.archive),
+            getSubject: options.archive.getSubject.bind(options.archive),
             getSetting: options.archive.getSetting.bind(options.archive),
             setSetting: options.archive.setSetting.bind(options.archive),
             withBackgroundReads: options.archive.withBackgroundReads?.bind(options.archive),
@@ -289,9 +283,9 @@ export function createPreviews(options: PreviewOptions): PreviewsPort {
     {
       source: string;
       attempts: number;
+      consecutiveFailures: number;
       retryAt: number;
       missing: boolean;
-      discovered: string | null;
     }
   >();
   const coverMissing = (error: unknown): boolean =>
@@ -306,26 +300,38 @@ export function createPreviews(options: PreviewOptions): PreviewsPort {
       source ? new URL(source).hostname : undefined,
     );
   };
-  const failCover = (
-    id: string,
-    qualification: string,
-    error: unknown,
-    discovered: string | null = null,
-  ): void => {
+  const failCover = (id: string, qualification: string, error: unknown): void => {
     const previous = coverFailures.get(id);
     const attempts = previous?.source === qualification ? Math.min(previous.attempts + 1, 7) : 1;
+    const missing = coverMissing(error);
+    const previousFailures = previous?.source === qualification ? previous.consecutiveFailures : 0;
     coverFailures.delete(id);
     // These are short-lived retry qualifications, not a second image/version cache.
     if (coverFailures.size >= 2048) coverFailures.delete(coverFailures.keys().next().value!);
     coverFailures.set(id, {
       source: qualification,
       attempts,
+      consecutiveFailures: missing ? 0 : Math.min(previousFailures + 1, 7),
       retryAt: now() + Math.min(300000, 5000 * 2 ** (attempts - 1)),
-      missing: coverMissing(error),
-      discovered,
+      missing,
     });
   };
   const defaultDownloads = new Map<string, Promise<Uint8Array>>();
+  const publishCover = async (
+    disk: PreviewDiskCache | LibraryImages,
+    providerId: number,
+    bytes: Uint8Array,
+  ): Promise<void> => {
+    const key = `cover:${providerId}`;
+    const canPublish = async () =>
+      Boolean(await options.archive.getSubject(`stripchat:${providerId}`, { activity: false }));
+    if (disk instanceof LibraryImages) {
+      if (await disk.put(key, bytes, canPublish)) return;
+      if (!(await canPublish())) throw new PreviewError('preview_not_found');
+    } else if (await disk.put(key, bytes)) return;
+    throw Error('COVER_CACHE_WRITE_FAILED');
+  };
+
   const loadDefaultCover = (
     providerId: number,
     source: string,
@@ -354,7 +360,7 @@ export function createPreviews(options: PreviewOptions): PreviewsPort {
           ? previous
           : await readCoverImage(source, abort);
       if (abort.aborted) throw new PreviewError('preview_cancelled');
-      if (!(await disk.put(key, bytes))) throw Error('COVER_CACHE_WRITE_FAILED');
+      await publishCover(disk, providerId, bytes);
       await options.archive.setSetting!(setting, source);
       return bytes;
     };
@@ -363,26 +369,6 @@ export function createPreviews(options: PreviewOptions): PreviewsPort {
     });
     defaultDownloads.set(key, work);
     return work;
-  };
-  const discoverCover = async (providerId: number, signal: AbortSignal): Promise<string | null> => {
-    try {
-      const item = await sites.read(
-        '/api/front/v2/broadcasts/' + providerId,
-        (text) => broadcastResponse(text, providerId),
-        signal,
-      );
-      return broadcastCover(providerId, item);
-    } catch (error) {
-      if (signal.aborted) throw new PreviewError('preview_cancelled');
-      const restricted =
-        error instanceof ProviderError &&
-        error.code === 'upstream-http' &&
-        error.status === 403 &&
-        !error.challenge;
-      if (!restricted && !coverMissing(error))
-        coverDiagnostics.record('cover_source_lookup_failed', error);
-      return null;
-    }
   };
   const fetchCover = async (
     id: string,
@@ -402,47 +388,20 @@ export function createPreviews(options: PreviewOptions): PreviewsPort {
     if (hit && !background) return hit;
     const local = hit ?? (await coverDisk?.get(key));
     const previous = local && previewImageType(local) ? local : null;
-    let source: string | null = null,
-      discovered: string | null = null;
-    let qualification = '',
-      primaryFailed = false;
+    let source: string | null = null;
+    let qualification = '';
+    let primaryFailure: { error: unknown } | undefined;
     try {
       const storedSource = coverSource(await options.archive.subjectPreview?.(id));
-      const observed = observedSources.has(id);
       source = observedSources.get(id) ?? storedSource;
-      qualification = JSON.stringify([source, storedSource]);
-      const failure = coverFailures.get(id);
-      // A foreground lookup may have found a URL before the image download failed.
-      // A later roster or status observation supersedes that retry target.
-      if (
-        !source &&
-        !observed &&
-        !broadcaster.archived &&
-        failure?.source === qualification &&
-        !failure.missing
-      ) {
-        discovered = failure.discovered;
-        source = discovered;
-      }
-      // The account list and the status clock own discovery for background jobs.
-      // Do not invalidate a foreground negative cache on a routine empty warm-up.
-      const discover = !background && !broadcaster.archived && !observed;
-      if (!source && !discover) {
-        if (!failure?.missing || failure.source !== qualification) coverFailures.delete(id);
+      if (!source) {
+        coverFailures.delete(id);
         if (previous) save(key, previous, 15000, true);
         return previous;
       }
+      qualification = JSON.stringify([source, storedSource]);
+      const failure = coverFailures.get(id);
       if (failure?.source === qualification && now() < failure.retryAt) return previous;
-      if (!source) {
-        discovered = await discoverCover(providerId, abort);
-        source = discovered;
-      }
-      if (!source) {
-        if (!previous) throw new PreviewError('preview_not_found');
-        coverFailures.delete(id);
-        save(key, previous, 15000, true);
-        return previous;
-      }
       const setting = 'preview.cover-source.' + providerId;
       const version = versions.get(id) ?? (await options.archive.getSetting?.(setting));
       if (previous && previewImageType(previous) && version === source) {
@@ -459,26 +418,26 @@ export function createPreviews(options: PreviewOptions): PreviewsPort {
             : await readCoverImage(source, abort);
       } catch (error) {
         if (abort.aborted || previous || !storedSource || storedSource === source) throw error;
-        // The first live snapshot can be unavailable while the CDN is catching up.
-        // The list's real preview is a verified alternative, never a square avatar.
-        failCover(id, qualification, error);
+        // An observed cover can be unavailable before its CDN update reaches this site.
+        // Keep the last persisted cover from the same source while the retry is pending.
         reportCoverFailure(error, source);
-        primaryFailed = true;
+        primaryFailure = { error };
         source = storedSource;
         bytes = await loadDefaultCover(providerId, source, abort);
       }
       if (!previewImageType(bytes)) throw new PreviewError('preview_failed');
       if (coverDisk) {
-        if (!(await coverDisk.put(key, bytes))) throw Error('COVER_CACHE_WRITE_FAILED');
+        await publishCover(coverDisk, providerId, bytes);
         await options.archive.setSetting?.(setting, source);
       }
       versions.set(id, source);
       save(key, bytes, 15000, true);
-      if (!primaryFailed) coverFailures.delete(id);
+      if (primaryFailure) failCover(id, qualification, primaryFailure.error);
+      else coverFailures.delete(id);
       return bytes;
     } catch (error) {
       if (abort.aborted) throw new PreviewError('preview_cancelled');
-      failCover(id, qualification, error, discovered);
+      failCover(id, qualification, error);
       reportCoverFailure(error, source);
       return previous;
     }
@@ -728,6 +687,7 @@ export function createPreviews(options: PreviewOptions): PreviewsPort {
                   : 'disabled',
           pending: pendingCoverCount(),
           failed,
+          consecutiveFailures: Math.max(0, ...issues.map((issue) => issue.consecutiveFailures)),
           lastRunAtMs: coverStartedAt,
           lastSuccessAtMs: coverSucceededAt,
           error: failed ? 'cover_refresh_partial' : null,
@@ -908,7 +868,6 @@ export function createPreviews(options: PreviewOptions): PreviewsPort {
     close: () => {
       if (closing) return closing;
       closed = true;
-      if (!options.sites) sites.close();
       detachScreenshotRecovery?.();
       detachCoverRetry?.();
       clearTimeout(backgroundTimer);

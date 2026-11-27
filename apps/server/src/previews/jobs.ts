@@ -48,7 +48,7 @@ interface Options {
     | 'snapshotForSegment'
     | 'snapshotUnits'
   > &
-    Partial<Pick<ArchivePort, 'hasMedia' | 'withBackgroundReads'>>;
+    Partial<Pick<ArchivePort, 'getSubject' | 'hasMedia' | 'withBackgroundReads'>>;
   render: (job: SnapshotJob, signal: AbortSignal) => Promise<SnapshotFrame>;
   validate: (bytes: Uint8Array, signal: AbortSignal) => Promise<void>;
   pollMs?: number;
@@ -90,6 +90,7 @@ export class ScreenshotJobs {
   private auditCursor: [string, number, number, string] = ['', -1, -1, ''];
   private scanIndex = 0;
   private scanAfter = 0;
+  private pruneScanAfter = 0;
   private idleScanAfter = 0;
   private scanRevision = 0;
   private readonly scanCooldown = new Map<string, number>();
@@ -622,6 +623,8 @@ export class ScreenshotJobs {
         const unit = await this.options.archive.snapshotUnit(job.subject, job.at, job.unit);
         segment = unit?.unitId === job.unit ? unit : null;
       } catch (error) {
+        if (error instanceof Error && error.message === 'SUBJECT_NOT_FOUND')
+          return this.missingSource(job);
         this.auditFailures++;
         this.auditError = 'screenshot_audit_failed';
         this.diagnostics.record('screenshot_source_reconciliation_failed', error);
@@ -742,6 +745,20 @@ export class ScreenshotJobs {
     const item = await this.options.archive.snapshotForSegment?.(subject, segment);
     if (item) await this.enqueue(subject, item, priority);
   }
+  private async pruneRemovedScanCursors(ids: string[], now: number): Promise<void> {
+    if (!this.options.archive.getSubject || now < this.pruneScanAfter) return;
+    this.pruneScanAfter = now + 60_000;
+    const candidates = await this.db
+      .prepare(
+        'SELECT subject FROM scan WHERE subject NOT IN (SELECT value FROM json_array_elements_text(?::json)) ORDER BY subject LIMIT 32',
+      )
+      .all<{ subject: string }>(JSON.stringify(ids));
+    for (const { subject } of candidates) {
+      // Recheck against the archive in case the subject returned after the list read.
+      if (!(await this.options.archive.getSubject(subject, { activity: false })) && !this.closed)
+        await this.db.prepare('DELETE FROM scan WHERE subject=?').run(subject);
+    }
+  }
   private async scan(): Promise<void> {
     const now = performance.now();
     if (!this.options.archive.snapshotUnits || now < Math.max(this.scanAfter, this.idleScanAfter))
@@ -749,6 +766,10 @@ export class ScreenshotJobs {
     this.scanAfter = now + HISTORY_SCAN_MS;
     const rotationRevision = this.scanRevision;
     const subjects = await this.options.archive.listSubjects({ activity: false });
+    await this.pruneRemovedScanCursors(
+      subjects.map(({ id }) => id),
+      now,
+    );
     let empty = 0,
       visited = 0,
       nextCooldown = Infinity;
@@ -769,8 +790,14 @@ export class ScreenshotJobs {
             .get<{ unit_cursor: string | null }>(subject)
         )?.unit_cursor ?? undefined;
       const revision = this.scanRevision;
-      const page = await this.options.archive.snapshotUnits(subject, cursor, 8);
+      const page = await this.options.archive
+        .snapshotUnits(subject, cursor, 8)
+        .catch((error: unknown) => {
+          if (error instanceof Error && error.message === 'SUBJECT_NOT_FOUND') return null;
+          throw error;
+        });
       if (this.closed) return;
+      if (!page) continue;
       const nextCursor = page.cursor ?? cursor;
       // Admission of a page and its cursor is atomic. A graceful close drains an
       // admitted page even when its first unit starts rendering concurrently.

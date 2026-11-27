@@ -483,6 +483,7 @@ try {
         ...subject,
         providerStatus: 'OFFLINE',
         archived: false,
+        directory: { group: 'OFFLINE', orderStatus: 'OFFLINE', pending: false },
         lastRecordedAtMs: subject.id === movedId ? null : 1000000 - index,
       })),
     });

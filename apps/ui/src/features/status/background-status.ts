@@ -52,6 +52,7 @@ const groups = {
     ['site-access', '账户绑定站点'],
     ['account-list', '关注清单同步'],
     ['capture-status', '主播状态同步'],
+    ['archive-reasons', '归档原因核验'],
     ['cover-sync', '封面更新'],
     ['avatar-sync', '头像更新'],
     ['client-sync', '客户端更新'],
@@ -74,18 +75,66 @@ const groups = {
   ],
 } as const;
 
+const syncAlarmAfter = 3;
+
+export function isPeriodicSyncTask(id: string): boolean {
+  return groups.sync.some(([taskId]) => taskId === id);
+}
+
+function needsAccountReconnect(task: BackgroundTask): boolean {
+  return (
+    task.id === 'account-list' &&
+    (task.detail === 'account-reconnect' || task.error === 'account_reconnect')
+  );
+}
+
+function persistentSyncFailure(task: BackgroundTask): boolean {
+  return (task.consecutiveFailures ?? 0) >= syncAlarmAfter;
+}
+
 function issueStatus(task: BackgroundTask): StatusValue | undefined {
+  const periodic = isPeriodicSyncTask(task.id);
+  const failures = task.consecutiveFailures ?? 0;
+  const reconnect = periodic && needsAccountReconnect(task);
   if (task.error === unobserved)
-    return { text: tr('检查中'), tone: 'warning', note: tr('状态暂不可用，将自动重试。') };
-  if (!task.error && task.state !== 'error' && task.state !== 'retrying') return undefined;
+    return {
+      text: tr('检查中'),
+      ...(periodic ? {} : { tone: 'warning' }),
+      note: tr('状态暂不可用，将自动重试。'),
+    };
+  if (
+    !task.error &&
+    task.state !== 'error' &&
+    task.state !== 'retrying' &&
+    !(periodic && failures > 0) &&
+    !reconnect
+  )
+    return undefined;
   const reason = task.error ? errors[task.error] : undefined;
   const note = reason
     ? tr(reason)
     : task.id === 'account-list' && task.error
       ? messageFor(new ApiError(task.error, 400))
-      : task.state !== 'retrying'
+      : !periodic && task.state !== 'retrying'
         ? tr('任务异常，请查看运行日志。')
         : undefined;
+  if (periodic) {
+    if (reconnect)
+      return {
+        text: tr('需要更新 Cookies'),
+        tone: 'warning',
+        note: note ?? tr(errors.account_reconnect),
+      };
+    if (failures >= syncAlarmAfter) {
+      const count = tr('连续 {{v0}} 轮未完成', {
+        v0: failures.toLocaleString(),
+      });
+      return { text: tr('异常'), tone: 'error', note: note ? `${count} · ${note}` : count };
+    }
+    if (task.state === 'running')
+      return { text: tr('正在刷新'), tone: 'busy', ...(note ? { note } : {}) };
+    return { text: tr('本轮未完成'), ...(note ? { note } : {}) };
+  }
   return {
     text: task.state === 'retrying' ? tr('等待重试') : tr('异常'),
     tone: task.state === 'retrying' ? 'warning' : 'error',
@@ -93,11 +142,17 @@ function issueStatus(task: BackgroundTask): StatusValue | undefined {
   };
 }
 
-/** Manual site measurements and temporary observer failures have their own feedback. */
+/** Top-level alarms use completed sync failures instead of the raw last error. */
 export function backgroundTaskAlert(tasks: BackgroundTask[]): string | undefined {
   const alarms = tasks.filter(
-    (task) => task.id !== 'site-probe' && task.error && task.error !== unobserved,
+    (task) =>
+      task.id !== 'site-probe' &&
+      task.error !== unobserved &&
+      (isPeriodicSyncTask(task.id)
+        ? persistentSyncFailure(task) || needsAccountReconnect(task)
+        : Boolean(task.error)),
   );
+  if (alarms.some(needsAccountReconnect)) return tr('需要更新 Cookies');
   if (alarms.some((task) => task.id === 'site-access')) return tr('绑定站点访问异常');
   if (alarms.some((task) => task.id === 'account-list')) return tr('关注清单同步异常');
   if (alarms.length) return tr('后台任务异常');
@@ -119,6 +174,12 @@ function scheduledValue(task: BackgroundTask, now: number): StatusValue {
   if (task.state === 'paused') return { text: tr('已暂停'), tone: 'warning' };
   if (task.id === 'site-access' && task.state === 'idle')
     return { text: task.target ?? tr('可用'), tone: 'ok' };
+  if (task.detail === 'account-roster-pending' && task.pending)
+    return {
+      text: tr('原站清单缺项 · {{v0}} 位主播', { v0: task.pending.toLocaleString() }),
+      tone: 'warning',
+      note: tr('已保留这些主播，清单同步会继续核实。'),
+    };
   if (task.pending) return { text: tr('待处理 {{v0}}', { v0: task.pending.toLocaleString() }) };
   const next = task.nextRunAtMs;
   if (task.state === 'waiting' && task.group === 'sync' && typeof next === 'number' && next > now) {
@@ -126,6 +187,12 @@ function scheduledValue(task: BackgroundTask, now: number): StatusValue {
     return { text: tr('下次刷新 {{v0}}', { v0: time }) };
   }
   return { text: tr(task.state === 'waiting' ? '等待' : '空闲') };
+}
+
+function withPendingProfiles(value: StatusValue, pending?: number): StatusValue {
+  if (!pending) return value;
+  const count = tr('待补资料 {{v0}}', { v0: pending.toLocaleString() });
+  return { ...value, note: value.note ? `${value.note} ${count}` : count };
 }
 
 export function statusGroups(
@@ -142,7 +209,14 @@ export function statusGroups(
       const taskValue =
         task && (optional && !retrying?.has(id) ? issueStatus(task) : scheduledValue(task, now));
       const value = deletionValue ?? taskValue;
-      return value ? [{ id, label: tr(title), value }] : [];
+      if (!value) return [];
+      return [
+        {
+          id,
+          label: tr(title),
+          value: withPendingProfiles(value, task?.accountRoster?.pendingProfileCount),
+        },
+      ];
     });
   return { sync: rows('sync'), media: rows('media'), storage: rows('storage') };
 }

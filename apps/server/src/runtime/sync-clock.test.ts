@@ -49,13 +49,14 @@ it('observes slow execution, failure and recovery without altering job admission
   vi.useFakeTimers();
   const clock = new SyncClock({ intervalMs: () => 1000 });
   let reject!: () => void;
+  let shouldFail = true;
   const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-  const detach = clock.subscribe(
-    'observed',
-    () =>
-      new Promise<void>((_resolve, fail) => {
-        reject = () => fail(Error('not exposed'));
-      }),
+  const detach = clock.subscribe('observed', () =>
+    shouldFail
+      ? new Promise<void>((_resolve, fail) => {
+          reject = () => fail(Error('not exposed'));
+        })
+      : undefined,
   );
   try {
     expect(clock.status()[0]).toMatchObject({
@@ -72,12 +73,28 @@ it('observes slow execution, failure and recovery without altering job admission
     expect(clock.status()[0].lastStartedAtMs).toBe(before.lastStartedAtMs);
     reject();
     await vi.advanceTimersByTimeAsync(0);
-    expect(clock.status()[0]).toMatchObject({ running: false, failed: true });
+    expect(clock.status()[0]).toMatchObject({
+      running: false,
+      failed: true,
+      consecutiveFailures: 1,
+    });
     expect(clock.status()[0]).not.toHaveProperty('error');
-    detach();
-    clock.subscribe('recovered', () => undefined, { immediate: true });
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(clock.status()[0]).toMatchObject({ running: true, consecutiveFailures: 1 });
+    reject();
     await vi.advanceTimersByTimeAsync(0);
-    expect(clock.status()[0]).toMatchObject({ name: 'recovered', failed: false, running: false });
+    expect(clock.status()[0]).toMatchObject({
+      running: false,
+      failed: true,
+      consecutiveFailures: 2,
+    });
+    shouldFail = false;
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(clock.status()[0]).toMatchObject({
+      failed: false,
+      running: false,
+      consecutiveFailures: 0,
+    });
   } finally {
     detach();
     await clock.close();

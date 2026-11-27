@@ -98,7 +98,7 @@ export function PanelStatus({
   value,
   kind,
   accessory,
-  children,
+  note,
   className = '',
   rowId,
   live = true,
@@ -107,7 +107,7 @@ export function PanelStatus({
   value: ReactNode;
   kind: 'ok' | 'checking' | 'error' | 'neutral' | 'warning' | 'busy';
   accessory?: ReactNode;
-  children?: ReactNode;
+  note?: string;
   className?: string;
   rowId?: string;
   live?: boolean;
@@ -121,6 +121,11 @@ export function PanelStatus({
     >
       <div className="panel-row panel-status-row">
         <span className="panel-row-label">{label}</span>
+        {note && (
+          <span className="system-row-note" title={note}>
+            {note}
+          </span>
+        )}
         <span className="panel-row-value">
           <PanelBadge tone={tone}>
             {kind === 'busy' && <ProgressRing />}
@@ -129,7 +134,6 @@ export function PanelStatus({
           {accessory}
         </span>
       </div>
-      {children && <div className="panel-status-notes">{children}</div>}
     </div>
   );
 }

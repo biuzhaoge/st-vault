@@ -33,11 +33,15 @@ const entries: Record<StatusHelpId, { description: string; setting?: Setting }> 
   },
   'account-list': {
     description:
-      '通过已导入的 Cookies 更新关注清单和账户资料。会话失效时，在账户面板更新 Cookies。',
+      '用已导入的 Cookies 更新关注清单和账户资料，暂时缺席的主播会保留到核实后。会话失效时，在账户面板更新 Cookies。',
     setting: 'pollMs',
   },
   'capture-status': {
     description: '匿名查询主播的公开状态，更新在线分组和状态时间线。',
+    setting: 'pollMs',
+  },
+  'archive-reasons': {
+    description: '随统一心跳分批核验归档原因，优先检查未核验的主播。站点限制访问时会推迟重试。',
     setting: 'pollMs',
   },
   'cover-sync': {

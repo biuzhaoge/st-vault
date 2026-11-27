@@ -7,12 +7,14 @@ export function StatusHelp({
   label,
   description,
   parameter,
+  note,
   open,
   onOpenChange,
 }: {
   label: string;
   description: string;
   parameter?: string;
+  note?: string;
   open: boolean;
   onOpenChange: (open: boolean) => void;
 }): JSX.Element {
@@ -72,7 +74,7 @@ export function StatusHelp({
       window.visualViewport?.removeEventListener('resize', hide);
       window.removeEventListener('scroll', dismissOnScroll, true);
     };
-  }, [open]);
+  }, [open, note]);
 
   return (
     <span
@@ -106,6 +108,7 @@ export function StatusHelp({
       <span ref={tooltip} id={id} className="status-help-popup" role="tooltip">
         {description}
         {parameter && <small>{parameter}</small>}
+        {note && <small>{note}</small>}
       </span>
     </span>
   );

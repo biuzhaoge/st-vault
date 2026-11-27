@@ -70,6 +70,39 @@ function fixture(extra: Partial<Parameters<typeof createIngressHub>[0]> = {}, fr
   };
 }
 describe('shared live ingress', () => {
+  it('requires a verified public observation for a new producer despite a retained continuation lease', async () => {
+    const status = vi
+      .fn<() => Promise<Subject['providerStatus']>>()
+      .mockResolvedValueOnce('PUBLIC')
+      .mockResolvedValue('UNKNOWN');
+    const evidence = new StatusEvidence({ provider: { status } });
+    evidenceServices.push(evidence);
+    await evidence.observe(subject);
+    await evidence.observe(subject);
+    expect(evidence.public(subject.id)).toBe(true);
+    const { hub, requests } = fixture({ evidence });
+    await expect(hub.acquire(subject)).rejects.toMatchObject({ code: 'live_not_public' });
+    expect(requests).toEqual([]);
+  });
+
+  it('keeps a current viewer through UNKNOWN while requiring new viewers to confirm PUBLIC', async () => {
+    const status = vi.fn<() => Promise<Subject['providerStatus']>>().mockResolvedValue('PUBLIC');
+    const evidence = new StatusEvidence({ provider: { status } });
+    evidenceServices.push(evidence);
+    const { hub } = fixture({ evidence });
+    const viewer = await hub.acquire(subject);
+    try {
+      status.mockResolvedValue('UNKNOWN');
+      await evidence.observe(subject);
+      expect(viewer.snapshot().playlist.segments).not.toHaveLength(0);
+      await expect(hub.acquire(subject)).rejects.toMatchObject({ code: 'live_not_public' });
+      status.mockResolvedValue('PUBLIC');
+      (await hub.acquire(subject)).release();
+    } finally {
+      viewer.release();
+    }
+  });
+
   it('releases frame protection when recording is cancelled before the first frame', async () => {
     let reportPublic!: () => void;
     const ready = new Promise<Subject['providerStatus']>((resolve) => {
@@ -783,6 +816,25 @@ describe('shared live ingress', () => {
         '1',
         '2',
       ]);
+    } finally {
+      lease.release();
+    }
+  });
+  it('refreshes public permission on a new outbound transport and preserves the live viewer', async () => {
+    const status = vi.fn(() => Promise.resolve('PUBLIC' as const));
+    const evidence = new StatusEvidence({ provider: { status } });
+    evidenceServices.push(evidence);
+    const f = fixture({ evidence });
+    const lease = await f.hub.acquire(subject);
+    try {
+      const first = lease.snapshot().playlist.segments[0];
+      const checks = status.mock.calls.length;
+      evidence.resetTransport();
+      f.advance();
+      f.hub.changeCdn();
+      await vi.waitFor(() => expect(lease.snapshot().playlist.segments).toHaveLength(2));
+      expect(status.mock.calls.length).toBeGreaterThan(checks);
+      expect(lease.media(first.address)).toHaveLength(64);
     } finally {
       lease.release();
     }

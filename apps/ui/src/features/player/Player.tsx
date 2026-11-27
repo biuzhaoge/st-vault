@@ -9,8 +9,6 @@ import {
   type ReactNode,
 } from 'react';
 import type { LiveProgress, Subject } from '@st-vault/api-schema';
-import { CoverImage } from '../directory/CoverImage';
-import { displayStatus } from '../directory/subjects';
 import { liveNotice, mediaNotice, type MediaPhase, type PlaybackNotice } from './player-status';
 import { Preparation, shouldPrepareNext } from './playback-continuation';
 import {
@@ -27,6 +25,7 @@ import { mediaTimeToUtc, mediaTimePosition } from '../timeline/timeline';
 import type { ViewWindow } from '../timeline/range-control';
 import { fullCalendar, type ArchiveCalendar } from '../timeline/archive-calendar';
 import { PlayerHeading } from './PlayerHeading';
+import { WorkbenchPosterImage } from './PlaybackPoster';
 import { PlaybackNoticeContent } from './PlaybackNoticeContent';
 import { SelectionSummary } from './SelectionSummary';
 import { PlayerActivity } from './player-activity';
@@ -716,12 +715,7 @@ export const Player = forwardRef<PlayerHandle, Props>(function Player(
           )}
           {poster && showPoster && (
             <div className="playback-poster" aria-hidden="true">
-              <CoverImage
-                id={poster.id}
-                revision={0}
-                status={displayStatus(poster)}
-                priority="visible"
-              />
+              <WorkbenchPosterImage subject={poster} />
             </div>
           )}
           {displayNotice && noticeStage !== 'hidden' && (

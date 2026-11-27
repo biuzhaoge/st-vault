@@ -5,6 +5,8 @@ import { tr } from '../../shared/lib/i18n';
 import { LanguageSwitch } from '../../shared/ui/LanguageSwitch';
 import { PanelFeedback, PanelField, PanelSection } from '../../shared/ui/PanelContent';
 import type { RuntimeSettings } from '../status/system';
+import { SocksProxySettingsForm } from './SocksProxySettingsForm';
+import './runtime-settings.css';
 interface SettingsDraft {
   pollSeconds: string;
   retentionDays: string;
@@ -185,6 +187,7 @@ export function RuntimeSettingsForm({
           )}
         </div>
       </form>
+      <SocksProxySettingsForm />
     </div>
   );
 }

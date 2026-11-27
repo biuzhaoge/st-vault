@@ -17,6 +17,25 @@ function subject(id = 1): Subject {
     observedAtMs: null,
   };
 }
+it('observes a region-restricted subject without starting automatic recording', async () => {
+  const { archive, observations } = memoryArchive([
+    { ...subject(), archiveReason: 'region_restricted' },
+  ]);
+  const capture = vi.fn<ProviderPort['capture']>().mockResolvedValue(undefined);
+  const supervisor = createSupervisor({
+    archive,
+    autoStart: false,
+    provider: { status: async () => 'PUBLIC', importList: async () => [], capture },
+  });
+  try {
+    await supervisor.reconcile();
+    expect(observations).toEqual(['PUBLIC']);
+    expect(capture).not.toHaveBeenCalled();
+  } finally {
+    await supervisor.close();
+  }
+});
+
 it('keeps ordinary polling linear when the urgent queue is empty', async () => {
   let idReads = 0;
   const rows = Array.from({ length: 160 }, (_, index) => {
@@ -195,6 +214,12 @@ function memoryArchive(subjects: Subject[]): {
     },
     async accountActivation() {
       return null;
+    },
+    async followedAccountSubjects() {
+      throw new Error('unused-fixture');
+    },
+    async archivedAccountSubjects() {
+      throw new Error('unused-fixture');
     },
     async discardAccountPreparation() {
       throw new Error('unused-fixture');
@@ -399,6 +424,78 @@ describe('independent anonymous supervisor', () => {
     } finally {
       release();
       await sweeping;
+      await supervisor.close();
+    }
+  });
+  it.each(['failed observation', 'transport change'])(
+    'does not use persisted PUBLIC after a %s',
+    async (reason) => {
+      let now = 1000;
+      const rows = [{ ...subject(), autoRecord: false }];
+      const { archive } = memoryArchive(rows);
+      const capture = vi.fn<ProviderPort['capture']>(async (_row, _sink, signal) =>
+        untilAbort(signal),
+      );
+      const status = vi
+        .fn<ProviderPort['status']>()
+        .mockResolvedValueOnce('PUBLIC')
+        .mockResolvedValue('UNKNOWN');
+      const evidence = new StatusEvidence({
+        provider: { status },
+        now: () => now,
+        persist: archive.setObservation,
+      });
+      const supervisor = createSupervisor({
+        archive,
+        evidence,
+        provider: { importList: async () => [], status, capture },
+        now: () => now,
+        autoStart: false,
+      });
+      try {
+        await supervisor.reconcile();
+        now += 1000;
+        if (reason === 'failed observation') await evidence.observe(rows[0]);
+        else evidence.resetTransport();
+        expect(rows[0].providerStatus).toBe('PUBLIC');
+        await archive.setPolicy(rows[0].id, { autoRecord: true });
+        await supervisor.requestRecording!([rows[0].id]);
+        await supervisor.reconcile();
+        expect(capture).not.toHaveBeenCalled();
+        expect(supervisor.states()[rows[0].id]).toBe('IDLE');
+      } finally {
+        await supervisor.close();
+        await evidence.close();
+      }
+    },
+  );
+  it('does not launch a recording when the subject is archived during its public check', async () => {
+    const rows = [subject()];
+    const { archive } = memoryArchive(rows);
+    const capture = vi.fn<ProviderPort['capture']>();
+    let finishStatus!: (status: PublicStatus) => void;
+    const status = vi.fn<ProviderPort['status']>(
+      () =>
+        new Promise((resolve) => {
+          finishStatus = resolve;
+        }),
+    );
+    const supervisor = createSupervisor({
+      archive,
+      provider: { importList: async () => [], status, capture },
+      autoStart: false,
+    });
+    const sweep = supervisor.reconcile();
+    try {
+      await vi.waitFor(() => expect(status).toHaveBeenCalledOnce());
+      rows[0].archived = true;
+      finishStatus('PUBLIC');
+      await sweep;
+      await supervisor.requestRecording!([rows[0].id]);
+      expect(capture).not.toHaveBeenCalled();
+      expect(supervisor.states()[rows[0].id]).toBe('IDLE');
+    } finally {
+      finishStatus?.('PUBLIC');
       await supervisor.close();
     }
   });

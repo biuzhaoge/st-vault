@@ -1098,6 +1098,50 @@ it('periodically removes source-less completed jobs while retaining data on sour
   await expect(readFile(filename(root))).rejects.toMatchObject({ code: 'ENOENT' });
 });
 
+it('reclaims screenshot scan cursors only after their archive subject is gone', async () => {
+  const { root, queue, reopen } = await fixture();
+  await queue.close();
+  const removed = 'stripchat:43';
+  const db = await SqlDatabase.open(path.join(root, 'jobs'));
+  try {
+    await db
+      .prepare('INSERT INTO scan VALUES(?,?),(?,?)')
+      .run(subject, 'retained', removed, 'stale');
+    await reopen({
+      archive: {
+        ...idleArchive(),
+        listSubjects: () => Promise.resolve(subjects),
+        getSubject: (id: string) => Promise.resolve(subjects.find((row) => row.id === id) ?? null),
+      },
+    });
+    await vi.waitFor(async () => {
+      expect(await db.prepare('SELECT * FROM scan ORDER BY subject').all()).toEqual([
+        { subject, unit_cursor: 'retained' },
+      ]);
+    });
+  } finally {
+    await db.close();
+  }
+});
+
+it('continues a history scan when a subject is removed after reading the directory', async () => {
+  const removed = { ...subjects[0], id: 'stripchat:43', providerId: 43 };
+  const snapshotUnits = vi.fn((id: string) =>
+    id === removed.id
+      ? Promise.reject(new Error('SUBJECT_NOT_FOUND'))
+      : Promise.resolve({ items: [], cursor: null }),
+  );
+  await fixture({
+    archive: {
+      ...idleArchive(),
+      listSubjects: () => Promise.resolve([removed, ...subjects]),
+      snapshotUnits,
+    },
+    pollMs: 10000,
+  });
+  await vi.waitFor(() => expect(snapshotUnits).toHaveBeenNthCalledWith(2, subject, undefined, 8));
+});
+
 it('does not checkpoint a stale history page after concurrent source removal invalidates the scan', async () => {
   const report = deferred<SnapshotItem | null>(),
     next = deferred<{ items: SnapshotItem[]; cursor: string | null }>(),

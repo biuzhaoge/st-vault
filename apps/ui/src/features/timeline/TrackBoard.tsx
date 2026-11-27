@@ -13,7 +13,7 @@ import {
   type ReactNode,
   type CSSProperties,
 } from 'react';
-import type { Subject } from '@st-vault/api-schema';
+import { subjectDirectory, type Subject } from '@st-vault/api-schema';
 import { formatDateTime } from './timeline';
 import {
   DAY_MS,
@@ -32,10 +32,10 @@ import {
   restoreRowViewport,
 } from '../directory/virtual-list';
 import type { ListPosition } from '../../shared/lib/workspace-state';
-import { CoverImage } from '../directory/CoverImage';
+import { SubjectPreview } from '../directory/SubjectPreview';
 import { useRowMotion } from '../directory/use-row-motion';
-import { displayStatus } from '../directory/subjects';
 import { DirectoryRowNumber, RecordingMode } from '../directory/RecordingMode';
+import { UnfollowButton } from '../directory/UnfollowButton';
 import { useSyncClock } from '../../shared/lib/sync';
 import { TimeRangeControl } from './TimeRangeControl';
 import { indicateRow, panTimeline, joinTimelinePan } from '../../design/motion';
@@ -44,6 +44,7 @@ import { snapCoverageRange } from './selection-range';
 import { calendarDivisions } from './ruler';
 import { TrackGestureSession, type TrackGesture } from './track-gesture';
 import { useLayoutMotion } from '../../design/use-layout-motion';
+import { Icon } from '../../design/Icon';
 import { TimelineHoverPreview, type TimelineHoverHandle } from './TimelineHoverPreview';
 import { hoverMediaTime } from './hover-preview';
 import { fullCalendar, type ArchiveCalendar, type TimelineScale } from './archive-calendar';
@@ -268,6 +269,7 @@ const TrackRow = memo(function TrackRow({
   scale,
   onChoose,
   onRecordingChange,
+  onUnfollow,
 }: {
   subject: Subject;
   rowNumber: number;
@@ -285,16 +287,23 @@ const TrackRow = memo(function TrackRow({
   scale: TimelineScale;
   onChoose: (subject: Subject, utc?: number) => void;
   onRecordingChange: (subject: Subject, record: boolean) => Promise<void>;
+  onUnfollow?: (subject: Subject) => Promise<void>;
 }) {
   useTranslation();
+  const { group, orderStatus } = subjectDirectory(subject);
+  const archived = group === 'ARCHIVED';
+  const status = archived ? 'archived' : orderStatus.toLowerCase();
+  const canUnfollow = archived
+    ? subject.archiveReason === 'account_disabled'
+    : subject.archiveReason === undefined;
   return (
     <div
       className={`track-row${selected ? ' selected' : ''}${selecting ? ' is-selecting' : ''}`}
       data-subject-id={subject.id}
     >
-      <div className={`track-label status-cell-${displayStatus(subject).toLowerCase()}`}>
+      <div className={`track-label status-cell-${status}`}>
         <div className="directory-row-index">
-          {subject.archived ? (
+          {archived ? (
             <DirectoryRowNumber number={rowNumber} />
           ) : (
             <RecordingMode
@@ -306,26 +315,18 @@ const TrackRow = memo(function TrackRow({
               onChange={(record) => onRecordingChange(subject, record)}
             />
           )}
+          {onUnfollow && subject.unfollowBinding && canUnfollow && (
+            <UnfollowButton handle={subject.handle} onUnfollow={() => onUnfollow(subject)} />
+          )}
         </div>
         <div className="track-cover-cell">
-          <button
-            className="subject-preview"
-            onClick={(event) => {
-              if (event.detail === 0) onChoose(subject);
-            }}
-            aria-label={subject.handle}
-            aria-current={selected ? 'true' : undefined}
-            title={`${subject.handle} · ${subject.id}`}
-          >
-            <CoverImage
-              id={subject.id}
-              revision={coverRevision}
-              status={displayStatus(subject)}
-              priority={priority}
-            >
-              <strong className="subject-name">{subject.handle}</strong>
-            </CoverImage>
-          </button>
+          <SubjectPreview
+            subject={subject}
+            coverRevision={coverRevision}
+            priority={priority}
+            selected={selected}
+            onChoose={onChoose}
+          />
         </div>
       </div>
       <div
@@ -376,12 +377,14 @@ export function TrackBoard({
   calendar = fullCalendar,
   account,
   filters,
+  onOpenMonitor,
   onChoose,
   onRangeChoose,
   onAnchor,
   onViewChange,
   onMove,
   onRecordingChange,
+  onUnfollow,
   reveal,
   restorePosition,
   onPosition,
@@ -409,7 +412,9 @@ export function TrackBoard({
   onMove: (direction: -1 | 1) => void;
   account?: ReactNode;
   filters?: ReactNode;
+  onOpenMonitor?: () => void;
   onRecordingChange: (subject: Subject, record: boolean) => Promise<void>;
+  onUnfollow?: (subject: Subject) => Promise<void>;
 }): JSX.Element {
   const scale = useMemo(() => calendar.scale(fromMs, toMs), [calendar, fromMs, toMs]);
   const [viewport, setViewport] = useState({ top: 0, height: 500 });
@@ -464,13 +469,16 @@ export function TrackBoard({
   viewRef.current = { fromMs, toMs };
   const subjectsRef = useRef(subjects);
   subjectsRef.current = subjects;
-  const rowActions = useRef({ onChoose, onRecordingChange });
-  rowActions.current = { onChoose, onRecordingChange };
+  const rowActions = useRef({ onChoose, onRecordingChange, onUnfollow });
+  rowActions.current = { onChoose, onRecordingChange, onUnfollow };
   const chooseRow = useRef((subject: Subject, utc?: number) =>
     rowActions.current.onChoose(subject, utc),
   ).current;
   const recordRow = useRef((subject: Subject, record: boolean) =>
     rowActions.current.onRecordingChange(subject, record),
+  ).current;
+  const unfollowRow = useRef(
+    (subject: Subject) => rowActions.current.onUnfollow?.(subject) ?? Promise.resolve(),
   ).current;
   const subjectIds = useMemo(() => subjects.map((subject) => subject.id), [subjects]);
   const ids = useMemo(() => subjectIds.join('|'), [subjectIds]);
@@ -700,6 +708,20 @@ export function TrackBoard({
             nowMs={nowMs}
             calendar={calendar}
             filters={filters}
+            actions={
+              onOpenMonitor && (
+                <button
+                  type="button"
+                  className="monitor-wall-trigger"
+                  aria-label={tr('监控墙')}
+                  title={tr('监控墙')}
+                  onClick={onOpenMonitor}
+                >
+                  <Icon name="monitor-wall" />
+                  <span>{tr('监控墙')}</span>
+                </button>
+              )
+            }
             onChange={onViewChange}
             onMove={onMove}
           />
@@ -999,6 +1021,7 @@ export function TrackBoard({
                 scale={scale}
                 onChoose={chooseRow}
                 onRecordingChange={recordRow}
+                onUnfollow={onUnfollow ? unfollowRow : undefined}
               />
             );
           })}

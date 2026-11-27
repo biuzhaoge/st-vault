@@ -1,0 +1,39 @@
+.runtime-settings {
+  --menu-gap: var(--panel-stack-gap);
+  font-size: var(--panel-text-size);
+  line-height: var(--panel-text-line);
+}
+
+.runtime-settings :is(.panel-section, .panel-actions) {
+  gap: var(--panel-stack-gap);
+}
+
+.runtime-settings .panel-section > h3 {
+  font-size: var(--panel-caption-size);
+  font-weight: var(--panel-caption-weight);
+  line-height: var(--panel-caption-line);
+}
+
+.panel-content .runtime-settings :is(.field, .language-setting, .global-recording-settings) {
+  gap: 2px var(--panel-stack-gap);
+  font-size: var(--panel-text-size);
+}
+
+.panel-content .runtime-settings :is(.field, .language-setting, .global-recording-settings) > span {
+  color: var(--ink);
+  font-weight: var(--panel-label-weight);
+}
+
+.panel-content .runtime-settings :is(small, p.muted) {
+  font-size: var(--panel-caption-size);
+  line-height: var(--panel-caption-line);
+}
+
+.runtime-settings .panel-feedback {
+  font-size: var(--panel-text-size);
+  line-height: var(--panel-text-line);
+}
+
+.runtime-settings input[type='number'] {
+  font-variant-numeric: tabular-nums;
+}

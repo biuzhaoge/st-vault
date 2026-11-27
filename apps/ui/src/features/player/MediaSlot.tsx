@@ -40,6 +40,8 @@ interface Props {
   active: boolean;
   muted: boolean;
   volume: number;
+  manageSession?: boolean;
+  observeProgress?: boolean;
   bufferAheadSeconds?: number;
   onProgress: (utc: number, mediaTime: number, unitId?: string) => void;
   onReady: () => void;
@@ -48,6 +50,8 @@ interface Props {
   onPlaying: (playing: boolean) => void;
   onAudio: (muted: boolean, volume: number) => void;
   onError: (message: string) => void;
+  onConnectionFailure?: (message: string) => void;
+  onStablePlayback?: () => void;
   onRecovered: () => void;
   onPhase?: (phase: MediaPhase) => void;
 }
@@ -55,7 +59,7 @@ interface Props {
 // Delaying release one task lets React StrictMode cancel its simulated teardown.
 const releases = new Map<string, ReturnType<typeof setTimeout>>();
 export const MediaSlot = forwardRef<MediaSlotHandle, Props>(function MediaSlot(props, ref) {
-  const { source, active, muted, volume } = props;
+  const { source, active, muted, volume, manageSession = true } = props;
   const videoRef = useRef<HTMLVideoElement>(null),
     engine = useRef<Hls | null>(null);
   const callbacks = useRef(props);
@@ -111,9 +115,11 @@ export const MediaSlot = forwardRef<MediaSlotHandle, Props>(function MediaSlot(p
       awaitingSeek = false,
       ended = false;
     let failureShown = false,
-      terminalFailure = '',
+      terminalFailure: { message: string; connection: boolean } | undefined,
       healthyMediaTime: number | null = null,
-      healthyClock = -Infinity;
+      healthyClock = -Infinity,
+      stablePlaybackStart: number | null = null,
+      reportedStable = false;
     let networkRecoveries = 0,
       mediaRecoveries = 0,
       recoveryMediaTime = 0;
@@ -123,7 +129,7 @@ export const MediaSlot = forwardRef<MediaSlotHandle, Props>(function MediaSlot(p
       if (recoveryTimer !== undefined) return true;
       if (kind === 'network' ? networkRecoveries >= 2 : mediaRecoveries >= 1) return false;
       const attempt = kind === 'network' ? ++networkRecoveries : ++mediaRecoveries;
-      terminalFailure = '';
+      terminalFailure = undefined;
       callbacks.current.onPhase?.(kind === 'network' ? 'network' : 'decoder');
       recoveryMediaTime = video.currentTime;
       recoveryTimer = setTimeout(() => {
@@ -142,10 +148,11 @@ export const MediaSlot = forwardRef<MediaSlotHandle, Props>(function MediaSlot(p
     let frame = 0,
       lastRender = -Infinity;
     const isCurrent = (): boolean => !cancelled && callbacks.current.source === source;
-    const fail = (message: string): void => {
+    const fail = (message: string, connection = false): void => {
       if (isCurrent()) {
         failureShown = true;
         callbacks.current.onError(message);
+        if (connection) callbacks.current.onConnectionFailure?.(message);
       }
     };
     start.current = async () => {
@@ -191,6 +198,7 @@ export const MediaSlot = forwardRef<MediaSlotHandle, Props>(function MediaSlot(p
     const reset = (): void => {
       healthyMediaTime = null;
       healthyClock = -Infinity;
+      stablePlaybackStart = null;
     };
     const finish = (): void => {
       if (!isCurrent() || ended || !callbacks.current.active) return;
@@ -235,8 +243,9 @@ export const MediaSlot = forwardRef<MediaSlotHandle, Props>(function MediaSlot(p
       checkReady();
       // Loading/seeking events can still carry the previous decoded position.
       if (!positioned || video.seeking || awaitingSeek) return;
-      const position = archivePosition?.(video.currentTime),
-        actual = archivePosition ? (position?.atMs ?? null) : utc(),
+      const reportProgress = callbacks.current.observeProgress !== false;
+      const position = reportProgress ? archivePosition?.(video.currentTime) : undefined,
+        actual = reportProgress ? (archivePosition ? (position?.atMs ?? null) : utc()) : null,
         clock = performance.now();
       const healthy =
         callbacks.current.active &&
@@ -246,6 +255,14 @@ export const MediaSlot = forwardRef<MediaSlotHandle, Props>(function MediaSlot(p
         !video.error;
       if (healthy && healthyMediaTime !== null && video.currentTime > healthyMediaTime) {
         healthyClock = clock;
+        const onStable = callbacks.current.onStablePlayback;
+        if (onStable && !reportedStable) {
+          stablePlaybackStart ??= healthyMediaTime;
+          if (video.currentTime - stablePlaybackStart >= 10) {
+            reportedStable = true;
+            onStable();
+          }
+        }
         // Renew the recovery budget only after ten seconds of actual media progress.
         if (video.currentTime - recoveryMediaTime >= 10) {
           networkRecoveries = 0;
@@ -315,7 +332,7 @@ export const MediaSlot = forwardRef<MediaSlotHandle, Props>(function MediaSlot(p
       callbacks.current.onPhase?.(recoveryTimer !== undefined ? 'network' : 'buffering');
       // A fatal HLS error stops loading, but buffered frames can still play.
       // Keep its cause until depletion rather than leaving an endless spinner.
-      if (terminalFailure) fail(terminalFailure);
+      if (terminalFailure) fail(terminalFailure.message, terminalFailure.connection);
     };
     const nativeError = (): void => {
       if (!video.error || video.error.code === 1) return;
@@ -327,6 +344,7 @@ export const MediaSlot = forwardRef<MediaSlotHandle, Props>(function MediaSlot(p
           : video.error.code === 3
             ? tr('视频解码失败，解码器恢复未能完成。')
             : tr('当前视频格式或编码不受浏览器支持。'),
+        video.error.code === 2,
       );
     };
     seek.current = (target, unitId) => {
@@ -384,7 +402,7 @@ export const MediaSlot = forwardRef<MediaSlotHandle, Props>(function MediaSlot(p
         console.warn('Page playback release failed', error),
       );
     };
-    window.addEventListener('pagehide', leaving);
+    if (manageSession) window.addEventListener('pagehide', leaving);
     frame = requestAnimationFrame(animate);
     callbacks.current.onPhase?.('engine');
     void loadPlayerEngine()
@@ -405,21 +423,32 @@ export const MediaSlot = forwardRef<MediaSlotHandle, Props>(function MediaSlot(p
           engine.current = hls;
           hls.on(Engine.Events.ERROR, (_event, data) => {
             if (!isCurrent() || !data.fatal) return;
-            if (data.type === Engine.ErrorTypes.NETWORK_ERROR && recover('network')) return;
+            const network = data.type === Engine.ErrorTypes.NETWORK_ERROR;
+            const status = data.response?.code;
+            const rejected = network && [401, 403, 409, 410].includes(status ?? 0);
+            const stopRecovery = rejected && !!callbacks.current.onConnectionFailure;
+            if (stopRecovery) {
+              clearTimeout(recoveryTimer);
+              recoveryTimer = undefined;
+            } else if (network && recover('network')) return;
             if (data.type === Engine.ErrorTypes.MEDIA_ERROR && recover('media')) return;
-            terminalFailure =
-              data.type === Engine.ErrorTypes.NETWORK_ERROR
-                ? tr('播放分片请求失败，自动重连未能恢复连接。')
-                : data.type === Engine.ErrorTypes.MEDIA_ERROR
-                  ? tr('视频解码失败，解码器恢复未能完成。')
-                  : tr('播放引擎无法继续处理当前媒体，请重新连接。');
+            terminalFailure = {
+              message: stopRecovery
+                ? tr('请求失败（{{v0}}）', { v0: status })
+                : network
+                  ? tr('播放分片请求失败，自动重连未能恢复连接。')
+                  : data.type === Engine.ErrorTypes.MEDIA_ERROR
+                    ? tr('视频解码失败，解码器恢复未能完成。')
+                    : tr('播放引擎无法继续处理当前媒体，请重新连接。'),
+              connection: network && !rejected,
+            };
             if (
               !callbacks.current.active ||
               video.paused ||
               video.readyState < 2 ||
               performance.now() - healthyClock > 1000
             )
-              fail(terminalFailure);
+              fail(terminalFailure.message, terminalFailure.connection);
           });
           hls.attachMedia(video);
           callbacks.current.onPhase?.('manifest');
@@ -445,17 +474,18 @@ export const MediaSlot = forwardRef<MediaSlotHandle, Props>(function MediaSlot(p
       video.pause();
       video.removeAttribute('src');
       video.load();
-      releases.set(
-        key,
-        setTimeout(() => {
-          releases.delete(key);
-          void closeSource(source).catch((error) =>
-            console.warn('Playback session release failed', error),
-          );
-        }, 0),
-      );
+      if (manageSession)
+        releases.set(
+          key,
+          setTimeout(() => {
+            releases.delete(key);
+            void closeSource(source).catch((error) =>
+              console.warn('Playback session release failed', error),
+            );
+          }, 0),
+        );
     };
-  }, [source]);
+  }, [source, manageSession]);
   return (
     <video
       ref={videoRef}

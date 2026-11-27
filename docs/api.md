@@ -8,19 +8,26 @@
 
 ## 会话与账户
 
-| 方法和路径                             | 行为                                                                                                             |
-| -------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| `GET /api/session`                     | 读取管理员认证与初始化阶段                                                                                       |
-| `POST /api/setup/session`              | 获取受限初始化许可；旧部署需验证原密码                                                                           |
-| `POST /api/setup`                      | 提交 `{pin}` 完成初始化，不要求账户连接                                                                          |
-| `POST /api/login` / `POST /api/logout` | PIN 解锁、撤销当前会话                                                                                           |
-| `GET /api/account-sync`                | 账户资料和同步状态，无凭据                                                                                       |
-| `PUT /api/account-sync`                | 导入 `{cookiesText, origin}`                                                                                     |
-| `DELETE /api/account-sync`             | 断开并返回 `{status, draft}`；draft 为原 `{cookiesText, origin}` 或 null，供浏览器保存站点绑定草稿。响应禁止缓存 |
+| 方法和路径                               | 行为                                                                                                             |
+| ---------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `GET /api/session`                       | 读取管理员认证与初始化阶段                                                                                       |
+| `POST /api/setup/session`                | 获取受限初始化许可；旧部署需验证原密码                                                                           |
+| `POST /api/setup`                        | 提交 `{pin}` 完成初始化，不要求账户连接                                                                          |
+| `POST /api/login` / `POST /api/logout`   | PIN 解锁、撤销当前会话                                                                                           |
+| `GET /api/account-sync`                  | 账户资料和同步状态，无凭据                                                                                       |
+| `PUT /api/account-sync`                  | 导入 `{cookiesText, origin}`                                                                                     |
+| `DELETE /api/account-sync`               | 断开并返回 `{status, draft}`；draft 为原 `{cookiesText, origin}` 或 null，供浏览器保存站点绑定草稿。响应禁止缓存 |
+| `DELETE /api/account-sync/favorites/:id` | 在当前绑定账户取消关注单个主播，返回 `{subject}`。有录像时返回归档后的记录，已清理或正在后台清理时返回 `null`。  |
 
 初始化许可只用于完成 PIN，不可访问账户、录像或设置。没有原站账号密码登录、验证码任务或直接清单导入接口；账户仅通过粘贴 Cookies 接入。实现见 [http/app.ts](../apps/server/src/http/app.ts)。
 
 账户接口仅允许已解锁的管理员会话，返回 `Cache-Control: no-store, private`。导入未提供来源时沿用当前来源，未连接则使用默认值；登录后绑定域名，不接受不同域名的更新（409 account_origin_locked）；退出后可重新选择。网站测速也受相同连接锁约束。退出通过持久化空清单提交归档全部主播并停录，重启后继续恢复，录像保留。
+
+手动取关提交 `{binding}`，来自当前主播列表返回的 `unfollowBinding`。该值与当时绑定的原站账户对应，过期列表会收到 409。原站确认后才更新本地归属。
+
+同步成功后，`favoritesIndexCount` 表示原站关注索引的唯一 ID 数，`pendingProfileCount` 表示待补充官方资料的 ID 数（有待处理时返回）。状态面板的关注清单同步会提示待补资料数，分组数量显示在主播列表筛选器上。
+
+已连接账户的心跳确认新关注 ID 后，`GET /api/subjects` 可以先返回带 `主播 #ID` 临时名称的条目，同步事件流会通知目录刷新。姓名和图片在资料返回后补齐。
 
 ## 工作台与媒体
 
@@ -36,6 +43,8 @@
 | 管理   | system、settings、keys、me/favorites                                                                                               |
 
 `GET /api/subjects` 在有连续在线记录时返回可选的 `onlineSinceMs`，表示工作台用于在线排序的、最近一次连续在线的最早观测时间。连续的公开和私密状态属于同一次在线。`lastOnlineAtMs` 仍是最新在线状态区间的起点，供离线和归档排序。
+
+每条主播记录的 `directory` 提供 `group`（ONLINE、OFFLINE、ARCHIVED）、`orderStatus` 和 `pending`。`providerStatus` 表示当前有效的原站直播状态观测，过期时分组可沿用 `lastKnownStatus`。`archiveReason` 提供已确认的归档原因。仍按直播状态分组的地区受限条目也会返回 `archiveReason: "region_restricted"`。等待清理且无录像的已确认取关或封禁条目不出现在列表响应中。
 
 `GET /api/archive-calendar` 返回 `{emptyDays:[{fromMs,toMs}]}`。范围按时间排序，覆盖部署时区里已结束且全库没有可回放录像的完整日期，相邻空白日合并为半开区间。该接口要求管理员会话并禁止缓存。工作台和运行记录允许最多八个 UTC 日的可见时长，录像定位、回放、截图分页与批量操作允许最多九个。超过原始时长上限的请求由服务端用全库空白日期验证可见时长。原始分片列表和单主播独立状态、覆盖接口仍使用各自的原始时间范围上限。
 
@@ -72,6 +81,8 @@
 当时间线只因同状态观测续期而变化时，`change` 可附带 `timelineSubjectIds`，最多 64 个主播 ID。范围只作用于本条消息的 `timeline` 主题。缺少该字段时刷新整个主题。媒体版本变化、确认状态切换和主播集合变化仍使用全局通知。
 
 `GET /api/system` 保留原有健康、磁盘、录制和截图数据，并返回 `capturedAtMs`、`backgroundTasks` 与 `ingress`。任务项包含稳定 `id`、分组 `group`、状态 `state`，以及可选的最近执行/成功/下次调度时间、已处理量、总量、待处理量和失败量。没有总量时不能由客户端推算百分比。`target` 仅用于公开接入点的主机名及延迟，不包含凭据、媒体地址或本地路径。`ingress` 是共享直播入口的当前主播数、保留字节与内存预算。
+
+周期数据同步任务可返回 `consecutiveFailures`，表示连续未完成的轮次或同一资源的连续失败尝试。失败项目数由 `failed` 单独表示。读取状态面板不会增加连续失败数。账户需要更新凭据时，关注同步任务的 `detail` 为 `account-reconnect`。
 
 `deletionJobs` 与 `GET /api/media-deletions` 返回的任务列表格式相同，包含所有已获名额的在途任务、最多 20 项最早等待名额的任务和最多 20 项最新终态任务。`deletionWaiting` 为等待名额的完整数量。空数组表示没有任务，`null` 表示状态暂时不可用。客户端可用独立接口恢复读取，或在删除提交的响应丢失时按命令 ID 立即核验。
 

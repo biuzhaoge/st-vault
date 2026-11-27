@@ -37,7 +37,6 @@
   position: absolute;
   inset: 0;
   z-index: 0;
-  opacity: 0.45;
 }
 .playback-status::before {
   content: '';
@@ -53,11 +52,7 @@
   aspect-ratio: auto;
 }
 .playback-poster .track-cover {
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  filter: blur(3px);
-  transform: scale(1.03);
+  filter: blur(5px);
 }
 .playback-poster .cover-placeholder {
   display: none;

@@ -863,6 +863,7 @@ try {
                 id: 'site-access',
                 state: archiveFault ? 'error' : 'idle',
                 error: archiveFault ? 'site_unavailable' : null,
+                consecutiveFailures: archiveFault ? 3 : 0,
                 detail: 'account-bound',
                 target: 'fast.invalid',
               }
@@ -1225,7 +1226,9 @@ try {
         const count = button.querySelector('.filter-count');
         const original = count.textContent;
         count.textContent = '10000';
-        const label = button.querySelector('.filter-label');
+        const label = [...button.querySelectorAll('.filter-label,.filter-label-compact')].find(
+          (node) => node.getClientRects().length,
+        );
         const range = document.createRange();
         range.selectNodeContents(label);
         const text = range.getBoundingClientRect();
@@ -1238,9 +1241,9 @@ try {
           number.right <= bounds.right - 3 &&
           number.left >= bounds.left + 3 &&
           text.right <= bounds.right - 3 &&
-          number.left >= text.right &&
-          number.top < text.bottom &&
-          text.top < number.bottom
+          (getComputedStyle(button).flexDirection === 'column'
+            ? number.top >= text.bottom - 1 && number.bottom <= bounds.bottom
+            : number.left >= text.right && number.top < text.bottom && text.top < number.bottom)
         );
       });
       const row = document.querySelector('.track-row');
@@ -2679,7 +2682,7 @@ try {
       const original = label.className;
       try {
         return Object.fromEntries(
-          ['public', 'private', 'offline', 'unknown'].map((status) => {
+          ['public', 'private', 'offline', 'unknown', 'archived'].map((status) => {
             label.className = `track-label status-cell-${status}`;
             return [status, getComputedStyle(label.querySelector('.track-cover')).objectFit];
           }),
@@ -2692,7 +2695,8 @@ try {
     public: 'contain',
     private: 'contain',
     offline: 'cover',
-    unknown: 'contain',
+    unknown: 'cover',
+    archived: 'cover',
   });
   report.checks.coverFitByStatus = coverFits;
   for (const size of [

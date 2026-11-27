@@ -1,6 +1,6 @@
 import type { PublicStatus, Subject } from '@st-vault/api-schema';
 import type { ProviderPort } from '../ports.js';
-import type { SyncClock } from '../runtime/sync-clock.js';
+import { syncSkipped, type SyncClock } from '../runtime/sync-clock.js';
 import { ProviderError, waitFor } from './http.js';
 import { MediaBudget } from './media-budget.js';
 
@@ -29,6 +29,7 @@ export interface PublicEvidence {
 interface State extends PublicEvidence {
   confirmed: PublicStatus;
   observedAt: number;
+  startPublic?: boolean;
   candidate?: { from: PublicStatus; status: PublicStatus; at: number };
   offline?: { count: number; since: number };
   last?: StatusObservation;
@@ -68,9 +69,10 @@ export class StatusEvidence {
   private readonly monitorConcurrency: number;
   private readonly activeConcurrency: number;
   private readonly monitoring = new Set<string>();
-  private readonly work = new Map<string, Promise<StatusObservation>>();
+  private readonly work = new Map<string, { state: State; result: Promise<StatusObservation> }>();
   private readonly requests = new Set<{
     id: string;
+    state: State;
     kind: 'monitor' | 'active';
     controller: AbortController;
     done: Promise<PublicStatus>;
@@ -83,6 +85,7 @@ export class StatusEvidence {
   private timer?: ReturnType<typeof setTimeout>;
   private activeWork?: Promise<void>;
   private nextRefresh = 0;
+  private transportChangedAt = -Infinity;
   private cursor = 0;
   private closed = false;
   constructor(private readonly options: StatusEvidenceOptions) {
@@ -155,6 +158,10 @@ export class StatusEvidence {
   public(id: string): boolean {
     return this.now() < this.snapshot(id).publicUntilMs;
   }
+  /** A recovery lease can sustain existing media after an inconclusive check. */
+  publicForStart(id: string): boolean {
+    return this.states.get(id)?.startPublic === true && this.public(id);
+  }
   private state(subject: Subject): State {
     let state = this.states.get(subject.id);
     if (!state) {
@@ -173,11 +180,19 @@ export class StatusEvidence {
     return state;
   }
   seedPublic(subject: Subject, observedAt: number): void {
+    if (observedAt <= this.transportChangedAt) return;
     const state = this.state(subject);
-    if (state.revocation || state.observedAt > observedAt) return;
+    if (state.startPublic !== undefined || state.observedAt > observedAt) return;
+    state.startPublic = true;
     state.lastPublicAtMs = observedAt;
     state.publicUntilMs = Math.max(state.publicUntilMs, observedAt + this.lease());
     this.changed(subject.id);
+  }
+  resetTransport(): void {
+    this.transportChangedAt = this.now();
+    this.states.clear();
+    this.nextRefresh = 0;
+    for (const request of this.requests) request.controller.abort();
   }
   private changed(id: string): void {
     for (const listener of this.listeners) listener(id, this.snapshot(id));
@@ -225,10 +240,10 @@ export class StatusEvidence {
     );
     this.timer.unref();
   }
-  private async pulse(): Promise<void> {
-    if (this.closed) return;
+  private async pulse(): Promise<void | typeof syncSkipped> {
+    if (this.closed) return syncSkipped;
     for (const id of this.interests.keys()) this.changed(id);
-    if (this.activeWork || this.now() < this.nextRefresh) return;
+    if (this.activeWork || this.now() < this.nextRefresh) return syncSkipped;
     this.nextRefresh = this.now() + this.interval();
     const active = [...this.interests.values()];
     const batch = active.length
@@ -240,11 +255,9 @@ export class StatusEvidence {
     this.cursor = active.length ? (this.cursor + batch.length) % active.length : 0;
     // Active refresh and monitor rotation share one capacity plan. Its reserved
     // monitor capacity must also drive the permit rotation estimate.
+    if (!batch.length || this.pending >= this.concurrency || this.closed) return syncSkipped;
     this.activeWork = Promise.all(
-      batch.map(async ({ subject }) => {
-        if (this.pending >= this.concurrency || this.closed) return;
-        await this.observe(subject, undefined, this.interval() / 2, 'active');
-      }),
+      batch.map(({ subject }) => this.observe(subject, undefined, this.interval() / 2, 'active')),
     )
       .then(() => undefined)
       .finally(() => {
@@ -272,22 +285,44 @@ export class StatusEvidence {
       return Promise.resolve(state.last);
     }
     let work = this.work.get(subject.id);
+    const outstanding =
+      work?.state === state ? [] : [...this.requests].filter(({ id }) => id === subject.id);
+    const retiring = outstanding.filter((request) => request.state !== state);
+    if ((work && work.state !== state) || retiring.length) {
+      // The prior route's caller may have returned before its actual request
+      // released read capacity. Wait for it before checking the new route.
+      const settled = Promise.allSettled([work?.result, ...retiring.map(({ done }) => done)]);
+      const deadline = AbortSignal.timeout(this.options.timeoutMs ?? 5000);
+      const until = AbortSignal.any([
+        this.controller.signal,
+        deadline,
+        ...(signal ? [signal] : []),
+      ]);
+      return waitFor(settled, until).then(
+        () => this.observe(subject, signal, maxAgeMs, kind, timing),
+        (error: unknown) => {
+          if (signal?.aborted || this.closed) throw error;
+          return { status: 'UNKNOWN', at: this.now() };
+        },
+      );
+    }
     if (!work) {
       // Logical deadlines do not free a provider request that ignores abort.
       // Do not fan out replacement requests for that same source.
-      if (this.pendingFor(subject.id)) {
+      if (outstanding.length) {
         if (timing) timing.source = 'blocked';
         return Promise.resolve({ status: 'UNKNOWN', at: this.now() });
       }
       if (timing) timing.source = 'upstream';
       if (kind === 'monitor') this.monitoring.add(subject.id);
-      work = this.read(subject, state, kind, timing).finally(() => {
+      const result = this.read(subject, state, kind, timing).finally(() => {
         this.work.delete(subject.id);
         this.monitoring.delete(subject.id);
       });
+      work = { state, result };
       this.work.set(subject.id, work);
     } else if (timing) timing.source = 'shared';
-    return waitFor(work, signal);
+    return waitFor(work.result, signal);
   }
   private async request(
     subject: Subject,
@@ -310,6 +345,7 @@ export class StatusEvidence {
     let status: PublicStatus;
     try {
       release = await this.budget.acquire(controller.signal);
+      if (this.states.get(subject.id) !== state) return { status: 'UNKNOWN', at: this.now() };
       if (timing) upstreamStarted = performance.now();
       const requestUpstream = (): Promise<PublicStatus> => {
         attempts++;
@@ -329,7 +365,7 @@ export class StatusEvidence {
             return requestUpstream();
           throw error;
         });
-      const request = { id: subject.id, kind, controller, done };
+      const request = { id: subject.id, state, kind, controller, done };
       this.requests.add(request);
       const releaseActual = release;
       release = undefined;
@@ -360,7 +396,8 @@ export class StatusEvidence {
         }
       }
     }
-    if (controller.signal.aborted) status = 'UNKNOWN';
+    if (controller.signal.aborted || this.states.get(subject.id) !== state) status = 'UNKNOWN';
+    if (status !== 'PUBLIC') state.startPublic = false;
     if (status === 'PRIVATE') {
       state.publicUntilMs = 0;
       state.revocation = 'PRIVATE';
@@ -376,6 +413,7 @@ export class StatusEvidence {
   ): Promise<StatusObservation> {
     const first = await this.request(subject, state, kind, timing);
     if (this.closed) throw Error('STATUS_EVIDENCE_CLOSED');
+    if (this.states.get(subject.id) !== state) return { status: 'UNKNOWN', at: first.at };
     if (first.at < state.observedAt) return { status: 'UNKNOWN', at: first.at };
     let { status } = first;
     let at = first.at,
@@ -397,6 +435,7 @@ export class StatusEvidence {
         state.candidate = { from: baseline, status, at: first.at };
         const second = await this.request(subject, state, kind, timing);
         if (this.closed) throw Error('STATUS_EVIDENCE_CLOSED');
+        if (this.states.get(subject.id) !== state) return { status: 'UNKNOWN', at: second.at };
         if (second.at < first.at) {
           delete state.candidate;
           return { status: 'UNKNOWN', at: second.at };
@@ -424,17 +463,12 @@ export class StatusEvidence {
         }
       }
     } else if (status !== 'UNKNOWN') delete state.candidate;
-    if (status === 'PUBLIC') {
-      state.lastPublicAtMs = at;
-      state.publicUntilMs = Math.max(state.publicUntilMs, at + this.lease());
-      state.revocation = null;
-      delete state.offline;
-    } else if (status === 'PRIVATE') {
+    if (status === 'PUBLIC' || status === 'UNKNOWN') delete state.offline;
+    else if (status === 'PRIVATE') {
       state.publicUntilMs = 0;
       state.revocation = 'PRIVATE';
       delete state.offline;
-    } else if (status === 'UNKNOWN') delete state.offline;
-    else {
+    } else {
       const offline = state.offline ?? { count: 0, since: at };
       offline.count++;
       state.offline = offline;
@@ -461,8 +495,15 @@ export class StatusEvidence {
         if (timing && persistStarted !== undefined)
           timing.persistMs = performance.now() - persistStarted;
       }
+      if (this.states.get(subject.id) !== state) return { status: 'UNKNOWN', at };
       state.confirmed = status;
       state.observedAt = at;
+    }
+    state.startPublic = status === 'PUBLIC';
+    if (state.startPublic) {
+      state.lastPublicAtMs = at;
+      state.publicUntilMs = Math.max(state.publicUntilMs, at + this.lease());
+      state.revocation = null;
     }
     state.last = result;
     this.changed(subject.id);
@@ -476,7 +517,7 @@ export class StatusEvidence {
     this.controller.abort();
     for (const request of this.requests) request.controller.abort();
     await Promise.allSettled([
-      ...this.work.values(),
+      ...[...this.work.values()].map(({ result }) => result),
       ...[...this.requests].map((request) => request.done),
       this.activeWork,
     ]);

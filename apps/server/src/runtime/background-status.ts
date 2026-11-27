@@ -19,6 +19,7 @@ interface Input {
     clients: number;
     running: boolean;
     failed: boolean;
+    consecutiveFailures?: number;
     lastRunAtMs: number | null;
     lastSuccessAtMs: number | null;
   };
@@ -37,6 +38,7 @@ export function backgroundOverview(input: Input): BackgroundTask[] {
       state: job?.running ? 'running' : job?.failed ? 'retrying' : job ? 'waiting' : 'disabled',
       lastRunAtMs: job?.lastStartedAtMs,
       nextRunAtMs: job?.nextTickAtMs,
+      consecutiveFailures: job?.consecutiveFailures,
       error: job?.failed
         ? name === 'run-heartbeat'
           ? 'run_heartbeat_failed'
@@ -48,7 +50,9 @@ export function backgroundOverview(input: Input): BackgroundTask[] {
   const account = input.account,
     sites = input.sites,
     snapshots = input.snapshots,
-    clientFailed = input.client.clients > 0 && input.client.failed;
+    clientFailed =
+      (input.client.consecutiveFailures ??
+        Number(input.client.clients > 0 && input.client.failed)) > 0;
   const active = (input.deletions ?? []).filter(
     (job) =>
       job.state !== 'completed' &&
@@ -58,7 +62,8 @@ export function backgroundOverview(input: Input): BackgroundTask[] {
   const deletionPending = active.length + Math.max(0, (input.deletionWaiting ?? 0) - waitingInView);
   const boundOrigin = account.connected ? account.origin : undefined;
   const access = sites && boundOrigin && sites.access?.origin === boundOrigin ? sites.access : null;
-  const siteError = access?.error;
+  const failedAccessRound = access?.lastFailedRound;
+  const siteError = failedAccessRound === undefined ? access?.error : failedAccessRound?.error;
   const siteReason = !siteError
     ? null
     : siteError.startsWith('upstream-challenge')
@@ -76,6 +81,15 @@ export function backgroundOverview(input: Input): BackgroundTask[] {
     !sites?.probing &&
     (sites?.probeProgress?.total ?? 0) > 0 &&
     sites?.probeProgress?.failed === sites?.probeProgress?.total;
+  const pendingAccountEntries =
+    account.connected && !account.running && !account.error && !account.needsReconnect
+      ? account.pendingMissingCount
+      : undefined;
+  const { favoritesIndexCount, pendingProfileCount } = account;
+  const accountRoster =
+    account.connected && (favoritesIndexCount !== undefined || pendingProfileCount !== undefined)
+      ? { favoritesIndexCount, pendingProfileCount }
+      : undefined;
   const tasks: BackgroundTask[] = [
     schedule('capture-status'),
     ...(input.clock.some((job) => job.name === 'public-status-evidence')
@@ -96,22 +110,32 @@ export function backgroundOverview(input: Input): BackgroundTask[] {
       lastRunAtMs: account.lastAttemptMs,
       lastSuccessAtMs: account.lastSuccessMs,
       nextRunAtMs: account.needsReconnect ? null : account.nextAttemptMs,
+      consecutiveFailures: account.consecutiveFailures,
       error: account.error ?? (account.needsReconnect ? 'account_reconnect' : null),
-      detail: !account.connected ? 'account-disconnected' : account.stage,
+      pending: pendingAccountEntries,
+      ...(accountRoster ? { accountRoster } : {}),
+      detail: account.needsReconnect
+        ? 'account-reconnect'
+        : !account.connected
+          ? 'account-disconnected'
+          : pendingAccountEntries
+            ? 'account-roster-pending'
+            : account.stage,
     },
     account.connected
       ? {
           id: 'site-access',
           group: 'sync',
-          state: access?.error
+          state: siteError
             ? 'error'
             : access?.checkedAtMs !== null && access?.checkedAtMs !== undefined
               ? 'idle'
               : 'waiting',
           target:
             boundOrigin && URL.canParse(boundOrigin) ? new URL(boundOrigin).hostname : undefined,
-          lastRunAtMs: access?.checkedAtMs,
+          lastRunAtMs: failedAccessRound?.atMs ?? access?.checkedAtMs,
           lastSuccessAtMs: access?.lastSuccessAtMs,
+          consecutiveFailures: failedAccessRound?.consecutiveFailures,
           error: siteReason,
           detail: 'account-bound',
         }
@@ -197,10 +221,10 @@ export function backgroundOverview(input: Input): BackgroundTask[] {
     {
       id: 'client-sync',
       group: 'sync',
-      state: clientFailed
-        ? 'retrying'
-        : input.client.running
-          ? 'running'
+      state: input.client.running
+        ? 'running'
+        : clientFailed
+          ? 'retrying'
           : input.client.clients
             ? 'waiting'
             : 'idle',
@@ -208,6 +232,7 @@ export function backgroundOverview(input: Input): BackgroundTask[] {
       detail: 'connected-clients',
       lastRunAtMs: input.client.lastRunAtMs,
       lastSuccessAtMs: input.client.lastSuccessAtMs,
+      consecutiveFailures: input.client.consecutiveFailures,
       nextRunAtMs: input.client.clients
         ? input.clock.find((job) => job.name === 'ui-sync')?.nextTickAtMs
         : null,

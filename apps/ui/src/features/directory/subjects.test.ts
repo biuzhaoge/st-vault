@@ -15,18 +15,70 @@ it('reuses unchanged subject identities but preserves field, name and order chan
   expect(reconcileSubjects(previous, [{ ...first, formerNames: ['Other'] }])[0]).not.toBe(first);
   expect(reconcileSubjects(previous, [{ ...first, formerNames: undefined }])[0]).not.toBe(first);
 });
-it('keeps confirmed online membership through expired or failed polls, until confirmed offline', () => {
+it('updates a reason without changing an archived subject’s membership', () => {
+  const archived = { id: '1', handle: 'A', providerStatus: 'UNKNOWN', archived: true } as Subject;
+  const known: Subject = { ...archived, archiveReason: 'region_restricted' };
+  const updated = reconcileSubjects([archived], [known]);
+  expect(visibleSubjects(updated, ['ARCHIVED'])).toEqual([known]);
+  expect(updated[0]).not.toBe(archived);
+  expect(reconcileSubjects(updated, [{ ...known }])).toBe(updated);
+  expect(reconcileSubjects(updated, [archived])[0].archiveReason).toBeUndefined();
+});
+it('uses the directory projection and keeps identical projections stable across polling', () => {
+  const row = {
+    id: '1',
+    handle: 'A',
+    providerStatus: 'PUBLIC',
+    directory: { group: 'ONLINE', orderStatus: 'PUBLIC', pending: false },
+  } as Subject;
+  const previous = [row];
+  expect(reconcileSubjects(previous, [{ ...row, directory: { ...row.directory! } }])).toBe(
+    previous,
+  );
+  const updated: Subject = {
+    ...row,
+    directory: { group: 'ARCHIVED', orderStatus: 'PUBLIC', pending: false },
+  };
+  expect(reconcileSubjects(previous, [updated])).toEqual([updated]);
+  expect(visibleSubjects([updated], ['ONLINE'])).toEqual([]);
+  expect(visibleSubjects([updated], ['ARCHIVED'])).toEqual([updated]);
+});
+it('counts last known states and keeps an unobserved row at the offline tail', () => {
   const rows = [
     { id: '1', handle: 'A', providerStatus: 'UNKNOWN', lastKnownStatus: 'PUBLIC' },
     { id: '2', handle: 'B', providerStatus: 'UNKNOWN', lastKnownStatus: 'PRIVATE' },
     { id: '3', handle: 'C', providerStatus: 'OFFLINE', lastKnownStatus: 'PUBLIC' },
     { id: '4', handle: 'D', providerStatus: 'UNKNOWN' },
     { id: '5', handle: 'E', providerStatus: 'UNKNOWN', lastKnownStatus: 'PUBLIC', archived: true },
+    { id: '6', handle: 'F', providerStatus: 'UNKNOWN', lastKnownStatus: 'OFFLINE' },
   ] as Subject[];
   expect(subjectCounts(rows)).toEqual({ ONLINE: 2, OFFLINE: 2, ARCHIVED: 1 });
   expect(visibleSubjects(rows, ['ONLINE']).map((row) => row.id)).toEqual(['1', '2']);
+  expect(visibleSubjects(rows, ['OFFLINE']).map((row) => row.id)).toEqual(['3', '6', '4']);
 });
-it('partitions online, offline and archived without duplicates and counts the same membership', () => {
+it('groups a regional restriction by broadcast status, including the last known state', () => {
+  const rows = [
+    { id: 'public', providerStatus: 'PUBLIC' },
+    { id: 'private', providerStatus: 'PRIVATE' },
+    { id: 'offline', providerStatus: 'OFFLINE' },
+    { id: 'pending', providerStatus: 'UNKNOWN', lastKnownStatus: 'PRIVATE' },
+  ].map((row) => ({
+    ...row,
+    handle: row.id,
+    archived: false,
+    archiveReason: 'region_restricted',
+  })) as Subject[];
+
+  expect(visibleSubjects(rows, ['ONLINE']).map((row) => row.id)).toEqual([
+    'public',
+    'pending',
+    'private',
+  ]);
+  expect(visibleSubjects(rows, ['OFFLINE']).map((row) => row.id)).toEqual(['offline']);
+  expect(visibleSubjects(rows, ['ARCHIVED'])).toEqual([]);
+  expect(subjectCounts(rows)).toEqual({ ONLINE: 3, OFFLINE: 1, ARCHIVED: 0 });
+});
+it('partitions online, offline and archived without duplicating archived or unconfirmed rows', () => {
   const subjects = [
     { id: '1', handle: 'Z', providerStatus: 'OFFLINE' },
     { id: '2', handle: 'A', providerStatus: 'UNKNOWN' },
@@ -36,7 +88,7 @@ it('partitions online, offline and archived without duplicates and counts the sa
     { id: '6', handle: 'Archived live', providerStatus: 'PUBLIC', archived: true },
     { id: '7', handle: 'Archived offline', providerStatus: 'OFFLINE', archived: true },
   ] as Subject[];
-  expect(subjectCounts(subjects)).toEqual({ ONLINE: 3, OFFLINE: 2, ARCHIVED: 2 });
+  expect(subjectCounts(subjects)).toEqual({ ONLINE: 3, OFFLINE: 1, ARCHIVED: 2 });
   expect(visibleSubjects(subjects, ['ONLINE']).map((subject) => subject.id)).toEqual([
     '4',
     '3',
@@ -46,7 +98,7 @@ it('partitions online, offline and archived without duplicates and counts the sa
   expect(visibleSubjects(subjects, ['OFFLINE']).map((s) => s.id)).toEqual(['1', '2']);
   expect(visibleSubjects(subjects, ['ARCHIVED']).map((s) => s.id)).toEqual(['6', '7']);
 });
-it('orders offline subjects by existing recording first, then online history and deterministic ties', () => {
+it('orders known offline before initially unknown, with media, online history and stable ties in each', () => {
   const subjects = [
     { id: '8', handle: 'Z', providerStatus: 'OFFLINE' },
     { id: '7', handle: 'A', providerStatus: 'UNKNOWN', lastRecordedAtMs: 3000 },
@@ -75,7 +127,7 @@ it('orders offline subjects by existing recording first, then online history and
       observedAtMs: 99999,
     },
   ] as Subject[];
-  const expected = ['7', '5', '6', '4', '3', '2', '8', '1'];
+  const expected = ['5', '6', '4', '3', '2', '8', '7', '1'];
   expect(visibleSubjects(subjects, ['OFFLINE']).map((s) => s.id)).toEqual(expected);
   expect(visibleSubjects([...subjects].reverse(), ['OFFLINE']).map((s) => s.id)).toEqual(expected);
 });

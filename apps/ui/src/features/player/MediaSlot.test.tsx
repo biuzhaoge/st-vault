@@ -43,9 +43,14 @@ vi.mock('react', async (importOriginal) => {
     },
   };
 });
+interface EngineFailure {
+  fatal: boolean;
+  type?: string;
+  response?: { code: number };
+}
 const engine = vi.hoisted(() => ({
   supported: true,
-  failures: [] as ((event: string, data: { fatal: boolean; type?: string }) => void)[],
+  failures: [] as ((event: string, data: EngineFailure) => void)[],
   startLoad: vi.fn(),
   stopLoad: vi.fn(),
   recoverMediaError: vi.fn(),
@@ -72,10 +77,7 @@ vi.mock('./player-engine', () => ({
         startLoad = engine.startLoad;
         stopLoad = engine.stopLoad;
         recoverMediaError = engine.recoverMediaError;
-        on(
-          _event: string,
-          callback: (event: string, data: { fatal: boolean; type?: string }) => void,
-        ): void {
+        on(_event: string, callback: (event: string, data: EngineFailure) => void): void {
           engine.failures.push(callback);
         }
         attachMedia(): void {
@@ -159,6 +161,8 @@ function setup() {
     onPlaying: vi.fn(),
     onAudio: vi.fn(),
     onError: vi.fn(),
+    onConnectionFailure: vi.fn(),
+    onStablePlayback: vi.fn(),
     onRecovered: vi.fn(),
     onPhase: vi.fn(),
   };
@@ -335,6 +339,58 @@ it('recovers fatal live network errors through HLS before showing unavailable me
   expect(props.onError).not.toHaveBeenCalled();
   await vi.advanceTimersByTimeAsync(600);
   expect(engine.startLoad).toHaveBeenCalledWith(-1);
+});
+it('reports an exhausted HLS connection failure without treating an auth or decoder error the same', async () => {
+  const { props } = setup();
+  await Promise.resolve();
+  const fail = engine.failures[0];
+  for (const delay of [500, 1000]) {
+    fail('error', { fatal: true, type: 'networkError' });
+    await vi.advanceTimersByTimeAsync(delay);
+  }
+  expect(props.onConnectionFailure).not.toHaveBeenCalled();
+  fail('error', { fatal: true, type: 'networkError', response: { code: 403 } });
+  fail('error', { fatal: true, type: 'mediaError' });
+  await vi.advanceTimersByTimeAsync(500);
+  expect(props.onConnectionFailure).not.toHaveBeenCalled();
+  fail('error', { fatal: true, type: 'networkError', response: { code: 503 } });
+  expect(props.onConnectionFailure).toHaveBeenCalledExactlyOnceWith(
+    '播放分片请求失败，自动重连未能恢复连接。',
+  );
+});
+it('cancels pending HLS recovery after the monitor receives a definitive playback rejection', async () => {
+  const { props } = setup();
+  await Promise.resolve();
+  const fail = engine.failures[0];
+  fail('error', { fatal: true, type: 'networkError', response: { code: 503 } });
+  fail('error', { fatal: true, type: 'networkError', response: { code: 403 } });
+  await vi.advanceTimersByTimeAsync(500);
+  expect(engine.startLoad).not.toHaveBeenCalled();
+  expect(props.onConnectionFailure).not.toHaveBeenCalled();
+  expect(props.onError).toHaveBeenCalledWith('请求失败（403）');
+});
+it('preserves the existing HLS recovery for players that do not manage connection failures', async () => {
+  const { render } = setup();
+  render({ onConnectionFailure: undefined });
+  await Promise.resolve();
+  engine.failures[0]('error', { fatal: true, type: 'networkError', response: { code: 403 } });
+  await vi.advanceTimersByTimeAsync(500);
+  expect(engine.startLoad).toHaveBeenCalledExactlyOnceWith(-1);
+});
+it('reports stable playback once actual advancing video lasts at least ten seconds', async () => {
+  const { video, props } = setup();
+  await Promise.resolve();
+  video.fire('loadedmetadata');
+  video.fire('timeupdate');
+  video.currentTime = 9.9;
+  video.fire('timeupdate');
+  expect(props.onStablePlayback).not.toHaveBeenCalled();
+  video.currentTime = 10;
+  video.fire('timeupdate');
+  expect(props.onStablePlayback).toHaveBeenCalledOnce();
+  video.currentTime = 12;
+  video.fire('timeupdate');
+  expect(props.onStablePlayback).toHaveBeenCalledOnce();
 });
 it('recovers one decoder failure and reports a repeated unrecovered failure', async () => {
   const { props } = setup();

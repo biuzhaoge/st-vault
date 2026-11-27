@@ -96,7 +96,23 @@ Set a six-digit PIN on first visit. If the startup screen reports a connection f
 
 The workbench uses a landscape layout. The browser viewport must be at least 744 × 600 CSS pixels and no wider than 21:9. Phones, portrait tablets, and undersized split windows show a display-size prompt. On touchscreens, swipe vertically to scroll the broadcaster list or page through screenshots, and drag horizontally on a timeline to select a range.
 
+You can combine the Online, Offline, and Archived filters. Groups appear in that order. Online entries show public rooms before private rooms, then order each by the latest time they came online. Offline and archived entries prioritize the most recent recordings. When current status needs confirmation, the last confirmed status preserves the row's grouping and the cover shows the uncertainty. Online previews fit the full image into the card at its original aspect ratio. Offline and archived covers fill their cards.
+
+Public live rooms refresh their covers from broadcast snapshots. The current image remains visible when a snapshot is temporarily unavailable. Confirmed offline or private rooms return to the default cover.
+
+The desktop history panel shows around 20 events. A scheduled sync failure appears inline. Three consecutive failed rounds raise a toolbar alert, which clears after the next successful sync.
+
+Select **Monitor wall** in the list toolbar to see online broadcasters together. The grid uses the space below the main header. Live tiles are muted and keep the username visible in the upper-left corner. Private rooms show their cover and status. The grid follows the online list order, adding and removing tiles and adjusting rows and columns as the list changes. Connection failures retry automatically up to three times. The floating **Back to workspace** button restores the previous playing position.
+
+New and returning broadcasters appear immediately after a following-list sync. If a followed broadcaster is missing from both lists, the app checks their account and follow status with the signed-in account in the same sync. Broadcasters confirmed as followed stay if the site reports no explicit restriction. Confirmed unfollows, regional restrictions, or disabled or deleted accounts can be archived in that sync. The named broadcaster's room page provides the disabled-account notice. Failed or inconclusive checks preserve the existing state, and **Status → Following sync** shows how many checks remain unresolved. Disconnecting an account manually still archives its followed broadcasters.
+
+Archived covers distinguish disabled accounts, deleted accounts, regional restrictions, and unfollows. The shared synchronization clock checks reasons in batches. A disabled broadcaster with no recordings is unfollowed automatically, and local cleanup begins after the site confirms it. Archived broadcasters return to the online or offline list when the site confirms they are still followed and their profiles are available. Inconclusive checks preserve the previous grouping.
+
+When the connected account confirms an unfollow, entries with recordings remain archived and available for playback. Once no recordings remain and related reclamation finishes, the app automatically clears the broadcaster's profile, status history, and leftover screenshot index records. Following the broadcaster again on the source site adds them back during sync.
+
 The Status panel uses color to distinguish healthy, running, warning, and error states. Hover over or focus a row's info icon to learn what the task does, when it runs, and which settings apply. The full storage bar represents total capacity. The filled section shows used space, and the unfilled section and text show free space. Affected rows offer **Retry** when the app can recheck or resume the work. Replace expired cookies in Account. Address read-only or full disks before retrying storage.
+
+Under **Settings → SOCKS5 proxy**, enter `socks5://host:port` and any required credentials. Saving applies the proxy to the server's outbound HTTP(S) requests for the follow list, status and archive checks, covers, live playback, and recording. Active streams recheck availability when the route changes. A proxy outage surfaces a request error and uses the existing retry behavior. Use an address reachable from the container. Docker Desktop can reach a proxy on the host through `host.docker.internal`. Proxy settings are stored separately in the local encrypted configuration.
 
 ## Connect an account
 

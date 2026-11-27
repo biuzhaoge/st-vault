@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode, type RefObject } from 'react';
 import { useTranslation } from 'react-i18next';
 import { setTimeZone } from './shared/lib/time';
 import { Icon } from './design/Icon';
@@ -10,6 +10,7 @@ import { GlobalRecordingSettings } from './features/directory/RecordingMode';
 import { subjectCounts, subjectGroup, visibleSubjects } from './features/directory/subjects';
 import { HistoryPanel } from './features/history/HistoryPanel';
 import { KeyTools } from './features/keys/KeyTools';
+import { MonitorWall } from './features/monitor/MonitorWall';
 import { RoutingOptions } from './features/network/RoutingOptions';
 import { FocusTimeline } from './features/player/FocusTimeline';
 import { Player } from './features/player/Player';
@@ -20,6 +21,7 @@ import { systemHealthStatus } from './features/status/display';
 import { TrackBoard } from './features/timeline/TrackBoard';
 import { tr } from './shared/lib/i18n';
 import { coverImages, snapshotImages } from './shared/lib/image-loader';
+import type { WorkspaceState } from './shared/lib/workspace-state';
 import { BrandName } from './shared/ui/BrandName';
 import { PanelFeedback } from './shared/ui/PanelContent';
 import { ProgressRing } from './shared/ui/ProgressRing';
@@ -33,11 +35,35 @@ import { useWorkbenchView } from './app/use-workbench-view';
 import { useWorkbenchData } from './app/use-workbench-data';
 import { useWorkbenchPlayback } from './app/use-workbench-playback';
 
+function WorkbenchSurface({
+  alternate,
+  workspace,
+  children,
+}: {
+  alternate?: ReactNode;
+  workspace: RefObject<HTMLDivElement>;
+  children: ReactNode;
+}): ReactNode {
+  return (
+    alternate ?? (
+      <div className="studio-workspace" id="top" ref={workspace}>
+        {children}
+      </div>
+    )
+  );
+}
+
 export default function App(): JSX.Element {
   useTranslation();
   const { session, setSession, sessionError, retrySession, logoutState, revokeSession } =
     useSession();
   const [tool, setTool] = useState<Tool | null>(null);
+  const [monitorOpen, setMonitorOpen] = useState(false);
+  const [monitorReturnRequested, setMonitorReturnRequested] = useState(false);
+  const savedWorkbenchPlayback = useRef<WorkspaceState['playback']>(null);
+  const currentListPosition = useRef<WorkspaceState['list']>(null);
+  const [returnPosition, setReturnPosition] = useState<WorkspaceState['list']>(null);
+  const returnFocus = useRef(false);
   const [revealSubject, setRevealSubject] = useState<{ id: string; token: number } | null>(null);
   const workspace = useRef<HTMLDivElement>(null),
     viewer = useRef<HTMLElement>(null);
@@ -64,17 +90,51 @@ export default function App(): JSX.Element {
     [subjects, calendar.directoryFilters],
   );
   useEffect(() => {
+    if (monitorOpen) return;
     const saved = calendar.takeSavedPlayback(data.subjectsLoaded);
     const subject = subjects.find((row) => row.id === saved?.subjectId);
     if (saved && subject) media.restore(subject, saved);
-  }, [storageKey, calendar.preferencesReady, data.subjectsLoaded, subjects]);
-  calendar.rememberPlayback(media.position);
+  }, [storageKey, calendar.preferencesReady, data.subjectsLoaded, subjects, monitorOpen]);
+  calendar.rememberPlayback(monitorOpen ? savedWorkbenchPlayback.current : media.position);
+  useEffect(() => {
+    if (monitorOpen || !returnFocus.current) return;
+    returnFocus.current = false;
+    workspace.current?.querySelector<HTMLButtonElement>('.monitor-wall-trigger')?.focus();
+  }, [monitorOpen]);
+
+  function openMonitor(): void {
+    const position = media.position;
+    savedWorkbenchPlayback.current =
+      position?.kind === 'archive' && position.atMs === null ? null : position;
+    setReturnPosition(currentListPosition.current);
+    setTool(null);
+    media.closePlayer();
+    setMonitorOpen(true);
+  }
+  function closeMonitor(released: Promise<void>): void {
+    media.trackMonitorRelease(released);
+    const saved = savedWorkbenchPlayback.current;
+    savedWorkbenchPlayback.current = null;
+    returnFocus.current = true;
+    setTool(null);
+    setMonitorReturnRequested(false);
+    setMonitorOpen(false);
+    const subject = subjects.find(({ id }) => id === saved?.subjectId);
+    if (saved && subject) media.restore(subject, saved);
+  }
+
   function handleUnauthorized(): void {
     coverImages.clear();
     snapshotImages.clear();
     calendar.clear();
     data.clearSubjects();
     media.closePlayer();
+    savedWorkbenchPlayback.current = null;
+    currentListPosition.current = null;
+    returnFocus.current = false;
+    setMonitorReturnRequested(false);
+    setMonitorOpen(false);
+    setReturnPosition(null);
     setSession({ authenticated: false, setupRequired: false });
   }
   useEffect(() => {
@@ -168,6 +228,7 @@ export default function App(): JSX.Element {
               onReveal={(id) => {
                 const subject = subjects.find((row) => row.id === id);
                 if (!subject) return;
+                if (monitorOpen) setMonitorReturnRequested(true);
                 calendar.includeDirectoryFilter(subjectGroup(subject));
                 setRevealSubject((previous) => ({ id, token: (previous?.token ?? 0) + 1 }));
                 setTool(null);
@@ -210,7 +271,19 @@ export default function App(): JSX.Element {
           }
         />
       </header>
-      <div className="studio-workspace" id="top" ref={workspace}>
+      <WorkbenchSurface
+        workspace={workspace}
+        alternate={
+          monitorOpen ? (
+            <MonitorWall
+              subjects={subjects}
+              onClose={closeMonitor}
+              onUnauthorized={handleUnauthorized}
+              returnRequested={monitorReturnRequested}
+            />
+          ) : null
+        }
+      >
         <aside className="studio-viewer" ref={viewer}>
           <Player
             siteOrigin={system?.siteRoutes?.selectedOrigin}
@@ -322,8 +395,11 @@ export default function App(): JSX.Element {
         <section className="aligned-arrangement">
           <TrackBoard
             key={storageKey}
-            restorePosition={calendar.restorePosition}
-            onPosition={calendar.rememberList}
+            restorePosition={returnPosition ?? calendar.restorePosition}
+            onPosition={(position) => {
+              currentListPosition.current = position;
+              calendar.rememberList(position);
+            }}
             reveal={revealSubject}
             subjects={filtered}
             filterKey={calendar.directoryFilters.join(',')}
@@ -357,6 +433,8 @@ export default function App(): JSX.Element {
             onViewChange={calendar.resize}
             onMove={calendar.move}
             onRecordingChange={(subject, record) => data.setRecording(subject.id, record)}
+            onUnfollow={data.unfollow}
+            onOpenMonitor={openMonitor}
           />
           {data.error && (
             <p className="form-error" role="status">
@@ -371,7 +449,7 @@ export default function App(): JSX.Element {
           name={selected?.handle ?? ''}
           onClose={media.closePlayer}
         />
-      </div>
+      </WorkbenchSurface>
     </main>
   );
   return content;

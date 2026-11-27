@@ -1,8 +1,7 @@
 import path from 'node:path';
 import type { ArchivePort } from '../ports.js';
 import type { SyncClock } from '../runtime/sync-clock.js';
-import { createHttp, ProviderError } from '../provider/http.js';
-import { SiteRoutes } from '../provider/site-routes.js';
+import { createHttp } from '../provider/http.js';
 import { coverSource } from '../provider/cover-source.js';
 import { PreviewDiskCache } from './disk-cache.js';
 import { LibraryImages } from '../library/images.js';
@@ -15,10 +14,9 @@ export function createSubjectAvatars(options: {
   root: string;
   mediaRoot?: string;
   archive: Pick<ArchivePort, 'getSetting' | 'setSetting' | 'listSubjects'> &
-    Partial<Pick<ArchivePort, 'withBackgroundReads'>>;
+    Partial<Pick<ArchivePort, 'getSubject' | 'withBackgroundReads'>>;
   clock?: SyncClock;
   fetch?: typeof fetch;
-  sites?: SiteRoutes;
   concurrency?: number;
   publishConcurrency?: number;
 }) {
@@ -28,15 +26,21 @@ export function createSubjectAvatars(options: {
     (options.concurrency ?? 2) > 64
   )
     throw Error('INVALID_AVATAR_CONCURRENCY');
-  const sites =
-    options.sites ??
-    new SiteRoutes({ origins: ['https://stripchat.com'], fetch: options.fetch, timeoutMs: 5000 });
   const disk = options.mediaRoot
     ? new LibraryImages(options.mediaRoot, 'avatar', options.publishConcurrency)
     : new PreviewDiskCache(path.join(options.root, 'avatars'), 64 * 1024 ** 2, 2048);
   const pending = new Set<string>();
   const roster = new Set<string>();
-  const failures = new Map<string, { attempts: number; retryAt: number; missing: boolean }>();
+  const failures = new Map<
+    string,
+    {
+      source: string | null;
+      attempts: number;
+      consecutiveFailures: number;
+      retryAt: number;
+      missing: boolean;
+    }
+  >();
   const diagnostics = new DerivativeDiagnostics();
   const controller = new AbortController();
   const readImage = createPreviewImageReader(
@@ -49,7 +53,7 @@ export function createSubjectAvatars(options: {
   let work: Promise<void> | undefined;
   let lastRunAtMs: number | null = null,
     lastSuccessAtMs: number | null = null,
-    failed = false;
+    runFailures = 0;
   const refresh = (manual = true): Promise<void> => {
     if (work) return work;
     if (controller.signal.aborted) return Promise.resolve();
@@ -64,41 +68,22 @@ export function createSubjectAvatars(options: {
     if (!ids.length) return Promise.resolve();
     const process = async (ids: string[]) => {
       lastRunAtMs = Date.now();
-      const subjects = new Map(
-        (await options.archive.listSubjects({ activity: false })).map((row) => [row.id, row]),
+      const subjects = new Set(
+        (await options.archive.listSubjects({ activity: false })).map((row) => row.id),
       );
-      failed = false;
       let index = 0;
       const worker = async () => {
         while (!controller.signal.aborted) {
           const id = ids[index++];
           if (!id) return;
           pending.delete(id);
-          const row = subjects.get(id);
-          if (!row) {
+          if (!subjects.has(id)) {
             failures.delete(id);
             continue;
           }
           let source: string | null = null;
           try {
             source = coverSource(await options.archive.getSetting(`preview.avatar-source.${id}`));
-            if (!source) {
-              const user = await sites.read(
-                `/api/front/v2/models/${row.providerId}/cam`,
-                (text) => {
-                  const value = JSON.parse(text) as {
-                    user?: { user?: { id?: number; avatarUrl?: unknown } };
-                  };
-                  const user = value?.user?.user;
-                  if (!user) throw new ProviderError('upstream-item-unavailable');
-                  if (user.id !== row.providerId)
-                    throw new ProviderError('upstream-identity-mismatch');
-                  return user;
-                },
-                controller.signal,
-              );
-              source = coverSource(user.avatarUrl);
-            }
             if (!source) {
               failures.delete(id);
               continue;
@@ -115,19 +100,40 @@ export function createSubjectAvatars(options: {
               continue;
             }
             const bytes = await readImage(source, controller.signal);
-            if (!(previous && Buffer.from(previous).equals(bytes)) && !(await disk.put(key, bytes)))
-              throw Error('AVATAR_CACHE_WRITE_FAILED');
+            const getSubject = options.archive.getSubject;
+            const canPublish = getSubject
+              ? async () => Boolean(await getSubject(id, { activity: false }))
+              : undefined;
+            if (!previous || !Buffer.from(previous).equals(bytes)) {
+              const written =
+                disk instanceof LibraryImages
+                  ? await disk.put(key, bytes, canPublish)
+                  : await disk.put(key, bytes);
+              if (!written) {
+                if (canPublish && !(await canPublish())) {
+                  failures.delete(id);
+                  continue;
+                }
+                throw Error('AVATAR_CACHE_WRITE_FAILED');
+              }
+            }
             await options.archive.setSetting(versionKey, source);
             failures.delete(id);
           } catch (error) {
             if (!controller.signal.aborted) {
-              const attempts = Math.min(7, (failures.get(id)?.attempts ?? 0) + 1);
+              const previous = failures.get(id);
+              const attempts = Math.min(7, (previous?.attempts ?? 0) + 1);
+              const previousFailures =
+                previous?.source === source ? previous.consecutiveFailures : 0;
+              const missing = missingImageResponse(error);
               failures.set(id, {
+                source,
                 attempts,
+                consecutiveFailures: missing ? 0 : Math.min(previousFailures + 1, 7),
                 retryAt: Date.now() + Math.min(300000, 5000 * 2 ** (attempts - 1)),
-                missing: missingImageResponse(error),
+                missing,
               });
-              if (!missingImageResponse(error))
+              if (!missing)
                 diagnostics.record(
                   'avatar_refresh_failed',
                   error,
@@ -139,7 +145,6 @@ export function createSubjectAvatars(options: {
         }
       };
       await Promise.all(Array.from({ length: options.concurrency ?? 2 }, () => worker()));
-      if (!hasFailed() && !controller.signal.aborted) lastSuccessAtMs = Date.now();
     };
     const run = async () => {
       while (ids.length && !controller.signal.aborted) {
@@ -157,8 +162,13 @@ export function createSubjectAvatars(options: {
       }
     };
     work = (options.archive.withBackgroundReads?.(run) ?? run())
+      .then(() => {
+        if (controller.signal.aborted) return;
+        runFailures = 0;
+        if (!issues().length) lastSuccessAtMs = Date.now();
+      })
       .catch((error: unknown) => {
-        if (!controller.signal.aborted) failed = true;
+        if (!controller.signal.aborted) runFailures++;
         throw error;
       })
       .finally(() => {
@@ -167,29 +177,33 @@ export function createSubjectAvatars(options: {
     return work;
   };
   const issues = () => [...failures.values()].filter((failure) => !failure.missing);
-  const hasFailed = () => failed || issues().length > 0;
   const stop = options.clock?.subscribe('subject-avatars', () => refresh(false));
   return {
     status: (): BackgroundTask => {
       const outstanding = issues();
+      const failed = outstanding.length + Number(runFailures > 0);
       return {
         id: 'avatar-sync',
         group: 'sync',
         state: work
           ? 'running'
-          : failed || outstanding.length
+          : failed
             ? 'retrying'
             : roster.size || pending.size
               ? 'waiting'
               : 'idle',
         pending: new Set([...roster, ...pending, ...failures.keys()]).size,
-        failed: outstanding.length + Number(failed),
+        failed,
+        consecutiveFailures: Math.max(
+          runFailures,
+          ...outstanding.map((issue) => issue.consecutiveFailures),
+        ),
         lastRunAtMs,
         lastSuccessAtMs,
         nextRunAtMs: outstanding.length
           ? Math.min(...outstanding.map((item) => item.retryAt))
           : null,
-        error: failed || outstanding.length ? 'avatar_refresh_partial' : null,
+        error: failed ? 'avatar_refresh_partial' : null,
       };
     },
     read: async (id: string): Promise<Uint8Array | null> => {
@@ -211,7 +225,6 @@ export function createSubjectAvatars(options: {
     close: async () => {
       stop?.();
       controller.abort();
-      if (!options.sites) sites.close();
       try {
         await work;
       } finally {

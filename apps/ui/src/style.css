@@ -383,19 +383,19 @@ strong {
 }
 .subject-filters {
   display: flex;
-  flex: 0 0 228px;
+  flex: 0 0 208px;
   min-width: 0;
 }
 .subject-filters button {
-  flex: 1 1 0;
   display: flex;
+  flex: 1 1 0;
   align-items: center;
   justify-content: center;
   gap: 2px;
   min-width: 0;
   min-height: 0;
-  padding: 2px 3px;
   border: 0;
+  padding: 2px 3px;
   background: transparent;
   font-size: 11px;
   color: var(--muted);
@@ -419,13 +419,31 @@ strong {
   gap: 6px;
   min-width: 0;
   height: calc(var(--navigation-height) + 5px);
-  padding: 3px 5px 2px;
+  padding: 3px 5px 2px 12px;
 }
 .time-control-row {
   display: flex;
   flex: 1 1 auto;
   align-items: center;
   min-width: 0;
+}
+.monitor-wall-trigger {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  inline-size: 96px;
+  min-height: 0;
+  border: 0;
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.monitor-wall-trigger .ui-icon {
+  flex: none;
+  width: 16px;
+  height: 16px;
 }
 .day-step {
   display: grid;
@@ -695,6 +713,7 @@ strong {
   white-space: nowrap;
 }
 .track-cover-cell {
+  position: relative;
   min-width: 0;
   padding: var(--subject-cell-inset);
   padding-inline-start: 0;
@@ -711,6 +730,22 @@ strong {
   border: 0;
   border-radius: 0;
   background: transparent;
+}
+.subject-preview-status {
+  position: absolute;
+  inset-block-start: 3px;
+  inset-inline-start: 3px;
+  z-index: 1;
+  max-inline-size: calc(100% - 6px);
+  padding: 2px 5px;
+  border-radius: var(--radius-small);
+  background: color-mix(in srgb, var(--page) 88%, transparent);
+  color: var(--ink);
+  font-size: 10px;
+  line-height: 1.2;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .subject-name {
   position: absolute;
@@ -738,7 +773,8 @@ strong {
 .status-cell-offline {
   background: #2c2c2c;
 }
-.status-cell-unknown {
+.status-cell-unknown,
+.status-cell-archived {
   background: var(--page);
 }
 .recording-mode {
@@ -748,7 +784,8 @@ strong {
   width: 36px;
   min-width: 0;
 }
-.recording-toggle {
+.recording-toggle,
+.panel-switch {
   position: relative;
   width: 36px;
   height: 24px;
@@ -761,7 +798,8 @@ strong {
   cursor: pointer;
   touch-action: pan-y;
 }
-.recording-toggle i {
+.recording-toggle i,
+.panel-switch i {
   position: absolute;
   left: 3px;
   top: 4px;
@@ -774,13 +812,16 @@ strong {
   transition: transform 0.15s ease-out;
   pointer-events: none;
 }
-.recording-toggle.is-recording {
+.recording-toggle.is-recording,
+.panel-switch[aria-checked='true'] {
   background: var(--accent);
 }
-.recording-toggle.is-recording i {
+.recording-toggle.is-recording i,
+.panel-switch[aria-checked='true'] i {
   transform: translateX(14px);
 }
-.recording-toggle:disabled {
+.recording-toggle:disabled,
+.panel-switch:disabled {
   opacity: 0.5;
   cursor: wait;
 }
@@ -816,7 +857,7 @@ strong {
   height: 100%;
   object-fit: contain;
 }
-.track-label.status-cell-offline .track-cover {
+.track-label:not(.status-cell-public, .status-cell-private) .track-cover-cell .track-cover {
   object-fit: cover;
 }
 .cover-placeholder {
@@ -1070,21 +1111,6 @@ strong {
 }
 .event-offline .event-description {
   color: var(--subtle);
-}
-.history-day {
-  height: 26px;
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  color: var(--subtle);
-  font-size: 10px;
-}
-.history-day::before,
-.history-day::after {
-  content: '';
-  height: 1px;
-  flex: 1;
-  background: var(--line);
 }
 .event-older {
   padding: 4px 0 10px;
@@ -2336,6 +2362,48 @@ button[data-liked='true'] > .snapshot-favorite-mark,
   }
 }
 .recording-number .mode-error {
+  top: 0;
+  inset-inline-end: 2px;
+}
+.directory-row-index:has(> .directory-unfollow) {
+  grid-template-rows: 36px 30px;
+  align-content: center;
+}
+.directory-row-index:has(> .directory-unfollow) .record-button {
+  block-size: 36px;
+}
+.directory-unfollow {
+  position: relative;
+  inline-size: 100%;
+}
+.directory-unfollow-button {
+  display: grid;
+  place-items: center;
+  inline-size: 100%;
+  block-size: 30px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  touch-action: pan-y pinch-zoom;
+}
+.directory-unfollow-button .ui-icon {
+  width: 14px;
+  height: 14px;
+}
+.directory-unfollow-button:enabled:is(:hover, :focus-visible, :active) {
+  background: var(--segment-hover-fill);
+  color: var(--accent-hover);
+}
+.directory-unfollow-button:focus-visible {
+  outline-offset: -3px;
+}
+.directory-unfollow-button[aria-busy='true'] {
+  cursor: wait;
+  color: var(--ink);
+  opacity: 1;
+}
+.directory-unfollow .mode-error {
   top: 0;
   inset-inline-end: 2px;
 }

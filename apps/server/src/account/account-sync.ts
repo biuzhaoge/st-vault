@@ -1,19 +1,30 @@
 import { accountSiteOrigin } from '../provider/site-routes.js';
 import { createHash } from 'node:crypto';
 import { runBackground } from '../runtime/background.js';
+import { redactLog } from '../runtime/runtime-logs.js';
 import { z } from 'zod';
 import { accountSyncConfigSchema } from '@st-vault/api-schema';
 import type { AccountSyncConfig, AccountSyncResult, AccountSyncStatus } from '@st-vault/api-schema';
-import type { AccountSyncPort, ProviderPort, SupervisorPort } from '../ports.js';
+import type {
+  AccountSyncPort,
+  ArchivePort,
+  ProviderPort,
+  SubjectInput,
+  SupervisorPort,
+  UnfollowedSubjectResult,
+} from '../ports.js';
 import type { KeyVault } from '../http/key-vault.js';
 import { createHttp, ProviderError, waitFor } from '../provider/http.js';
 import { accountAvatarSource } from '../provider/account-profile.js';
-import type { ImportedAccount, ImportedAccountProfile } from '../provider/account-profile.js';
+import type { ImportedAccountProfile } from '../provider/account-profile.js';
 import { previewImageType } from '../previews/image-type.js';
 import type { SyncClock } from '../runtime/sync-clock.js';
 import { AccountActivation, type AccountActivationArchive } from './account-activation.js';
+import type { ArchiveReasonProbe, OpenArchiveReasonProbe } from './archive-reasons.js';
 
 const timestamp = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable();
+const archivedRecoveryBatch = 4;
+const profileRefreshIntervalMs = 5 * 60_000;
 const errorCodes = [
   'cookies_invalid',
   'cookies_domain_mismatch',
@@ -54,6 +65,10 @@ type FailureCode =
   | 'account_sync_disconnected'
   | 'account_sync_busy'
   | 'account_sync_cancelled'
+  | 'account_unfollow_subject_missing'
+  | 'account_unfollow_protected'
+  | 'account_unfollow_account_changed'
+  | 'account_unfollow_failed'
   | 'account_origin_locked';
 export class AccountSyncError extends Error {
   constructor(
@@ -63,10 +78,16 @@ export class AccountSyncError extends Error {
     super(code, cause === undefined ? undefined : { cause });
   }
 }
+export function accountUnfollowBinding(status: AccountSyncStatus): string | undefined {
+  if (!status.connected || !status.origin || !status.profile || status.needsReconnect) return;
+  return createHash('sha256')
+    .update(JSON.stringify([status.origin, status.profile.username.toLowerCase()]))
+    .digest('hex');
+}
 interface Job {
   generation: number;
   controller: AbortController;
-  kind: 'configure' | 'refresh' | 'disconnect' | 'recover';
+  kind: 'configure' | 'refresh' | 'disconnect' | 'recover' | 'unfollow';
   work: Promise<AccountSyncResult>;
   timedOut: boolean;
   accepted: boolean;
@@ -75,14 +96,23 @@ export interface AccountSyncOptions {
   clock: SyncClock;
   origin?: string;
   onImported?: (subjectIds: string[]) => void | Promise<void>;
-  archive: AccountActivationArchive;
-  provider: Pick<ProviderPort, 'importList'> & {
-    importAccount?: (
+  archive: AccountActivationArchive &
+    Pick<
+      ArchivePort,
+      | 'followedAccountSubjects'
+      | 'archivedAccountSubjects'
+      | 'recordVerifiedUnfollowed'
+      | 'recordVerifiedBlocked'
+      | 'recordManualUnfollow'
+      | 'addIndexedAccountSubjects'
+    >;
+  provider: Pick<ProviderPort, 'importList' | 'importAccount' | 'unfollowAccountSubject'> & {
+    openArchiveReasonProbe?: (
       cookiesText: string,
-      signal?: AbortSignal,
-      onValidated?: () => void,
-      origin?: string,
-    ) => Promise<ImportedAccount>;
+      origin: string,
+      username: string | undefined,
+      signal: AbortSignal,
+    ) => Promise<ArchiveReasonProbe>;
   };
   supervisor: Pick<SupervisorPort, 'reconcile'>;
   vault: Pick<KeyVault, 'readSealedSecret' | 'writeSealedSecret'>;
@@ -90,9 +120,12 @@ export interface AccountSyncOptions {
   timeoutMs?: number;
   startupDelayMs?: number;
   fetch?: typeof globalThis.fetch;
+  transportSignal?: () => AbortSignal;
 }
 export interface AccountSyncService extends AccountSyncPort {
   avatar(signal?: AbortSignal): Promise<Uint8Array>;
+  unfollow(id: string, binding: string, signal?: AbortSignal): Promise<void>;
+  openArchiveReasonProbe: OpenArchiveReasonProbe;
 }
 function failure(error: unknown): (typeof errorCodes)[number] {
   if (error instanceof Error && error.message === 'ACCOUNT_ACTIVATION_LIBRARY_MISMATCH')
@@ -135,10 +168,11 @@ export async function createAccountSync(options: AccountSyncOptions): Promise<Ac
     active: Job | undefined,
     closing: Promise<void> | undefined;
   const jobs = new Set<Job>();
-  const listeners = new Set<() => void>();
-  const notify = (): void => {
-    for (const listener of listeners) listener();
+  const listeners = new Set<(topic?: 'subjects') => void>();
+  const notify = (topic?: 'subjects'): void => {
+    for (const listener of listeners) listener(topic);
   };
+  let lastProfileRefreshMs: number | null = null;
   const warming = new Set<Promise<void>>();
   let stage: AccountSyncStatus['stage'];
   const warmImages = (ids: string[]): void => {
@@ -193,6 +227,11 @@ export async function createAccountSync(options: AccountSyncOptions): Promise<Ac
     error: null,
   });
   let state = empty();
+  let consecutiveFailures = 0;
+  let pendingMissingCount = 0;
+  let favoritesIndexCount: number | undefined;
+  let pendingProfileCount = 0;
+  let archivedRecoveryCursor = 0;
   const adopt = (value: Stored): void => {
     state = {
       needsReconnect: value.needsReconnect,
@@ -237,6 +276,9 @@ export async function createAccountSync(options: AccountSyncOptions): Promise<Ac
     ...state,
     ...(stage ? { stage } : {}),
     ...(warming.size ? { warmingCovers: true } : {}),
+    ...(pendingMissingCount ? { pendingMissingCount } : {}),
+    ...(favoritesIndexCount === undefined ? {} : { favoritesIndexCount }),
+    ...(pendingProfileCount ? { pendingProfileCount } : {}),
     profile: connection.active?.profile
       ? {
           username: connection.active.profile.username,
@@ -252,6 +294,7 @@ export async function createAccountSync(options: AccountSyncOptions): Promise<Ac
     connected: connection.active !== null,
     running: jobs.size > 0,
     nextAttemptMs,
+    consecutiveFailures,
   });
   const clearSchedule = (): void => {
     nextAttemptMs = null;
@@ -313,7 +356,7 @@ export async function createAccountSync(options: AccountSyncOptions): Promise<Ac
       if (connection.recovering)
         state = { ...state, error: code, needsReconnect: code === 'account_library_changed' };
       else if (kind === 'configure' && connection.active) adopt(connection.active);
-      else state = { ...state, error: code };
+      else if (kind !== 'unfollow') state = { ...state, error: code };
     };
     const job: Job = {
       kind,
@@ -356,8 +399,11 @@ export async function createAccountSync(options: AccountSyncOptions): Promise<Ac
               ? job.timedOut
                 ? 'account_sync_timeout'
                 : 'account_sync_cancelled'
-              : failure(error);
+              : error instanceof AccountSyncError && error.code === 'account_sync_cancelled'
+                ? error.code
+                : failure(error);
             if (code !== 'account_sync_cancelled') reportFailure(code);
+            else if (connection.active && !connection.recovering) adopt(connection.active);
           }
           if (error instanceof AccountSyncError) throw error;
           throw new AccountSyncError(failure(error));
@@ -369,13 +415,31 @@ export async function createAccountSync(options: AccountSyncOptions): Promise<Ac
     active = job;
     // Keep ownership until actual work settles, even when a caller/deadline
     // has already stopped waiting for an importer which ignores cancellation.
-    job.work = work.finally(() => {
-      jobs.delete(job);
-      if (active === job) active = undefined;
-      if (job.generation === generation) stage = undefined;
-      notify();
-      if (job.generation === generation || !jobs.size) schedule();
-    });
+    job.work = work
+      .then(
+        (result) => {
+          if ((job.generation === generation || job.accepted) && kind !== 'unfollow')
+            consecutiveFailures = 0;
+          return result;
+        },
+        (error: unknown) => {
+          if (
+            !closed &&
+            job.generation === generation &&
+            (kind === 'refresh' || kind === 'recover') &&
+            !(error instanceof AccountSyncError && error.code === 'account_sync_cancelled')
+          )
+            consecutiveFailures++;
+          throw error;
+        },
+      )
+      .finally(() => {
+        jobs.delete(job);
+        if (active === job) active = undefined;
+        if (job.generation === generation) stage = undefined;
+        notify();
+        if (job.generation === generation || !jobs.size) schedule();
+      });
     tail = job.work.catch(() => undefined);
     return job;
   };
@@ -412,36 +476,121 @@ export async function createAccountSync(options: AccountSyncOptions): Promise<Ac
     cookiesText: string,
     replacing: boolean,
     origin = connection.active?.origin ?? defaultOrigin,
+    forceProfiles = true,
   ): Promise<number> => {
+    const transport = options.transportSignal?.();
+    const signal = transport
+      ? AbortSignal.any([job.controller.signal, transport])
+      : job.controller.signal;
+    const validImport = (): void => {
+      valid(job);
+      if (transport?.aborted) throw new AccountSyncError('account_sync_cancelled');
+    };
     const attempt = now();
-    const priorError = connection.active?.error;
+    const previous = connection.active;
+    const priorError = previous?.error;
+    const previousUsername = previous?.profile?.username.toLowerCase();
+    const changedOwner = (username: string): boolean =>
+      replacing && previousUsername !== undefined && previousUsername !== username.toLowerCase();
+    const verifyOwner = (username: string): void => {
+      if (!replacing && previousUsername && previousUsername !== username.toLowerCase())
+        throw new ProviderError('upstream-identity-mismatch');
+    };
+    const refreshProfiles =
+      forceProfiles ||
+      lastProfileRefreshMs === null ||
+      attempt < lastProfileRefreshMs ||
+      attempt - lastProfileRefreshMs >= profileRefreshIntervalMs;
+    let nextRecoveryCursor = archivedRecoveryCursor;
     stage = options.provider.importAccount ? 'validating' : 'syncing';
     notify();
     state = { ...state, lastAttemptMs: attempt, error: null };
     if (!replacing && connection.active)
       await persist({ ...connection.active, lastAttemptMs: attempt }, job);
-    let subjects: Awaited<ReturnType<ProviderPort['importList']>>,
+    let indexCount: number | undefined,
+      verifiedFollowingCount: number | undefined,
+      unresolvedProfileCount = 0,
+      unverifiedMissingCount = 0,
+      recoveredArchivedCount = 0,
+      subjects: SubjectInput[],
       profile: ImportedAccountProfile | null = !replacing
         ? (connection.active?.profile ?? null)
         : null;
     try {
+      validImport();
       if (options.provider.importAccount) {
         const result = await options.provider.importAccount(
           cookiesText,
-          job.controller.signal,
+          signal,
           () => {
-            valid(job);
+            validImport();
             stage = 'syncing';
             notify();
           },
           origin,
+          async (username) => {
+            validImport();
+            if (changedOwner(username)) return [];
+            return await options.archive.followedAccountSubjects(true);
+          },
+          async (username, indexedIds) => {
+            validImport();
+            const readIndexed = () =>
+              indexedIds?.length
+                ? options.archive.archivedAccountSubjects(0, archivedRecoveryBatch, indexedIds)
+                : [];
+            if (changedOwner(username)) return await readIndexed();
+            const readCandidates = (cursor: number) =>
+              options.archive.archivedAccountSubjects(cursor, archivedRecoveryBatch);
+            const [page, indexed] = await Promise.all([
+              readCandidates(archivedRecoveryCursor),
+              readIndexed(),
+            ]);
+            const candidates =
+              page.length || !archivedRecoveryCursor ? page : await readCandidates(0);
+            nextRecoveryCursor =
+              candidates.length === archivedRecoveryBatch
+                ? (candidates.at(-1)?.providerId ?? 0)
+                : 0;
+            const roster = new Map(candidates.map((row) => [row.providerId, row]));
+            for (const row of indexed) roster.set(row.providerId, row);
+            return [...roster.values()];
+          },
+          {
+            refreshProfiles,
+            onIndexed: replacing
+              ? undefined
+              : async ({ profile, indexedIds }) => {
+                  validImport();
+                  verifyOwner(storedProfileSchema.parse(profile).username);
+                  const { addIndexedAccountSubjects } = options.archive;
+                  if (!previousUsername || !addIndexedAccountSubjects || !indexedIds.length) return;
+                  const activation = await options.archive.accountActivation();
+                  validImport();
+                  if (!activation) return;
+                  const added = await addIndexedAccountSubjects.call(
+                    options.archive,
+                    indexedIds,
+                    activation,
+                    signal,
+                  );
+                  if (added) notify('subjects');
+                  validImport();
+                },
+          },
         );
         subjects = result.subjects;
+        indexCount = result.indexCount;
+        verifiedFollowingCount = result.verifiedFollowingCount;
+        unresolvedProfileCount = result.unresolvedProfileCount ?? 0;
+        unverifiedMissingCount = result.unverifiedMissingCount ?? 0;
+        recoveredArchivedCount = result.recoveredArchivedCount ?? 0;
         profile = storedProfileSchema.parse(result.profile);
+        verifyOwner(profile.username);
         profile.avatarSourceUrl = accountAvatarSource(profile.avatarSourceUrl);
-      } else subjects = await options.provider.importList(cookiesText, job.controller.signal);
+      } else subjects = await options.provider.importList(cookiesText, signal);
     } catch (error) {
-      valid(job);
+      validImport();
       const code = failure(error);
       console.warn(
         JSON.stringify({ event: 'account_sync_failed', origin, code, operation: job.kind }),
@@ -466,12 +615,13 @@ export async function createAccountSync(options: AccountSyncOptions): Promise<Ac
         );
       throw new AccountSyncError(code);
     }
-    valid(job);
-    // Only a complete successful import reconciles membership; recordings and local policies survive.
+    validImport();
     stage = 'saving';
     notify();
+    const imported = verifiedFollowingCount ?? subjects.length - unverifiedMissingCount;
+    let activatedGeneration: string;
     try {
-      await connection.activate(
+      activatedGeneration = await connection.activate(
         subjects,
         {
           version: 1,
@@ -479,29 +629,70 @@ export async function createAccountSync(options: AccountSyncOptions): Promise<Ac
           cookiesText,
           lastAttemptMs: attempt,
           lastSuccessMs: now(),
-          lastImportedCount: subjects.length,
+          lastImportedCount: imported,
           error: null,
           needsReconnect: false,
           profile,
         },
-        () => valid(job),
+        validImport,
         () => {
           job.accepted = true;
+        },
+        {
+          resetUnfollows:
+            replacing && (!previousUsername || !profile || changedOwner(profile.username)),
         },
       );
     } catch (error) {
       if (error instanceof AccountSyncError) throw error;
       throw new AccountSyncError('account_sync_unavailable', error);
     }
+    if (refreshProfiles) lastProfileRefreshMs = attempt;
+    const finishUnfollow = options.archive.recordVerifiedUnfollowed;
+    if (finishUnfollow) {
+      for (const subject of subjects) {
+        if (!subject.accountUnfollowConfirmed) continue;
+        try {
+          await finishUnfollow.call(options.archive, subject.id, activatedGeneration);
+        } catch (error) {
+          // The roster is already committed. The archive heartbeat can retry the cleanup.
+          console.warn(
+            JSON.stringify({ event: 'account_unfollow_cleanup_deferred', error: redactLog(error) }),
+          );
+        }
+      }
+    }
+    archivedRecoveryCursor = profile && changedOwner(profile.username) ? 0 : nextRecoveryCursor;
+    if (
+      indexCount !== favoritesIndexCount ||
+      unresolvedProfileCount !== pendingProfileCount ||
+      unverifiedMissingCount !== pendingMissingCount ||
+      recoveredArchivedCount
+    )
+      console.info(
+        JSON.stringify({
+          event: 'account_roster_reconciled',
+          origin,
+          directoryRows: subjects.length,
+          verifiedFollowing: imported,
+          pending: unverifiedMissingCount,
+          ...(indexCount === undefined ? {} : { favoritesIndexCount: indexCount }),
+          pendingProfiles: unresolvedProfileCount,
+          ...(recoveredArchivedCount ? { recoveredArchived: recoveredArchivedCount } : {}),
+        }),
+      );
+    pendingMissingCount = unverifiedMissingCount;
+    favoritesIndexCount = indexCount;
+    pendingProfileCount = unresolvedProfileCount;
     if (priorError)
       console.info(
         JSON.stringify({ event: 'account_sync_recovered', origin, previousError: priorError }),
       );
     runBackground(options.supervisor.reconcile(), 'account_reconcile_failed');
     warmImages(subjects.map((subject) => subject.id));
-    return subjects.length;
+    return imported;
   };
-  function refresh(signal?: AbortSignal): Promise<AccountSyncResult> {
+  function refresh(signal?: AbortSignal, forceProfiles = true): Promise<AccountSyncResult> {
     try {
       available();
       if (signal?.aborted) throw new AccountSyncError('account_sync_cancelled');
@@ -512,7 +703,9 @@ export async function createAccountSync(options: AccountSyncOptions): Promise<Ac
       clearSchedule();
       const current = connection.active;
       return wait(
-        launch('refresh', generation, (job) => synchronize(job, current.cookiesText, false)),
+        launch('refresh', generation, (job) =>
+          synchronize(job, current.cookiesText, false, current.origin, forceProfiles),
+        ),
         signal,
       );
     } catch (error) {
@@ -520,6 +713,143 @@ export async function createAccountSync(options: AccountSyncOptions): Promise<Ac
         error instanceof Error ? error : new AccountSyncError('list_import_failed'),
       );
     }
+  }
+  async function unfollow(id: string, binding: string, signal?: AbortSignal): Promise<void> {
+    available();
+    if (signal?.aborted) throw new AccountSyncError('account_sync_cancelled');
+    const saved = connection.active;
+    if (!saved?.profile) throw new AccountSyncError('account_sync_disconnected');
+    if (saved.needsReconnect) throw new AccountSyncError('cookies_expired');
+    if (binding !== accountUnfollowBinding(status()))
+      throw new AccountSyncError('account_unfollow_account_changed');
+    const username = saved.profile.username.toLowerCase();
+    const { recordManualUnfollow } = options.archive;
+    const { unfollowAccountSubject } = options.provider;
+    if (!recordManualUnfollow || !unfollowAccountSubject)
+      throw new AccountSyncError('account_sync_unavailable');
+
+    clearSchedule();
+    const job = launch('unfollow', generation, async (job) => {
+      const current = connection.active;
+      if (
+        !current?.origin ||
+        current.origin !== saved.origin ||
+        current.profile?.username.toLowerCase() !== username
+      )
+        throw new AccountSyncError('account_sync_cancelled');
+      const origin = current.origin;
+      if (current.needsReconnect) throw new AccountSyncError('cookies_expired');
+      const activation = await options.archive.accountActivation();
+      if (!activation) throw new AccountSyncError('account_sync_unavailable');
+      const transport = options.transportSignal?.();
+      const signal = transport
+        ? AbortSignal.any([job.controller.signal, transport])
+        : job.controller.signal;
+      try {
+        const result = await recordManualUnfollow.call(
+          options.archive,
+          id,
+          activation,
+          async () => {
+            valid(job);
+            if (signal.aborted) throw new AccountSyncError('account_sync_cancelled');
+            await unfollowAccountSubject.call(
+              options.provider,
+              current.cookiesText,
+              origin,
+              username,
+              Number(id.slice('stripchat:'.length)),
+              signal,
+            );
+            // Once the upstream change is acknowledged, finish the local update even if the client leaves.
+            job.accepted = true;
+          },
+        );
+        if (result === 'missing') throw new AccountSyncError('account_unfollow_subject_missing');
+        if (result === 'stale') throw new AccountSyncError('account_unfollow_protected');
+      } catch (error) {
+        if (error instanceof AccountSyncError) throw error;
+        const code = failure(error);
+        throw new AccountSyncError(
+          code === 'list_import_failed' ? 'account_unfollow_failed' : code,
+          error,
+        );
+      }
+      runBackground(options.supervisor.reconcile(), 'account_reconcile_failed');
+      return null;
+    });
+    await wait(job, signal, true);
+  }
+  function withBlockedCleanup(
+    probe: ArchiveReasonProbe,
+    saved: Stored,
+    bindingSignal: AbortSignal,
+  ): ArchiveReasonProbe {
+    const { recordVerifiedBlocked } = options.archive;
+    const { unfollowBlocked } = probe;
+    if (!unfollowBlocked || !recordVerifiedBlocked || !saved.profile) return probe;
+    const username = saved.profile.username.toLowerCase();
+    const sameBinding = (current: Stored | null): boolean =>
+      current !== null &&
+      current.origin === saved.origin &&
+      current.cookiesText === saved.cookiesText &&
+      current.profile?.username.toLowerCase() === username &&
+      !current.needsReconnect;
+    const cleanupBlocked: NonNullable<ArchiveReasonProbe['cleanupBlocked']> = async (
+      id,
+      providerId,
+      signal,
+    ) => {
+      const request = AbortSignal.any([bindingSignal, signal]);
+      if (
+        closed ||
+        request.aborted ||
+        !sameBinding(connection.active) ||
+        id !== `stripchat:${providerId}`
+      )
+        return 'stale';
+      if (jobs.size >= 8) throw new ProviderError('archive-unfollow-busy');
+      let result: UnfollowedSubjectResult = 'stale';
+      clearSchedule();
+      const job = launch('unfollow', generation, async (job) => {
+        if (!sameBinding(connection.active)) return null;
+        const activation = await options.archive.accountActivation();
+        valid(job);
+        if (!activation) return null;
+        const transport = options.transportSignal?.();
+        const operation = AbortSignal.any(
+          transport
+            ? [job.controller.signal, request, transport]
+            : [job.controller.signal, request],
+        );
+        if (operation.aborted) return null;
+        try {
+          result = await recordVerifiedBlocked.call(options.archive, id, activation, async () => {
+            valid(job);
+            if (operation.aborted) throw new ProviderError('cancelled');
+            await unfollowBlocked.call(probe, providerId, operation);
+            // Publish the upstream acknowledgement even if the initiating probe is cancelled.
+            job.accepted = true;
+          });
+        } catch (error) {
+          if (error instanceof AccountSyncError) throw error;
+          throw new AccountSyncError('account_unfollow_failed', error);
+        }
+        return null;
+      });
+      try {
+        await wait(job, request, true);
+      } catch (error) {
+        if (error instanceof AccountSyncError) {
+          if (error.code === 'account_sync_cancelled') return 'stale';
+          if (error.cause instanceof ProviderError) throw error.cause;
+          if (error.code === 'account_sync_timeout') throw new ProviderError('request-deadline');
+        }
+        throw error;
+      }
+      return result;
+    };
+    return Object.assign(probe, { cleanupBlocked });
   }
   const detachClock = options.clock.subscribe('account-list', async () => {
     if (!closed && connection.recovering && !jobs.size && nextAttemptMs !== null) {
@@ -544,12 +874,20 @@ export async function createAccountSync(options: AccountSyncOptions): Promise<Ac
       nextAttemptMs !== null
     ) {
       nextAttemptMs = dueAt();
-      if (now() >= nextAttemptMs) await refresh();
+      if (now() >= nextAttemptMs) await refresh(undefined, false);
     }
   });
   schedule(true);
   return {
     status,
+    openArchiveReasonProbe: async (origin, signal) => {
+      const saved = connection.active;
+      const openProbe = options.provider.openArchiveReasonProbe;
+      if (closed || signal.aborted || saved?.origin !== origin || !openProbe)
+        throw new ProviderError('account-session-unavailable');
+      const probe = await openProbe(saved.cookiesText, origin, saved.profile?.username, signal);
+      return withBlockedCleanup(probe, saved, signal);
+    },
     subscribe: (listener) => {
       listeners.add(listener);
       return () => {
@@ -617,6 +955,7 @@ export async function createAccountSync(options: AccountSyncOptions): Promise<Ac
       return wait(job, signal, true);
     },
     refresh,
+    unfollow,
     disconnect: async () => {
       available();
       let draft: AccountSyncConfig | null = null;
@@ -629,6 +968,10 @@ export async function createAccountSync(options: AccountSyncOptions): Promise<Ac
           const active = connection.active;
           draft = active ? { cookiesText: active.cookiesText, origin: active.origin } : null;
           await connection.disconnect();
+          pendingMissingCount = 0;
+          favoritesIndexCount = undefined;
+          pendingProfileCount = 0;
+          archivedRecoveryCursor = 0;
           await options.supervisor.reconcile();
         } catch {
           throw new AccountSyncError('account_sync_unavailable');

@@ -9,6 +9,7 @@ import { z } from 'zod';
 import {
   accountSyncConfigSchema,
   policySchema,
+  subjectDirectory,
   timelineSchema,
   type ArchiveHealthStatus,
   type SiteRoutesStatus,
@@ -22,11 +23,17 @@ import type {
   SupervisorPort,
 } from '../ports.js';
 import { defaultRuntimeSettings, type SettingsStore } from '../runtime/settings.js';
+import type { SocksProxySettings } from '../runtime/socks-proxy.js';
 import type { ResourceMonitor } from '../runtime/resources.js';
 import { LocalAuth, LocalAuthError, sessionToken, setupToken } from './auth.js';
 import type { KeyVault } from './key-vault.js';
 import { createKeyValidation } from './key-validation.js';
-import { AccountSyncError, createAccountSync } from '../account/account-sync.js';
+import {
+  accountUnfollowBinding,
+  AccountSyncError,
+  createAccountSync,
+} from '../account/account-sync.js';
+import { createArchiveReasons, type OpenArchiveReasonProbe } from '../account/archive-reasons.js';
 import { createPreviews, PreviewError } from '../previews/index.js';
 import { registerPreviews } from './previews.js';
 import { registerStatusHistory } from './status-history.js';
@@ -62,12 +69,14 @@ interface AppOptions {
   uiRoot?: string;
   allowedOrigins?: string[];
   settings?: SettingsStore;
+  socksProxy?: Pick<SocksProxySettings, 'get' | 'update' | 'signal'>;
   resources?: ResourceMonitor;
   archiveHealth?: () => ArchiveHealthStatus;
   retryArchiveHealth?: () => Promise<void>;
   siteRoutes?: () => SiteRoutesStatus;
   network?: NetworkRouting;
   accountSync?: AccountSyncPort;
+  openArchiveReasonProbe?: OpenArchiveReasonProbe;
   previews?: PreviewsPort;
   live?: LiveProxy;
   backgroundTasks?: () => BackgroundTask[];
@@ -92,6 +101,7 @@ const keySchema = z
 export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   const timeZone = deploymentTimeZone();
   const { archive, provider, supervisor, vault } = options;
+  const socksProxy = options.socksProxy;
   const keyValidation = createKeyValidation(
     vault,
     options.network?.keySample.bind(options.network),
@@ -186,10 +196,24 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   let setupCompleting = false;
   let ready = true;
   const tokenOf = (cookie?: string): string | undefined => sessionToken(cookie);
+  const archiveReasons =
+    options.openArchiveReasonProbe &&
+    createArchiveReasons({
+      clock,
+      archive,
+      account: () => accountSync.status(),
+      subscribeAccount: accountSync.subscribe?.bind(accountSync),
+      openProbe: options.openArchiveReasonProbe,
+      transportSignal: socksProxy ? () => socksProxy.signal() : undefined,
+      now,
+      onUpdated: (purged) =>
+        sync.notify(purged ? ['subjects', 'timeline', 'events', 'personal'] : 'subjects'),
+    });
   const syncState = createSyncState({
     archive,
     supervisor,
     accountSync,
+    archiveReasons,
     resources: options.resources,
     settings: options.settings,
     keyCount: () => vault.count,
@@ -205,7 +229,9 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   const detachMedia = archive.subscribeMedia?.((change) => {
     if (syncState.affectsDirectory(change)) sync.invalidate('subjects');
   });
-  const detachAccount = accountSync.subscribe?.(() => sync.notify(['account', 'system']));
+  const detachAccount = accountSync.subscribe?.((topic) =>
+    sync.notify(topic === 'subjects' ? topic : ['account', 'system']),
+  );
   const detachPlayback = live.subscribe?.(() => sync.notify('playback'));
   const detachNetwork = options.network?.subscribe(() => sync.notify('system'));
   app.addHook('onClose', (_instance, done) => {
@@ -257,6 +283,8 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     }
     if (code === 'SUBJECT_NOT_FOUND') return reply.code(404).send({ error: 'subject_not_found' });
     if (code === 'SUBJECT_ARCHIVED') return reply.code(409).send({ error: 'subject_archived' });
+    if (code === 'PROXY_SETTINGS_UNAVAILABLE')
+      return reply.code(503).send({ error: 'proxy_settings_unavailable' });
     if (code === 'CURSOR_STALE') return reply.code(409).send({ error: 'cursor_stale' });
     if (['STALE_DELETE_PLAN', 'MEDIA_SELECTION_STALE', 'PERSONAL_REVISION_STALE'].includes(code))
       return reply.code(409).send({ error: 'media_selection_stale' });
@@ -273,19 +301,23 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     if (code === 'INVALID_CURSOR') return reply.code(400).send({ error: 'invalid_cursor' });
     if (error instanceof AccountSyncError) {
       const status =
-        error.code === 'cookies_invalid' || error.code === 'account_sync_disconnected'
-          ? 400
-          : error.code === 'cookies_expired'
-            ? 422
-            : error.code === 'account_sync_busy' ||
-                error.code === 'account_sync_cancelled' ||
-                error.code === 'account_origin_locked'
-              ? 409
-              : error.code === 'account_sync_unavailable'
-                ? 503
-                : error.code === 'account_sync_timeout'
-                  ? 504
-                  : 502;
+        error.code === 'account_unfollow_subject_missing'
+          ? 404
+          : error.code === 'cookies_invalid' || error.code === 'account_sync_disconnected'
+            ? 400
+            : error.code === 'cookies_expired'
+              ? 422
+              : error.code === 'account_sync_busy' ||
+                  error.code === 'account_sync_cancelled' ||
+                  error.code === 'account_unfollow_protected' ||
+                  error.code === 'account_unfollow_account_changed' ||
+                  error.code === 'account_origin_locked'
+                ? 409
+                : error.code === 'account_sync_unavailable'
+                  ? 503
+                  : error.code === 'account_sync_timeout'
+                    ? 504
+                    : 502;
       return reply.code(status).send({ error: error.code });
     }
     if (error instanceof PreviewError)
@@ -515,6 +547,19 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     reply.header('cache-control', 'no-store, private');
     return { draft, status: accountSync.status() };
   });
+  app.delete('/api/account-sync/favorites/:id', async (request, reply) => {
+    const id = subjectId.parse((request.params as { id: string }).id);
+    const { binding } = z
+      .object({ binding: z.string().regex(/^[a-f0-9]{64}$/) })
+      .strict()
+      .parse(request.body);
+    return accountOperation(request, reply, async (signal) => {
+      if (!accountSync.unfollow) throw new AccountSyncError('account_sync_unavailable');
+      await accountSync.unfollow(id, binding, signal);
+      sync.notify(['subjects', 'timeline', 'events', 'personal']);
+      return { subject: await archive.getSubject(id) };
+    });
+  });
   app.get('/api/keys', () => ({ keyCount: vault.count }));
   app.route({
     method: ['GET', 'PUT'],
@@ -536,31 +581,20 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
   app.get('/api/subjects', async () => {
     const states = supervisor.states();
     const diagnostics = supervisor.diagnostics?.() ?? {};
-    return (await archive.listSubjects()).map((subject) => ({
+    const binding = accountUnfollowBinding(accountSync.status());
+    const subjects = await archive.listSubjects();
+    const unfollowBinding =
+      binding === accountUnfollowBinding(accountSync.status()) ? binding : undefined;
+    const archiveReason = archiveReasons?.snapshot();
+    return subjects.map((subject) => ({
       ...subject,
+      directory: subjectDirectory(subject),
+      archiveReason: subject.archiveReason ?? archiveReason?.(subject),
+      unfollowBinding,
       captureState: states[subject.id] ?? 'IDLE',
       captureError: diagnostics[subject.id]?.error ?? null,
       lastCapturedAtMs: diagnostics[subject.id]?.lastSuccessMs ?? null,
     }));
-  });
-  app.post('/api/subjects', async (request, reply) => {
-    const input = z
-      .object({
-        providerId: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
-        handle: z.string().trim().min(1).max(200).optional(),
-      })
-      .strict()
-      .parse(request.body);
-    const id = `stripchat:${input.providerId}`;
-    await archive.upsertSubjects([
-      {
-        id,
-        providerId: input.providerId,
-        handle: input.handle ?? `主播 #${input.providerId}`,
-      },
-    ]);
-    runBackground(supervisor.reconcile(), 'recording_reconcile_failed');
-    return reply.code(201).send(await archive.getSubject(id));
   });
   app.patch('/api/subjects/policies', async (request) => {
     const requestedAtMs = Date.now();
@@ -609,6 +643,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     const diagnostic = supervisor.diagnostics?.()[id];
     return {
       ...subject,
+      directory: subjectDirectory(subject),
       captureState: supervisor.states()[id] ?? 'IDLE',
       captureError: diagnostic?.error ?? null,
       lastCapturedAtMs: diagnostic?.lastSuccessMs ?? null,
@@ -690,7 +725,10 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     retryArchiveHealth: options.retryArchiveHealth,
     siteRoutes: options.siteRoutes,
     network: options.network,
-    backgroundTasks: options.backgroundTasks,
+    backgroundTasks: () => [
+      ...(options.backgroundTasks?.() ?? []),
+      ...(archiveReasons ? [archiveReasons.backgroundTask()] : []),
+    ],
     ingressStats: options.ingressStats,
   });
   app.put('/api/settings', async (request, reply) => {
@@ -702,6 +740,18 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
     );
     runBackground(supervisor.reconcile(), 'settings_reconcile_failed');
     return settings;
+  });
+  app.get('/api/settings/socks-proxy', (_request, reply) => {
+    reply.header('cache-control', 'no-store');
+    if (!socksProxy) return reply.code(503).send({ error: 'proxy_settings_unavailable' });
+    return socksProxy.get();
+  });
+  app.put('/api/settings/socks-proxy', async (request, reply) => {
+    reply.header('cache-control', 'no-store');
+    if (!socksProxy) return reply.code(503).send({ error: 'proxy_settings_unavailable' });
+    const proxy = await socksProxy.update(request.body);
+    sync.notify(['subjects', 'system']);
+    return proxy;
   });
   app.get('/api/media/:id', async (request, reply) => {
     const id = z
@@ -791,6 +841,7 @@ export async function buildApp(options: AppOptions): Promise<FastifyInstance> {
       () => sync.close(),
       () => supervisor.close(),
       () => accountSync.close(),
+      () => archiveReasons?.close(),
       () => previews.close(),
       () => live.close(),
       () => playback.close(),

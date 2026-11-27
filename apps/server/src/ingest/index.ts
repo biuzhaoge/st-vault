@@ -168,6 +168,17 @@ export function createIngressHub(options: IngressOptions): IngressHub {
       intervalMs: () => publicCheckMs,
       leaseMs: () => publicLeaseMs,
     });
+  const checkPublicForStart = async (subject: Subject, signal?: AbortSignal): Promise<void> => {
+    const maxAgeMs =
+      options.evidence && evidence.publicForStart(subject.id) ? publicCheckMs / 2 : 0;
+    const observed = await evidence.observe(subject, signal, maxAgeMs, 'active');
+    if (!evidence.publicForStart(subject.id)) {
+      const revocation = evidence.snapshot(subject.id).revocation;
+      throw new PublicStreamError(
+        revocation ?? (observed.status === 'PUBLIC' ? 'UNKNOWN' : observed.status),
+      );
+    }
+  };
   let closed = false,
     closing: Promise<void> | undefined;
   let publishedOrder = 0;
@@ -445,13 +456,7 @@ export function createIngressHub(options: IngressOptions): IngressHub {
           if (!signal.aborted) failure(entry, error);
         }
       });
-      const observed = await evidence.observe(
-        entry.subject,
-        signal,
-        options.evidence ? publicCheckMs / 2 : 0,
-        'active',
-      );
-      if (!evidence.public(entry.subject.id)) throw new PublicStreamError(observed.status);
+      await checkPublicForStart(entry.subject, signal);
       authorize();
       stage(entry, { phase: 'resolving' });
       initialStatusMs = Date.now() - started;
@@ -471,7 +476,6 @@ export function createIngressHub(options: IngressOptions): IngressHub {
         const nextRoute = entry.route;
         const scope = AbortSignal.any([signal, nextRoute.signal]);
         try {
-          authorize();
           if (route !== nextRoute) {
             route = nextRoute;
             resolveRoute = true;
@@ -485,7 +489,11 @@ export function createIngressHub(options: IngressOptions): IngressHub {
               stall,
               firstPublished ? stallTimeoutMs : firstSegmentDeadlineMs,
             );
+            if (!evidence.public(entry.subject.id)) {
+              await evidence.observe(entry.subject, scope, 0, 'active');
+            }
           }
+          authorize();
           if (entry.ended) {
             await pause(reloadMs, scope);
             continue;
@@ -848,6 +856,9 @@ export function createIngressHub(options: IngressOptions): IngressHub {
     entry.refs++;
     try {
       await waitFor(entry.ready, signal);
+      if (!entry.error && !evidence.publicForStart(subject.id))
+        await checkPublicForStart(subject, signal);
+      if (entry.error) throw entry.error;
     } catch (error) {
       release(entry, recordingRequested);
       if (entry.refs === 0) await entry.done;

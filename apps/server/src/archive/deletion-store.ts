@@ -471,17 +471,22 @@ export class DeletionStore {
     if (result.state === 'completed') await this.promoteWaiting();
     return result;
   }
-  async cleanup(beforeDiscard?: (id: string) => Promise<void>): Promise<boolean> {
-    const row = await this.db
-      .prepare(
-        `SELECT id FROM media_deletions WHERE state='discarding'
+  async cleanup(beforeDiscard?: (id: string) => Promise<void>, subject?: string): Promise<boolean> {
+    const row = subject
+      ? await this.db
+          .prepare(
+            `SELECT id FROM media_deletions WHERE subject=? AND state IN ('discarding','planned','completed','failed')
+             ORDER BY created,id LIMIT 1`,
+          )
+          .get<{ id: string }>(subject)
+      : await this.db
+          .prepare(
+            `SELECT id FROM media_deletions WHERE state='discarding'
       OR (state='planned' AND (created<? OR id NOT IN(SELECT id FROM media_deletions WHERE state='planned' ORDER BY created DESC LIMIT 8)))
       OR (state IN ('completed','failed') AND id NOT IN(SELECT id FROM media_deletions WHERE state IN ('completed','failed') ORDER BY updated DESC,id DESC LIMIT 20))
       ORDER BY created,id LIMIT 1`,
-      )
-      .get<{
-        id: string;
-      }>(Date.now() - 3600000);
+          )
+          .get<{ id: string }>(Date.now() - 3600000);
     if (!row) return false;
     await beforeDiscard?.(row.id);
     await this.db.prepare("UPDATE media_deletions SET state='discarding' WHERE id=?").run(row.id);

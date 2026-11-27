@@ -332,6 +332,20 @@ export class EventStore {
     await this.expireDue(at);
     await this.prune(at);
   }
+  async pruneSubject(id: string, limit: number): Promise<boolean> {
+    const { changes } = await this.db
+      .prepare(
+        `DELETE FROM archive_events WHERE id IN (
+          SELECT id FROM archive_events WHERE json::jsonb->>'subjectId'=? ORDER BY id LIMIT ?
+        )`,
+      )
+      .run(id, limit);
+    if (changes)
+      await this.db
+        .prepare('UPDATE event_meta SET event_count=event_count-?,revision=revision+1 WHERE id=1')
+        .run(changes);
+    return Number(changes) === limit;
+  }
   /** Reclaim events by their own timestamp and runs wholly contained in the interval. */
   async pruneWindow(from: number, to: number, limit: number): Promise<boolean> {
     const events = await this.db

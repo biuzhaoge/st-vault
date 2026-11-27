@@ -37,6 +37,25 @@ const system: SystemInfo = {
     },
   ],
 };
+it('keeps download details in their task row and exposes the full message in help', () => {
+  const note = '部分图片下载失败，已有图片继续使用。';
+  const html = renderToStaticMarkup(
+    <SystemSummary
+      system={{
+        ...system,
+        backgroundTasks: [
+          { id: 'cover-sync', group: 'sync', state: 'retrying', error: 'cover_refresh_partial' },
+        ],
+      }}
+      autoRecordingCount={0}
+    />,
+  );
+  expect(html).toContain(
+    `<span class="system-row-note" title="${note}">${note}</span><span class="panel-row-value">`,
+  );
+  expect(html).toMatch(new RegExp(`role="tooltip"[^>]*>[^<]*<small>${note}</small>`));
+});
+
 it('shows recording and media items in separate rows under their groups', () => {
   const html = renderToStaticMarkup(<SystemSummary system={system} autoRecordingCount={5} />);
   expect(html).toMatch(/data-status-row="recording-start"[^>]*>.*?启动中/);
@@ -120,7 +139,7 @@ it('shows low capacity and a disk check in the same status position', () => {
   expect(checking).toMatch(/data-status-row="disk-check"[^>]*>.*?panel-badge is-busy.*?检查中/);
   expect(checking).not.toContain('role="meter"');
 });
-it('keeps retry feedback on its existing status row and omits it after healthy checks', () => {
+it('omits manual retries for periodic sync even when advertised by the server', () => {
   const onRefresh = () => Promise.resolve();
   const html = renderToStaticMarkup(
     <SystemSummary
@@ -137,15 +156,8 @@ it('keeps retry feedback on its existing status row and omits it after healthy c
       onRefresh={onRefresh}
     />,
   );
-  expect(html).toMatch(
-    /data-status-row="cover-sync"[^>]*>.*?disabled="" aria-label="封面更新：重试"/,
-  );
-  expect(html).toMatch(
-    /data-status-row="avatar-sync"[^>]*>.*?system-retry" type="button" aria-label="头像更新：重试"/,
-  );
-  expect(html).toContain('重试中');
-  expect(html).not.toContain('aria-label="数据同步：重试"');
-  expect(html).not.toContain('aria-label="媒体处理：重试"');
+  expect(html).toContain('本轮未完成');
+  expect(html).not.toContain('system-retry');
   expect(
     renderToStaticMarkup(
       <SystemSummary system={system} autoRecordingCount={0} onRefresh={onRefresh} />,

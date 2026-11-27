@@ -30,6 +30,7 @@ export const TimeRangeControl = memo(function TimeRangeControl({
   onMove,
   nowMs = Date.now(),
   filters,
+  actions,
   calendar = fullCalendar,
 }: ViewWindow & {
   timelineStartMs: number;
@@ -37,6 +38,7 @@ export const TimeRangeControl = memo(function TimeRangeControl({
   onMove: (direction: -1 | 1) => void;
   nowMs?: number;
   filters?: ReactNode;
+  actions?: ReactNode;
   calendar?: ArchiveCalendar;
 }): JSX.Element {
   const first = dayStart(timelineStartMs),
@@ -260,6 +262,7 @@ export const TimeRangeControl = memo(function TimeRangeControl({
             <Icon name="chevron-right" />
           </button>
         </div>
+        {actions}
       </div>
       <div className="time-ruler-row">
         <TimelineRuler

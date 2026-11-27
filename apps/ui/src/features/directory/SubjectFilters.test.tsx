@@ -21,6 +21,7 @@ it('renders independent states for multiple selected filters and hides zero coun
   expect(html).toContain('aria-pressed="true" aria-label="在线"');
   expect(html).toContain('aria-pressed="true" aria-label="离线"');
   expect(html).toContain('aria-pressed="false" aria-label="归档"');
+  expect(html).not.toContain('role="status"');
   expect(html).not.toContain('<svg');
   expect(html).not.toContain('全部');
 });
@@ -34,4 +35,5 @@ it('renders all three filters off when none is selected', () => {
     />,
   );
   expect(html.match(/aria-pressed="false"/g) ?? []).toHaveLength(3);
+  expect(html).not.toContain('role="status"');
 });

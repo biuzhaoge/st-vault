@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import { chromium } from 'playwright-core';
 import { startFixture } from './support/fixture.mjs';
 
-const fixture = await startFixture();
+const newSubject = { id: 'stripchat:10001', providerId: 10001, handle: 'NewModel' };
+const fixture = await startFixture({ followingAdditions: [newSubject] });
 let browser;
 try {
   browser = await chromium.launch({ executablePath: '/usr/bin/chromium', headless: true });
@@ -25,27 +26,39 @@ try {
       document.querySelector('.global-recording-settings button')?.getAttribute('aria-checked') ===
         'true' && !document.querySelector('.global-recording-settings button').disabled,
   );
-  const added = await page.evaluate(async () => {
-    const response = await fetch('/api/subjects', {
-      method: 'POST',
+  const importStatus = await page.evaluate(async () => {
+    const response = await fetch('/api/account-sync', {
+      method: 'PUT',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ providerId: 10001, handle: 'NewModel' }),
+      body: JSON.stringify({
+        cookiesText: 'fixture=global-recording',
+        origin: 'https://stripchat.com',
+      }),
     });
-    return response.json();
+    return response.status;
   });
-  assert.equal(added.autoRecord, true);
-  await page.evaluate(async () => {
-    await fetch('/api/subjects/stripchat%3A10001/policy', {
+  assert.equal(importStatus, 200, 'The account sync adds the newly followed subject');
+  const readImportedSubject = () =>
+    page.evaluate(async (id) => {
+      const rows = await (await fetch('/api/subjects')).json();
+      return rows.find((row) => row.id === id);
+    }, newSubject.id);
+  assert.equal((await readImportedSubject())?.autoRecord, true);
+  const updated = await page.evaluate(async (id) => {
+    const response = await fetch(`/api/subjects/${encodeURIComponent(id)}/policy`, {
       method: 'PATCH',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ autoRecord: false }),
     });
     window.dispatchEvent(new CustomEvent('stv-sync', { detail: ['subjects', 'system'] }));
-  });
+    return response.json();
+  }, newSubject.id);
+  assert.equal(updated.autoRecord, false);
   await page.reload();
   await page.getByRole('button', { name: '设置', exact: true }).click();
   await toggle.waitFor();
   assert.equal(await toggle.getAttribute('aria-checked'), 'true');
+  assert.equal((await readImportedSubject())?.autoRecord, false);
   await toggle.click();
   await page.waitForFunction(
     () =>

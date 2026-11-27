@@ -13,7 +13,7 @@ import {
   syncReadFailure,
   type SyncReadResult,
 } from '../shared/lib/sync';
-import { reconcileSubjects } from '../features/directory/subjects';
+import { reconcileSubjects, subjectGroup } from '../features/directory/subjects';
 import type { KeyInfo } from '../features/keys/KeyTools';
 import type { SystemInfo } from '../features/status/system';
 
@@ -145,7 +145,9 @@ export function useWorkbenchData(
       setSystem((current) => (current ? { ...current, recordAll: enabled } : current));
       setSubjects((rows) =>
         rows.map((row) =>
-          row.archived ? row : { ...row, autoRecord: enabled, monitorEnabled: true },
+          subjectGroup(row) === 'ARCHIVED'
+            ? row
+            : { ...row, autoRecord: enabled, monitorEnabled: true },
         ),
       );
     } finally {
@@ -163,9 +165,39 @@ export function useWorkbenchData(
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ autoRecord: record, monitorEnabled: true }),
       });
-      setSubjects((rows) => rows.map((row) => (row.id === id ? updated : row)));
+      setSubjects((rows) =>
+        rows.map((row) =>
+          row.id === id ? { ...updated, unfollowBinding: row.unfollowBinding } : row,
+        ),
+      );
     } finally {
       subjectsVersion.current++;
+      void loadSubjects(true).catch((cause: unknown) => setError(messageFor(cause)));
+    }
+  }
+  async function unfollow(subject: Subject): Promise<void> {
+    try {
+      const result = await request<{ subject: Subject | null }>(
+        `/api/account-sync/favorites/${encodeURIComponent(subject.id)}`,
+        {
+          method: 'DELETE',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ binding: subject.unfollowBinding }),
+        },
+      );
+      subjectsVersion.current++;
+      setSubjects((rows) =>
+        reconcileSubjects(
+          rows,
+          rows.flatMap((row) =>
+            row.id === subject.id ? (result.subject ? [result.subject] : []) : [row],
+          ),
+        ),
+      );
+    } catch (cause) {
+      if (cause instanceof ApiError && cause.status === 401) handlers.current.onUnauthorized();
+      throw cause;
+    } finally {
       void loadSubjects(true).catch((cause: unknown) => setError(messageFor(cause)));
     }
   }
@@ -193,6 +225,7 @@ export function useWorkbenchData(
     loadSubjects,
     setGlobalRecording,
     setRecording,
+    unfollow,
     clearSubjects,
   };
 }

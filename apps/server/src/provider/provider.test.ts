@@ -30,6 +30,20 @@ function requestUrl(input: Parameters<typeof fetch>[0]): string {
   return typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
 }
 
+function roomPage(url: URL, disabled = false) {
+  const handle = url.pathname.slice(1);
+  const content = disabled
+    ? `<div class="deleted-wrapper"><div class="account-disabled-header">账户被禁用</div><div class="account-disabled-description">${handle}的账户已被禁用。</div></div>`
+    : '<div class="view-cam-page"><div class="view-cam-container"></div></div>';
+  return new Response(
+    `<html lang="zh"><head><link rel="canonical" href="${url.href}"></head><body>${content}</body></html>`,
+    {
+      status: disabled ? 404 : 200,
+      headers: { 'content-type': 'text/html; charset=utf-8' },
+    },
+  );
+}
+
 describe('public and one-shot account separation', () => {
   it('rejects an unavailable model response without switching the account-bound site', async () => {
     const provider = fixtureProvider(
@@ -37,7 +51,7 @@ describe('public and one-shot account separation', () => {
         Response.json(
           requestUrl(input).startsWith('https://site.invalid')
             ? { error: 'model-unavailable' }
-            : { item: { modelId: 12, isLive: true, status: 'public' } },
+            : { models: [{ id: 12, isLive: true, status: 'public' }] },
         ),
       { publicOrigins: ['https://site.invalid', 'https://backup.invalid'] },
     );
@@ -45,15 +59,17 @@ describe('public and one-shot account separation', () => {
     expect(provider.sites.status().candidates[0].failures).toBe(0);
     provider.sites.close();
   });
-  it('does not accept a different model ID from a mirror as the requested broadcaster', async () => {
+  it('does not accept a different model ID in a status batch', async () => {
     const provider = fixtureProvider(
       async (input) =>
         Response.json({
-          item: {
-            modelId: requestUrl(input).startsWith('https://site.invalid') ? 999 : 12,
-            isLive: true,
-            status: 'public',
-          },
+          models: [
+            {
+              id: requestUrl(input).startsWith('https://site.invalid') ? 999 : 12,
+              isLive: true,
+              status: 'public',
+            },
+          ],
         }),
       { publicOrigins: ['https://site.invalid', 'https://backup.invalid'] },
     );
@@ -69,10 +85,10 @@ describe('public and one-shot account separation', () => {
         const url = new URL(requestUrl(input)),
           cookie = new Headers(init?.headers).get('cookie');
         calls.push({ origin: url.origin, cookie });
-        if (url.pathname.includes('broadcasts'))
+        if (url.pathname === '/api/front/models/list')
           return url.origin === 'https://site.invalid'
             ? new Response(null, { status: 503 })
-            : Response.json({ item: { isLive: true, status: 'public' } });
+            : Response.json({ models: [{ id: 12, isLive: true, status: 'public' }] });
         return new Response(null, { status: 503 });
       },
       { publicOrigins: ['https://site.invalid', 'https://backup.invalid'] },
@@ -87,16 +103,16 @@ describe('public and one-shot account separation', () => {
     ]);
     provider.sites.close();
   });
-  it('returns account profile and targets from one initial dynamic request without changing importList', async () => {
+  it('returns account profile and targets from one initial request and counts index IDs', async () => {
     let initial = 0;
     const provider = fixtureProvider(async (input) => {
-      const url = requestUrl(input);
-      if (url.includes('initial-dynamic')) {
+      const { pathname } = new URL(requestUrl(input));
+      if (pathname.includes('initial-dynamic')) {
         initial++;
         return Response.json({
           initialDynamic: {
-            jwtToken: 'synthetic-jwt',
             user: {
+              id: 9,
               username: 'synthetic-owner',
               avatarUrl: 'https://static-proxy.strpst.com/avatars/synthetic',
               followingCount: 31,
@@ -104,7 +120,13 @@ describe('public and one-shot account separation', () => {
           },
         });
       }
-      return Response.json({ models: [{ id: 12, username: 'fixture' }], totalCount: 1 });
+      if (pathname === '/api/front/users/9/favorites') return Response.json({ modelIds: [12] });
+      if (pathname === '/api/front/v2/users')
+        return Response.json({ items: [{ id: 12, username: 'fixture' }] });
+      if (pathname === '/api/front/v2/users/profiles') return Response.json({ items: {} });
+      if (pathname === '/api/front/models/list')
+        return Response.json({ models: [{ id: 12, isInFavorites: true }] });
+      throw new Error('unexpected source');
     });
     const result = await provider.importAccount('session=synthetic');
     expect(provider.sites.status().access).toMatchObject({
@@ -117,22 +139,27 @@ describe('public and one-shot account separation', () => {
       subjects: [{ id: 'stripchat:12', providerId: 12, handle: 'fixture' }],
       profile: {
         username: 'synthetic-owner',
-        followingCount: 31,
+        followingCount: 1,
         avatarSourceUrl: 'https://static-proxy.strpst.com/avatars/synthetic',
       },
+      indexCount: 1,
+      verifiedFollowingCount: 1,
+      unresolvedProfileCount: 0,
     });
     expect(await provider.importList('session=synthetic')).toEqual(result.subjects);
     expect(initial).toBe(2);
   });
   it('keeps concurrent profile results bound to their own cookie invocation and rejects avatar SSRF', async () => {
     const provider = fixtureProvider(async (input, init) => {
-      const cookie = new Headers(init?.headers).get('cookie') ?? '',
-        owner = cookie.endsWith('A') ? 'A' : 'B';
-      if (requestUrl(input).includes('initial-dynamic'))
+      const owner = new Headers(init?.headers).get('cookie')?.endsWith('A') ? 'A' : 'B';
+      const userId = owner === 'A' ? 9 : 10;
+      const modelId = owner === 'A' ? 12 : 13;
+      const { pathname } = new URL(requestUrl(input));
+      if (pathname.includes('initial-dynamic'))
         return Response.json({
           initialDynamic: {
-            jwtToken: 'synthetic-' + owner,
             user: {
+              id: userId,
               username: 'synthetic-' + owner,
               avatarUrl:
                 owner === 'A'
@@ -141,10 +168,14 @@ describe('public and one-shot account separation', () => {
             },
           },
         });
-      return Response.json({
-        models: [{ id: owner === 'A' ? 12 : 13, username: 'fixture-' + owner }],
-        totalCount: 1,
-      });
+      if (pathname === `/api/front/users/${userId}/favorites`)
+        return Response.json({ modelIds: [modelId] });
+      if (pathname === '/api/front/v2/users')
+        return Response.json({ items: [{ id: modelId, username: 'fixture-' + owner }] });
+      if (pathname === '/api/front/v2/users/profiles') return Response.json({ items: {} });
+      if (pathname === '/api/front/models/list')
+        return Response.json({ models: [{ id: modelId, isInFavorites: true }] });
+      throw new Error('unexpected source');
     });
     const [a, b] = await Promise.all([
       provider.importAccount('session=A'),
@@ -160,7 +191,209 @@ describe('public and one-shot account separation', () => {
     expect(b.profile.followingCount).toBe(1);
     expect(b.subjects[0].providerId).toBe(13);
   });
-  it('rejects guest JWTs before requesting account lists', async () => {
+  it('retains previously followed IDs unless the selected sources confirm an archive reason', async () => {
+    const requested: number[] = [];
+    const provider = fixtureProvider(async (input, init) => {
+      const url = new URL(requestUrl(input));
+      const headers = new Headers(init?.headers);
+      expect(url.origin).toBe('https://site.invalid');
+      if (/^\/known-\d+$/.test(url.pathname)) {
+        expect(headers.has('cookie')).toBe(false);
+        expect(headers.has('authorization')).toBe(false);
+        return roomPage(url, url.pathname === '/known-18');
+      }
+      expect(headers.get('cookie')).toBe('session=synthetic');
+      expect(headers.has('authorization')).toBe(false);
+      if (url.pathname.includes('initial-dynamic'))
+        return Response.json({ initialDynamic: { user: { id: 9, username: 'fixture-owner' } } });
+      if (url.pathname === '/api/front/users/9/favorites') return Response.json({ modelIds: [12] });
+      if (url.pathname === '/api/front/models/list')
+        return Response.json({
+          models: [
+            { id: 12, isInFavorites: true, status: 'off', isLive: false },
+            { id: 13, isInFavorites: true },
+            { id: 14, isInFavorites: false },
+            { id: 16, isInFavorites: false },
+            { id: 19, isInFavorites: 'false' },
+            { id: 20, isInFavorites: false },
+          ],
+        });
+      if (url.pathname === '/api/front/v2/users') return Response.json({ items: [] });
+      if (url.pathname === '/api/front/v2/users/profiles') return Response.json({ items: {} });
+      if (url.pathname.endsWith('/cam')) return new Response(null, { status: 403 });
+      const id = Number(url.pathname.split('/').at(-1));
+      requested.push(id);
+      return Response.json({
+        item: {
+          id: id === 16 ? 999 : id,
+          username: id === 20 ? undefined : `known-${id}`,
+          isDeleted: id === 17,
+          isBlocked: id === 14,
+        },
+      });
+    });
+    const known = Array.from({ length: 9 }, (_value, index) => ({
+      id: `stripchat:${index + 12}`,
+      providerId: index + 12,
+      handle: `known-${index + 12}`,
+    }));
+    const result = await provider.importAccount(
+      'session=synthetic',
+      undefined,
+      undefined,
+      undefined,
+      async (username) => {
+        expect(username).toBe('fixture-owner');
+        return known;
+      },
+    );
+    expect(requested.sort((a, b) => a - b)).toEqual([13, 14, 15, 16, 17, 18, 19, 20]);
+    expect(result.subjects).toEqual(
+      known.map((row) => {
+        if (row.providerId === 14)
+          return { ...row, accountArchiveReason: 'unfollowed', accountUnfollowConfirmed: true };
+        if (row.providerId === 17) return { ...row, accountArchiveReason: 'account_deleted' };
+        if (row.providerId === 18)
+          return {
+            ...row,
+            accountArchiveReason: 'account_disabled',
+            accountBlockedConfirmed: true,
+          };
+        return row;
+      }),
+    );
+    expect(result.unverifiedMissingCount).toBe(4);
+    expect(result.verifiedFollowingCount).toBe(2);
+    expect(result.profile.followingCount).toBe(1);
+  });
+  it('recovers confirmed follows and reclassifies regional archives with their evidence intact', async () => {
+    const indexed = [12, 20, 21, 22, 23, 24, 25];
+    const provider = fixtureProvider(async (input) => {
+      const url = new URL(requestUrl(input));
+      const { pathname } = url;
+      if (pathname.includes('initial-dynamic'))
+        return Response.json({ initialDynamic: { user: { id: 9, username: 'fixture-owner' } } });
+      if (pathname === '/api/front/users/9/favorites') return Response.json({ modelIds: indexed });
+      if (pathname === '/api/front/v2/users') return Response.json({ items: [] });
+      if (pathname === '/api/front/v2/users/profiles') return Response.json({ items: {} });
+      if (pathname === '/api/front/models/list')
+        return Response.json({
+          models: indexed.map((id) => ({
+            id,
+            isInFavorites: true,
+            ...(id === 24 ? { status: 'off', isLive: false } : {}),
+          })),
+        });
+      if (/^\/archived-\d+$/.test(pathname)) return roomPage(url);
+      const id = Number(pathname.split('/').at(-1));
+      return Response.json({
+        item: {
+          id: id === 23 ? 999 : id,
+          username: `archived-${id}`,
+          isDeleted: id === 22 ? undefined : false,
+        },
+      });
+    });
+    const subject = (providerId: number) => ({
+      id: `stripchat:${providerId}`,
+      providerId,
+      handle: `archived-${providerId}`,
+    });
+    const archived = [
+      { ...subject(20), accountArchiveReason: 'unfollowed' as const },
+      { ...subject(21), accountArchiveReason: 'account_disabled' as const },
+      subject(22),
+      { ...subject(23), accountArchiveReason: 'unfollowed' as const },
+      { ...subject(24), accountArchiveReason: 'region_restricted' as const },
+      subject(25),
+    ];
+    const result = await provider.importAccount(
+      'session=synthetic',
+      undefined,
+      undefined,
+      undefined,
+      async () => [subject(12)],
+      async (username) => {
+        expect(username).toBe('fixture-owner');
+        return archived;
+      },
+    );
+    expect(result.subjects).toEqual([
+      subject(12),
+      subject(20),
+      archived[1],
+      { ...subject(22), accountArchivePending: true },
+      { ...subject(23), accountArchivePending: true },
+      archived[4],
+      subject(25),
+    ]);
+    expect(result.recoveredArchivedCount).toBe(3);
+    expect(result.unverifiedMissingCount).toBeUndefined();
+    expect(result.profile.followingCount).toBe(indexed.length);
+  });
+  it('preserves known models when account evidence is blocked by a challenge', async () => {
+    let probes = 0;
+    const provider = fixtureProvider(async (input) => {
+      const { pathname } = new URL(requestUrl(input));
+      if (pathname.includes('initial-dynamic'))
+        return Response.json({ initialDynamic: { user: { id: 9, username: 'fixture-owner' } } });
+      if (pathname === '/api/front/users/9/favorites') return Response.json({ modelIds: [12] });
+      if (pathname === '/api/front/v2/users') return Response.json({ items: [] });
+      if (pathname === '/api/front/v2/users/profiles') return Response.json({ items: {} });
+      if (pathname === '/api/front/models/list')
+        return Response.json({ models: [{ id: 12, isInFavorites: true }] });
+      probes++;
+      return Response.json(
+        { item: { id: Number(pathname.split('/').at(-1)), isDeleted: true } },
+        { status: 403, headers: { 'cf-mitigated': 'challenge' } },
+      );
+    });
+    const known = Array.from({ length: 9 }, (_value, index) => ({
+      id: `stripchat:${index + 12}`,
+      providerId: index + 12,
+      handle: `known-${index + 12}`,
+    }));
+    const result = await provider.importAccount(
+      'session=synthetic',
+      undefined,
+      undefined,
+      undefined,
+      async () => known,
+    );
+    expect(probes).toBe(4);
+    expect(result.subjects).toEqual(known);
+    expect(result.unverifiedMissingCount).toBe(known.length - 1);
+  });
+  it('cancels the import when its transport is withdrawn during account verification', async () => {
+    let started!: (signal?: AbortSignal | null) => void;
+    const checked = new Promise<AbortSignal | null | undefined>((resolve) => {
+      started = resolve;
+    });
+    const provider = fixtureProvider(async (input, init) => {
+      const { pathname } = new URL(requestUrl(input));
+      if (pathname.includes('initial-dynamic'))
+        return Response.json({ initialDynamic: { user: { id: 9, username: 'fixture-owner' } } });
+      if (pathname === '/api/front/users/9/favorites') return Response.json({ modelIds: [] });
+      if (pathname === '/api/front/v2/users') return Response.json({ items: [] });
+      if (pathname === '/api/front/v2/users/profiles') return Response.json({ items: {} });
+      if (pathname === '/api/front/models/list') return Response.json({ models: [] });
+      started(init?.signal);
+      return new Promise<Response>(() => undefined);
+    });
+    const controller = new AbortController();
+    const result = provider.importAccount(
+      'session=synthetic',
+      controller.signal,
+      undefined,
+      undefined,
+      async () => [{ id: 'stripchat:12', providerId: 12, handle: 'known' }],
+    );
+    const verification = await checked;
+    controller.abort();
+    await expect(result).rejects.toMatchObject({ code: 'cancelled' });
+    expect(verification?.aborted).toBe(true);
+  });
+  it('rejects guests before requesting the account index', async () => {
     let calls = 0;
     const provider = fixtureProvider(async () => {
       calls++;
@@ -224,11 +457,11 @@ describe('public and one-shot account separation', () => {
     { status: 'upstream-unavailable', isLive: false },
     { isLive: false },
     { status: 'off' },
-  ])('does not invent OFFLINE from contradictory broadcast fields %j', async (item) => {
-    const provider = fixtureProvider(async () => Response.json({ item }));
+  ])('does not invent OFFLINE from contradictory model status fields %j', async (item) => {
+    const provider = fixtureProvider(async () => Response.json({ models: [{ id: 12, ...item }] }));
     expect(await provider.status(12)).toBe('UNKNOWN');
   });
-  it('GETs broadcasts directly with zero account headers or profile/JWT requests', async () => {
+  it('GETs model status batches with zero account headers or profile/JWT requests', async () => {
     const calls: {
       url: string;
       headers: Headers;
@@ -240,138 +473,65 @@ describe('public and one-shot account separation', () => {
         headers: new Headers(init?.headers),
         credentials: init?.credentials,
       });
-      return Response.json({ item: { status: 'public', isLive: true } });
+      return Response.json({ models: [{ id: 12, status: 'public', isLive: true }] });
     });
     expect(await provider.status(12)).toBe('PUBLIC');
     expect(calls).toHaveLength(1);
-    expect(calls[0].url).toBe('https://site.invalid/api/front/v2/broadcasts/12');
+    const request = new URL(calls[0].url);
+    expect(request.origin + request.pathname).toBe('https://site.invalid/api/front/models/list');
+    expect(request.searchParams.get('modelIds[0]')).toBe('12');
     expect(calls[0].headers.has('cookie')).toBe(false);
     expect(calls[0].headers.has('authorization')).toBe(false);
     expect(calls[0].credentials).toBe('omit');
   });
-  it('returns only identity fields and does not retain account cookies for later public status', async () => {
+  it('keeps account cookies separate from anonymous status and returns only directory fields', async () => {
     const headers: Headers[] = [];
     const provider = fixtureProvider(async (input, init) => {
-      headers.push(new Headers(init?.headers));
-      if (requestUrl(input).includes('/broadcasts/'))
-        return Response.json({ item: { status: 'private', isLive: true } });
-      if (requestUrl(input).includes('initial-dynamic'))
+      const current = new Headers(init?.headers);
+      headers.push(current);
+      const { pathname } = new URL(requestUrl(input));
+      if (pathname === '/api/front/models/list' && !current.has('cookie'))
+        return Response.json({ models: [{ id: 12, status: 'private', isLive: true }] });
+      if (pathname.includes('initial-dynamic'))
         return Response.json({
-          initialDynamic: { jwtToken: 'one-shot-token', user: { username: 'synthetic-account' } },
+          initialDynamic: { user: { id: 9, username: 'synthetic-account' }, jwtToken: 'one-shot' },
         });
+      if (pathname === '/api/front/users/9/favorites') return Response.json({ modelIds: [12] });
+      if (pathname === '/api/front/v2/users')
+        return Response.json({ items: [{ id: 12, username: 'fixture' }] });
+      if (pathname === '/api/front/v2/users/profiles') return Response.json({ items: {} });
       return Response.json({
         models: [
-          { id: 12, username: 'fixture', status: 'public', isLive: true, snapshotTimestamp: 111 },
+          { id: 12, status: 'public', isLive: true, snapshotTimestamp: 111, isInFavorites: true },
         ],
-        totalCount: 1,
       });
     });
     expect(await provider.importList('fixture=one-shot')).toEqual([
       { id: 'stripchat:12', providerId: 12, handle: 'fixture' },
     ]);
     expect(await provider.status(12)).toBe('PRIVATE');
-    expect(headers.map((header) => header.get('cookie'))).toEqual([
-      'fixture=one-shot',
-      'fixture=one-shot',
-      'fixture=one-shot',
-      null,
-    ]);
-    expect(headers.map((header) => header.get('authorization'))).toEqual([
-      null,
-      'one-shot-token',
-      'one-shot-token',
-      null,
-    ]);
+    expect(headers).toHaveLength(6);
+    expect(
+      headers.slice(0, -1).every((header) => header.get('cookie') === 'fixture=one-shot'),
+    ).toBe(true);
+    expect(headers.at(-1)?.has('cookie')).toBe(false);
+    expect(headers.every((header) => !header.has('authorization'))).toBe(true);
   });
-  it('fails atomically when a later list page fails and keeps status independent', async () => {
+  it('fails an inaccessible index atomically and keeps status independent', async () => {
     const provider = fixtureProvider(async (input) => {
-      const url = new URL(requestUrl(input));
-      if (url.pathname.includes('/broadcasts/'))
-        return Response.json({ item: { status: 'off', isLive: false } });
-      if (url.pathname.includes('initial-dynamic'))
+      const { pathname } = new URL(requestUrl(input));
+      if (pathname === '/api/front/models/list')
+        return Response.json({ models: [{ id: 12, status: 'off', isLive: false }] });
+      if (pathname.includes('initial-dynamic'))
         return Response.json({
-          initialDynamic: { jwtToken: 'one-shot-token', user: { username: 'synthetic-account' } },
+          initialDynamic: { user: { id: 9, username: 'synthetic-account' } },
         });
-      if (url.searchParams.get('offset') === '100') return new Response('', { status: 403 });
-      return Response.json({
-        models: Array.from({ length: 100 }, (_, index) => ({
-          id: index + 1,
-          username: `fixture-${index}`,
-        })),
-        totalCount: 101,
-      });
+      if (pathname === '/api/front/users/9/favorites') return new Response('', { status: 403 });
+      throw new Error('unexpected fallback source');
     });
     await expect(provider.importList('fixture=one-shot')).rejects.toMatchObject({ status: 403 });
     expect(await provider.status(12)).toBe('OFFLINE');
   });
-  it.each(['favorites', 'favorites/offline'])(
-    'reads every row of short %s pages and merges duplicates across routes',
-    async (route) => {
-      const roster = Array.from({ length: 150 }, (_, index) => ({
-        id: index + 1,
-        username: `fixture-${index + 1}`,
-      }));
-      const offsets: number[] = [];
-      const provider = fixtureProvider(async (input) => {
-        const url = new URL(requestUrl(input));
-        if (url.pathname.includes('initial-dynamic'))
-          return Response.json({
-            initialDynamic: { jwtToken: 'synthetic-token', user: { username: 'owner' } },
-          });
-        if (url.pathname !== `/api/front/models/${route}`)
-          return Response.json({ models: [roster[0]], totalCount: 1 });
-        const offset = Number(url.searchParams.get('offset'));
-        offsets.push(offset);
-        return Response.json({
-          models: roster.slice(offset, offset + 50),
-          totalCount: roster.length,
-        });
-      });
-      try {
-        const subjects = await provider.importList('fixture=synthetic');
-        expect(offsets).toEqual([0, 50, 100]);
-        expect(subjects.map((row) => row.providerId)).toEqual(roster.map((row) => row.id));
-      } finally {
-        provider.sites.close();
-      }
-    },
-  );
-  it.each(['duplicate', 'changed total', 'oversized page', 'empty page', 'page limit'])(
-    'rejects an unverifiable roster (%s)',
-    async (scenario) => {
-      const rows = Array.from({ length: 101 }, (_, index) => ({
-        id: index + 1,
-        username: `fixture-${index + 1}`,
-      }));
-      let pageRequests = 0;
-      const provider = fixtureProvider(async (input) => {
-        const url = new URL(requestUrl(input));
-        if (url.pathname.includes('initial-dynamic'))
-          return Response.json({
-            initialDynamic: { jwtToken: 'synthetic-token', user: { username: 'owner' } },
-          });
-        pageRequests++;
-        if (scenario === 'page limit') {
-          const offset = Number(url.searchParams.get('offset'));
-          return Response.json({ models: rows.slice(offset, offset + 1), totalCount: 102 });
-        }
-        if (scenario === 'oversized page') return Response.json({ models: rows, totalCount: 101 });
-        if (url.searchParams.get('offset') === '0')
-          return Response.json({ models: rows.slice(0, 100), totalCount: 101 });
-        if (scenario === 'empty page') return Response.json({ models: [], totalCount: 101 });
-        if (scenario === 'changed total') return Response.json({ models: [], totalCount: 100 });
-        return Response.json({ models: [rows[0]], totalCount: 101 });
-      });
-      try {
-        await expect(provider.importList('fixture=synthetic')).rejects.toMatchObject({
-          code: 'incomplete-account-list',
-        });
-        if (scenario === 'page limit') expect(pageRequests).toBe(101);
-      } finally {
-        provider.sites.close();
-      }
-    },
-  );
   it('propagates an HTTP error instead of inventing OFFLINE', async () => {
     const provider = fixtureProvider(async () => new Response('', { status: 503 }));
     await expect(provider.status(12)).rejects.toMatchObject({ status: 503 });
@@ -575,16 +735,15 @@ it('uses only the explicitly selected login domain while public status remains a
       const url = new URL(requestUrl(input));
       calls.push({ origin: url.origin, cookie: new Headers(init?.headers).get('cookie') });
       if (url.pathname.includes('initial-dynamic'))
-        return Response.json({
-          initialDynamic: { user: { username: 'fixture' }, jwtToken: 'synthetic-token' },
-        });
-      if (url.pathname.includes('/broadcasts/'))
-        return Response.json({ item: { modelId: 12, isLive: true, status: 'public' } });
-      return Response.json({ models: [], totalCount: 0 });
+        return Response.json({ initialDynamic: { user: { id: 9, username: 'fixture' } } });
+      if (url.pathname === '/api/front/models/list')
+        return Response.json({ models: [{ id: 12, isLive: true, status: 'public' }] });
+      if (url.pathname === '/api/front/users/9/favorites') return Response.json({ modelIds: [] });
+      throw new Error('unexpected source');
     },
   });
   await provider.importAccount('session=synthetic', undefined, undefined, 'https://stripchat.org');
-  expect(calls).toHaveLength(3);
+  expect(calls).toHaveLength(2);
   expect(
     calls.every(
       (call) => call.origin === 'https://stripchat.org' && call.cookie === 'session=synthetic',

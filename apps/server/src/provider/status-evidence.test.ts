@@ -21,6 +21,41 @@ const observationTiming = (): StatusObservationTiming => ({
   upstreamDeadlines: 0,
 });
 
+it('requires new public evidence after the outbound route changes', async () => {
+  let now = 1000;
+  let finish: ((status: PublicStatus) => void) | undefined;
+  const status = vi
+    .fn<() => Promise<PublicStatus>>()
+    .mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    )
+    .mockResolvedValue('OFFLINE');
+  const evidence = new StatusEvidence({ provider: { status }, now: () => now });
+  let pending: ReturnType<StatusEvidence['observe']> | undefined;
+  try {
+    evidence.seedPublic(subject, now);
+    expect(evidence.public(subject.id)).toBe(true);
+    pending = evidence.observe(subject);
+    await vi.waitFor(() => expect(status).toHaveBeenCalledOnce());
+    now += 1;
+    evidence.resetTransport();
+    evidence.seedPublic(subject, 1000);
+    expect(evidence.public(subject.id)).toBe(false);
+    const renewed = evidence.observe(subject);
+    finish?.('PUBLIC');
+    expect(await pending).toMatchObject({ status: 'UNKNOWN' });
+    expect(await renewed).toMatchObject({ status: 'OFFLINE' });
+    expect(evidence.public(subject.id)).toBe(false);
+  } finally {
+    finish?.('PUBLIC');
+    if (pending) await Promise.allSettled([pending]);
+    await evidence.close();
+  }
+});
+
 it('uses the injected observation capacity and derives active permission leases from its rotation', async () => {
   const releases: ((status: PublicStatus) => void)[] = [];
   const status = vi.fn(() => new Promise<PublicStatus>((resolve) => releases.push(resolve)));
@@ -258,6 +293,35 @@ it('revokes public media on the first PRIVATE response before confirmation compl
     await evidence.close();
   }
 });
+it('pauses new starts while an OFFLINE transition is being rechecked', async () => {
+  let confirm!: (value: PublicStatus) => void;
+  const status = vi
+    .fn<() => Promise<PublicStatus>>()
+    .mockResolvedValueOnce('PUBLIC')
+    .mockResolvedValueOnce('OFFLINE')
+    .mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          confirm = resolve;
+        }),
+    );
+  const evidence = new StatusEvidence({ provider: { status } });
+  try {
+    await evidence.observe(subject);
+    expect(evidence.publicForStart(subject.id)).toBe(true);
+    const observing = evidence.observe(subject);
+    await vi.waitFor(() => expect(status).toHaveBeenCalledTimes(3));
+    expect(evidence.public(subject.id)).toBe(true);
+    expect(evidence.publicForStart(subject.id)).toBe(false);
+    confirm('PUBLIC');
+    await observing;
+    expect(evidence.publicForStart(subject.id)).toBe(true);
+  } finally {
+    confirm?.('PUBLIC');
+    await evidence.close();
+  }
+});
+
 it('keeps one shared offline recovery window instead of tearing media down on a second raw response', async () => {
   let now = 1000;
   const status = vi.fn<() => Promise<PublicStatus>>().mockResolvedValue('PUBLIC');
@@ -307,6 +371,40 @@ it('caps actual requests across all consumers even after logical timeouts', asyn
     await evidence.close();
   }
 });
+it('keeps failed evidence rounds through idle pulses and clears them after successful work', async () => {
+  vi.useFakeTimers();
+  const warning = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+  const clock = new SyncClock({ intervalMs: () => 1000 });
+  const persist = vi.fn<() => Promise<void>>().mockResolvedValue(undefined);
+  for (let attempt = 0; attempt < 3; attempt++)
+    persist.mockRejectedValueOnce(Error('failed to persist evidence'));
+  const evidence = new StatusEvidence({
+    clock,
+    intervalMs: () => 1000,
+    provider: { status: () => Promise.resolve('PUBLIC') },
+    persist,
+  });
+  const release = evidence.retain(subject, () => undefined);
+  try {
+    await vi.advanceTimersByTimeAsync(250);
+    expect(clock.status()[0]?.consecutiveFailures).toBe(1);
+    await vi.advanceTimersByTimeAsync(250);
+    expect(persist).toHaveBeenCalledTimes(1);
+    expect(clock.status()[0]?.consecutiveFailures).toBe(1);
+    await vi.advanceTimersByTimeAsync(1750);
+    expect(clock.status()[0]?.consecutiveFailures).toBe(3);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(persist).toHaveBeenCalledTimes(4);
+    expect(clock.status()[0]?.consecutiveFailures).toBe(0);
+  } finally {
+    release();
+    await evidence.close();
+    await clock.close();
+    warning.mockRestore();
+    vi.useRealTimers();
+  }
+});
+
 it('rotates active viewers on the common clock and reserves monitoring capacity', async () => {
   vi.useFakeTimers();
   const clock = new SyncClock({ intervalMs: () => 1000 });

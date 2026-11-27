@@ -57,6 +57,10 @@ try {
           rail: rect('.connection-rail'),
           filter: rect('.subject-filters'),
           controls: rect('.time-control-strip'),
+          monitor: rect('.monitor-wall-trigger'),
+          view: rect('.time-control-row'),
+          viewWindow: rect('.view-position-window'),
+          viewSpan: rect('.view-position-span'),
           lastStep: rect('.day-step:last-child'),
           playerControls: [
             ...document.querySelectorAll('.player-actions :is(.player-control,.tool-trigger)'),
@@ -88,6 +92,16 @@ try {
       assert(Math.abs(boxes.rail.top - boxes.list.top) < 1, result);
       assert(Math.abs(boxes.rail.bottom - boxes.list.bottom) < 1, result);
       assert(boxes.filter.width > 0 && boxes.lastStep.right <= boxes.list.right + 1, result);
+      assert(
+        boxes.filter.right <= boxes.view.left &&
+          boxes.view.right <= boxes.monitor.left &&
+          boxes.monitor.right <= boxes.controls.right &&
+          boxes.monitor.width >= 28 &&
+          boxes.monitor.height === boxes.filter.height &&
+          boxes.viewSpan.left >= boxes.viewWindow.left - 1 &&
+          boxes.viewSpan.right <= boxes.viewWindow.right + 1,
+        result,
+      );
       assert(!boxes.overflow && boxes.labels, result);
       assert(boxes.listOverflow <= 1 && boxes.lane.right <= boxes.list.right + 1, result);
       assert(Math.abs(boxes.ruler.right - boxes.lane.right) < 1, result);

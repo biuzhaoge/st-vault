@@ -2,15 +2,18 @@ export interface SyncTick {
   nowMs: number;
   intervalMs: number;
 }
+export const syncSkipped = Symbol('sync-skipped');
+type WorkResult = void | typeof syncSkipped;
+
 interface Job {
   name: string;
-  work: (tick: SyncTick) => void | Promise<void>;
+  work: (tick: SyncTick) => WorkResult | Promise<WorkResult>;
   running: boolean;
   active: boolean;
   pulse: boolean;
   lastStartedAtMs: number | null;
   lastFinishedAtMs: number | null;
-  failed: boolean;
+  consecutiveFailures: number;
   skippedRuns: number;
   pending?: Promise<void>;
 }
@@ -20,6 +23,7 @@ export interface ScheduledWorkStatus {
   lastStartedAtMs: number | null;
   lastFinishedAtMs: number | null;
   failed: boolean;
+  consecutiveFailures?: number;
   nextTickAtMs: number;
 }
 /** One process clock; independent jobs never overlap or delay each other's next admission. */
@@ -28,6 +32,7 @@ export class SyncClock {
   private readonly pending = new Set<Promise<void>>();
   private readonly timer: ReturnType<typeof setInterval>;
   private last: number;
+  private period = 0;
   private stopped = false;
   constructor(private readonly options: { intervalMs: () => number; now?: () => number }) {
     this.last = this.now();
@@ -43,6 +48,9 @@ export class SyncClock {
       throw new Error('INVALID_SYNC_INTERVAL');
     return value;
   }
+  periodNumber(): number {
+    return this.period;
+  }
   private run(job: Job, tick: SyncTick): Promise<void> | undefined {
     if (this.stopped || !job.active) return;
     if (job.running) {
@@ -54,12 +62,13 @@ export class SyncClock {
     const work = Promise.resolve()
       .then(() => {
         if (job.active && !this.stopped) return job.work(tick);
+        return syncSkipped;
       })
-      .then(() => {
-        job.failed = false;
+      .then((result) => {
+        if (result !== syncSkipped) job.consecutiveFailures = 0;
       })
       .catch((error) => {
-        job.failed = true;
+        job.consecutiveFailures++;
         console.warn(
           'Synchronization failed',
           job.name,
@@ -80,7 +89,10 @@ export class SyncClock {
     if (this.stopped) return;
     const tick = { nowMs: this.now(), intervalMs: this.intervalMs() };
     const due = tick.nowMs - this.last >= tick.intervalMs || tick.nowMs < this.last;
-    if (due) this.last = tick.nowMs;
+    if (due) {
+      this.last = tick.nowMs;
+      this.period++;
+    }
     for (const job of this.jobs) if (due || job.pulse) void this.run(job, tick);
   }
   subscribe(
@@ -97,7 +109,7 @@ export class SyncClock {
       pulse: options.everyPulse ?? false,
       lastStartedAtMs: null,
       lastFinishedAtMs: null,
-      failed: false,
+      consecutiveFailures: 0,
       skippedRuns: 0,
     };
     this.jobs.add(job);
@@ -132,7 +144,8 @@ export class SyncClock {
       running: job.running,
       lastStartedAtMs: job.lastStartedAtMs,
       lastFinishedAtMs: job.lastFinishedAtMs,
-      failed: job.failed,
+      failed: job.consecutiveFailures > 0,
+      consecutiveFailures: job.consecutiveFailures,
       nextTickAtMs: job.pulse ? this.now() + 250 : next,
     }));
   }

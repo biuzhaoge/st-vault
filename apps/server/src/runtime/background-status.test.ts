@@ -25,6 +25,26 @@ it('reports dormant client delivery when the last browser disconnects after a fa
   );
   expect(task).toMatchObject({ state: 'idle', error: null });
 });
+it('forwards a recorded sync failure after the server closes the last client', () => {
+  const value = input();
+  const client = { ...value.client, failed: true, consecutiveFailures: 2 };
+  expect(
+    backgroundOverview({ ...value, client }).find((entry) => entry.id === 'client-sync'),
+  ).toMatchObject({ state: 'retrying', error: 'client_sync_failed', consecutiveFailures: 2 });
+});
+it('forwards roster totals on the connected account task and preserves a verified empty roster', () => {
+  const value = input();
+  const account = { ...value.account, favoritesIndexCount: 0, pendingProfileCount: 0 };
+  const accountTask = (connected: boolean) =>
+    backgroundOverview({ ...value, account: { ...account, connected } }).find(
+      (task) => task.id === 'account-list',
+    );
+  expect(accountTask(true)?.accountRoster).toEqual({
+    favoritesIndexCount: 0,
+    pendingProfileCount: 0,
+  });
+  expect(accountTask(false)).not.toHaveProperty('accountRoster');
+});
 it('carries real screenshot execution capacity in the existing task row', () => {
   const tasks = backgroundOverview({
     ...input(),
@@ -65,6 +85,28 @@ it.each([
   expect(tasks.find((task) => task.id === 'site-access')).toMatchObject({
     state: 'error',
     error: expected,
+  });
+});
+it('reports the latest failed site round without requiring a confirmed transport outage', () => {
+  const value = input();
+  const origin = 'https://one.invalid';
+  const access = {
+    origin,
+    checkedAtMs: 1,
+    lastSuccessAtMs: 1,
+    error: null,
+    lastFailedRound: { atMs: 2, error: 'upstream-request', consecutiveFailures: 1 },
+  };
+  const tasks = backgroundOverview({
+    ...value,
+    account: { ...value.account, connected: true, origin },
+    sites: { selectedOrigin: origin, candidates: [], access },
+  });
+  expect(tasks.find((task) => task.id === 'site-access')).toMatchObject({
+    error: 'site_network_unavailable',
+    consecutiveFailures: 1,
+    lastRunAtMs: 2,
+    lastSuccessAtMs: 1,
   });
 });
 it('keeps domain failures and disabled policies authoritative over normal scheduling', () => {
@@ -235,6 +277,26 @@ it('reports the committed account binding, ignores old probe faults and preserve
     state: 'error',
     error: 'cookies_domain_mismatch',
     nextRunAtMs: null,
+  });
+});
+
+it('reports the retained following entries while keeping account errors authoritative', () => {
+  const value = input();
+  const account = { ...value.account, connected: true, pendingMissingCount: 18 };
+  const accountTask = (status: Parameters<typeof backgroundOverview>[0]['account']) =>
+    backgroundOverview({ ...value, account: status }).find((task) => task.id === 'account-list');
+  expect(accountTask(account)).toMatchObject({
+    state: 'waiting',
+    detail: 'account-roster-pending',
+    pending: 18,
+    error: null,
+  });
+  const expired = accountTask({ ...account, error: 'cookies_expired', needsReconnect: true });
+  expect(expired).toMatchObject({
+    state: 'error',
+    error: 'cookies_expired',
+    pending: undefined,
+    detail: 'account-reconnect',
   });
 });
 

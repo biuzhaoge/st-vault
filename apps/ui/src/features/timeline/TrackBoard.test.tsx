@@ -21,7 +21,12 @@ const subjects: Subject[] = Array.from({ length: 40 }, (_, index) => ({
   providerStatus: 'PUBLIC',
   observedAtMs: null,
 }));
-function render(selectedId: string | null = subjects[0].id, directory = subjects): string {
+function render(
+  selectedId: string | null = subjects[0].id,
+  directory = subjects,
+  onUnfollow?: (subject: Subject) => Promise<void>,
+  onOpenMonitor?: () => void,
+): string {
   return renderToStaticMarkup(
     <TrackBoard
       subjects={directory}
@@ -39,6 +44,8 @@ function render(selectedId: string | null = subjects[0].id, directory = subjects
       onViewChange={noop}
       onMove={noop}
       onRecordingChange={() => Promise.resolve()}
+      onUnfollow={onUnfollow}
+      onOpenMonitor={onOpenMonitor}
     />,
   );
 }
@@ -53,6 +60,17 @@ it('keeps the header outside the native row scroller so its scrollbar begins bel
   expect(html).toContain('<div class="directory"><button>account</button></div>');
   expect(html).toContain('<div class="time-control-strip"><div>filters</div>');
   expect(scroller).toContain('class="track-row selected"');
+});
+it('places the named monitor wall control after the view navigator in the same strip', () => {
+  const html = render(null, subjects, undefined, noop);
+  const start = html.indexOf('class="time-control-strip"');
+  const end = html.indexOf('class="time-ruler-row"');
+  const strip = html.slice(start, end);
+  expect(strip).toContain('aria-label="监控墙"');
+  expect(strip.indexOf('class="monitor-wall-trigger"')).toBeGreaterThan(
+    strip.indexOf('aria-label="后12小时"'),
+  );
+  expect(render()).not.toContain('class="monitor-wall-trigger"');
 });
 it('shows the selected subject range without a fixed-selection flag and hides it on disconnect', () => {
   expect(render()).toContain('data-selected-subject="stripchat:0"');
@@ -105,6 +123,39 @@ it('shows the same number without an interactive recording switch for archived r
   const html = render(null, [{ ...subjects[0], archived: true }]);
   expect(html).toContain('class="directory-row-number"');
   expect(html).not.toContain('class="recording-toggle record-button');
+});
+
+it('places a named unfollow control after the recording number and before the cover', () => {
+  const html = render(null, [{ ...subjects[0], unfollowBinding: 'fixture-binding' }], () =>
+    Promise.resolve(),
+  );
+  const index = html.indexOf('class="directory-row-number"');
+  const unfollow = html.indexOf('class="directory-unfollow-button"');
+  const cover = html.indexOf('class="track-cover-cell"');
+  expect(index).toBeGreaterThan(-1);
+  expect(unfollow).toBeGreaterThan(index);
+  expect(unfollow).toBeLessThan(cover);
+  expect(html).toContain('aria-label="取消关注 subject0"');
+});
+
+it('requires both an unfollow binding and an eligible directory row', () => {
+  const onUnfollow = () => Promise.resolve();
+  const row = { ...subjects[0], unfollowBinding: 'fixture-binding' };
+  expect(
+    render(null, [{ ...row, archived: true, archiveReason: 'account_disabled' }], onUnfollow),
+  ).toContain('class="directory-unfollow-button"');
+  expect(render(null, [row])).not.toContain('class="directory-unfollow-button"');
+  expect(render(null, [subjects[0]], onUnfollow)).not.toContain(
+    'class="directory-unfollow-button"',
+  );
+  for (const archiveReason of ['region_restricted', 'unfollowed', 'account_deleted'] as const) {
+    expect(render(null, [{ ...row, archived: true, archiveReason }], onUnfollow)).not.toContain(
+      'class="directory-unfollow-button"',
+    );
+  }
+  expect(render(null, [{ ...row, archiveReason: 'region_restricted' }], onUnfollow)).not.toContain(
+    'class="directory-unfollow-button"',
+  );
 });
 
 it('shows only the current name on the cover and keeps the tooltip free of former names', () => {

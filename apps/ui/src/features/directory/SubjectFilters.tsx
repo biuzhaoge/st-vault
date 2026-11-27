@@ -1,4 +1,4 @@
-import type { SubjectFilter } from './subjects';
+import type { SubjectCounts, SubjectFilter } from './subjects';
 import { tr } from '../../shared/lib/i18n';
 
 export function SubjectFilters({
@@ -8,7 +8,7 @@ export function SubjectFilters({
 }: {
   filters: readonly SubjectFilter[];
   onToggle: (value: SubjectFilter) => void;
-  counts: Record<SubjectFilter, number>;
+  counts: SubjectCounts;
 }): JSX.Element {
   const options: { id: SubjectFilter; label: string; compact: string }[] = [
     { id: 'ONLINE', label: tr('在线'), compact: tr('在线', { context: 'compact' }) },
@@ -26,7 +26,7 @@ export function SubjectFilters({
           title={
             item.id === 'ARCHIVED'
               ? tr(
-                  '归档包含已取关、断开账户或不在当前完整关注清单中的本地主播。已有录像仍可浏览，不再录制；临时网络或状态异常不会直接归档。',
+                  '封禁或取关的主播有录像时归入归档。地区受限且无法观测状态、平台已删除或断开账户后保留的主播也会归档。',
                 )
               : item.label
           }

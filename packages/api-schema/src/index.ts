@@ -26,8 +26,12 @@ export interface BackgroundTask {
   active?: number;
   limit?: number;
   failed?: number;
+  /** Completed failed synchronization rounds, distinct from the number of affected items. */
+  consecutiveFailures?: number;
   error?: string | null;
   detail?: string;
+  /** Most recently confirmed following totals for the account-list task. */
+  accountRoster?: Pick<AccountSyncStatus, 'favoritesIndexCount' | 'pendingProfileCount'>;
   /** Optional public endpoint label; never a credential, media URL or filesystem path. */
   target?: string;
 }
@@ -57,12 +61,13 @@ export interface SystemRetry {
 
 export interface SiteRoutesStatus {
   lastProbeAtMs?: number | null;
-  /** Observations from normal anonymous reads, never login-time benchmarks. */
+  /** Observations from normal site reads, excluding manual benchmarks. */
   access?: {
     origin: string;
     checkedAtMs: number | null;
     lastSuccessAtMs: number | null;
     error: string | null;
+    lastFailedRound?: { error: string; atMs: number; consecutiveFailures: number } | null;
   };
   probeProgress?: { completed: number; total: number; failed?: number };
   selectedOrigin: string | null;
@@ -110,6 +115,8 @@ export interface ArchiveHealthStatus {
 }
 
 export type PublicStatus = 'PUBLIC' | 'PRIVATE' | 'OFFLINE' | 'UNKNOWN';
+export type ArchiveReason =
+  'region_restricted' | 'account_disabled' | 'account_deleted' | 'unfollowed';
 /** Time spent in each observed state; UNKNOWN includes expired leases and unobserved gaps. */
 export interface StatusHistoryBucket {
   fromMs: number;
@@ -179,6 +186,11 @@ export interface RunHistoryResponse {
 }
 export type CaptureState = 'IDLE' | 'QUEUED' | 'RESOLVING' | 'CAPTURING' | 'BACKOFF' | 'STOPPING';
 export type TimeBasis = 'source-pdt' | 'estimated' | 'unknown';
+export interface SubjectDirectory {
+  group: 'ONLINE' | 'OFFLINE' | 'ARCHIVED';
+  orderStatus: PublicStatus;
+  pending: boolean;
+}
 export interface Subject {
   id: string;
   providerId: number;
@@ -187,8 +199,12 @@ export interface Subject {
   formerNames?: string[];
   monitorEnabled: boolean;
   autoRecord: boolean;
-  /** Previously imported from account favorites, absent from the latest complete sync. */
+  /** Removed from active monitoring after account reconciliation. */
   archived?: boolean;
+  /** A reported or previously verified archive reason. */
+  archiveReason?: ArchiveReason;
+  /** Account binding for unfollow requests from this directory result. */
+  unfollowBinding?: string;
   providerStatus: PublicStatus;
   /** Last confirmed state for list presentation, not fresh evidence for capture or history. */
   lastKnownStatus?: Exclude<PublicStatus, 'UNKNOWN'>;
@@ -202,6 +218,18 @@ export interface Subject {
   captureState?: CaptureState;
   captureError?: string | null;
   lastCapturedAtMs?: number | null;
+  directory?: SubjectDirectory;
+}
+export function subjectDirectory(subject: Subject): SubjectDirectory {
+  if (subject.directory) return subject.directory;
+  if (subject.archived) return { group: 'ARCHIVED', orderStatus: 'UNKNOWN', pending: false };
+  const pending = subject.providerStatus === 'UNKNOWN';
+  const orderStatus = pending ? (subject.lastKnownStatus ?? 'UNKNOWN') : subject.providerStatus;
+  return {
+    group: orderStatus === 'PUBLIC' || orderStatus === 'PRIVATE' ? 'ONLINE' : 'OFFLINE',
+    orderStatus,
+    pending,
+  };
 }
 export interface Segment {
   /** Read-model identity for archive navigation; not inferred from wall clock. */
@@ -481,6 +509,14 @@ export interface AccountSyncStatus {
   lastSuccessMs: number | null;
   nextAttemptMs: number | null;
   lastImportedCount: number | null;
+  /** Consecutive failed refresh attempts since this synchronization service started. */
+  consecutiveFailures?: number;
+  /** Previously followed broadcasters retained pending confirmation across syncs. */
+  pendingMissingCount?: number;
+  /** Unique model IDs confirmed by the account's complete favorites endpoint. */
+  favoritesIndexCount?: number;
+  /** IDs accepted from the roster that are still waiting for official profile data. */
+  pendingProfileCount?: number;
   error: string | null;
   profile?: AccountProfile | null;
 }

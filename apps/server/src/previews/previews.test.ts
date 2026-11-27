@@ -7,6 +7,7 @@ import type { DecodeInput } from './ffmpeg.js';
 import { SnapshotDecodeError } from './ffmpeg.js';
 
 const image = Buffer.from([255, 216, 255, 217]),
+  confirmedCoverUrl = 'https://static-cdn.strpst.com/previews/synthetic',
   cleanups: PreviewsPort[] = [];
 const addressOf = (address: URL | string | Request): string =>
   typeof address === 'string' ? address : address instanceof URL ? address.href : address.url;
@@ -53,6 +54,7 @@ function fixture(segments: Segment[]) {
         observedAtMs: 1,
       },
     ],
+    subjectPreview: vi.fn<() => Promise<string | null>>().mockResolvedValue(confirmedCoverUrl),
     locate: vi.fn(async (id: string, at: number, policy: string) => {
       expect(id).toBe('stripchat:42');
       return (
@@ -199,7 +201,7 @@ describe('bounded anonymous covers and recorded unit snapshots', () => {
     expect(f.archive.locate).not.toHaveBeenCalled();
     expect(f.decoder).not.toHaveBeenCalled();
   });
-  it('uses the public photographic preview saved during list sync before falling back to a square avatar', async () => {
+  it('uses the public photographic preview saved during list sync', async () => {
     const f = fixture([]),
       url = 'https://static-proxy.strpst.com/photos/synthetic',
       requests: string[] = [];
@@ -210,16 +212,14 @@ describe('bounded anonymous covers and recorded unit snapshots', () => {
         const address = addressOf(input);
         requests.push(address);
         expect(new Headers(init?.headers).has('cookie')).toBe(false);
-        return address.includes('/broadcasts/')
-          ? Response.json({ item: { status: 'off', isLive: false } })
-          : new Response(image);
+        return new Response(image);
       },
     });
     cleanups.push(previews);
     expect([...(await previews.cover('stripchat:42'))]).toEqual([...image]);
     expect(requests).toEqual([url]);
   });
-  it('uses only fixed anonymous status/snapshot URLs and a short controlled cover cache', async () => {
+  it('downloads the stored cover anonymously and serves subsequent reads from cache', async () => {
     const f = fixture([]),
       requests: string[] = [];
     const fetch = vi.fn(async (address: URL | string | Request, init?: RequestInit) => {
@@ -229,74 +229,61 @@ describe('bounded anonymous covers and recorded unit snapshots', () => {
       const headers = new Headers(init?.headers);
       expect(headers.has('cookie')).toBe(false);
       expect(headers.has('authorization')).toBe(false);
-      return url.includes('/broadcasts/')
-        ? Response.json({ item: { status: 'public', isLive: true, snapshotTimestamp: 123 } })
-        : new Response(image);
+      return new Response(image);
     });
     const previews = f.open({ fetch });
     expect([...(await previews.cover('stripchat:42'))]).toEqual([...image]);
     expect([...(await previews.cover('stripchat:42'))]).toEqual([...image]);
-    expect(fetch).toHaveBeenCalledTimes(2);
-    expect(requests).toEqual([
-      'https://stripchat.com/api/front/v2/broadcasts/42',
-      'https://img.doppiocdn.org/snapshot/42/123',
-    ]);
+    expect(fetch).toHaveBeenCalledOnce();
+    expect(requests).toEqual([confirmedCoverUrl]);
     await expect(previews.cover('stripchat:99')).rejects.toMatchObject({
       code: 'preview_not_found',
     });
   });
   it('serves public covers for private/offline states and never follows an arbitrary-host redirect', async () => {
-    for (const item of [
-      { status: 'private', isLive: true, snapshotTimestamp: 123 },
-      { status: 'groupShow', isLive: true, snapshotTimestamp: 123 },
-    ]) {
+    for (const providerStatus of ['PRIVATE', 'OFFLINE'] as const) {
       const f = fixture([]),
-        fetch = vi.fn(async (address: URL | string | Request) =>
-          addressOf(address).includes('/broadcasts/')
-            ? Response.json({ item })
-            : new Response(image),
-        ),
+        fetch = vi.fn(async () => new Response(image)),
         previews = f.open({ fetch });
+      const rows = await f.archive.listSubjects();
+      vi.spyOn(f.archive, 'listSubjects').mockResolvedValue(
+        rows.map((row) => ({ ...row, providerStatus })),
+      );
       expect([...(await previews.cover('stripchat:42'))]).toEqual([...image]);
-      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(fetch).toHaveBeenCalledOnce();
     }
     for (const host of ['arbitrary.invalid', 'stripchat.com']) {
       const f = fixture([]),
-        fetch = vi.fn(async (address: URL | string | Request) =>
-          addressOf(address).includes('/broadcasts/')
-            ? Response.json({ item: { status: 'public', isLive: true, snapshotTimestamp: 123 } })
-            : new Response(null, { status: 302, headers: { location: `https://${host}/image` } }),
+        fetch = vi.fn(
+          async () =>
+            new Response(null, { status: 302, headers: { location: `https://${host}/image` } }),
         );
       await expect(f.open({ fetch }).cover('stripchat:42')).rejects.toMatchObject({
         code: 'preview_not_found',
       });
-      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(fetch).toHaveBeenCalledOnce();
     }
   });
   it('does not replace an unavailable photographic cover with the unrelated square avatar', async () => {
-    for (const avatarUrl of [
-      'https://static-proxy.strpst.com/avatars/synthetic',
-      'https://127.0.0.1/private',
-    ]) {
-      const f = fixture([]),
-        urls: string[] = [],
-        fetch = vi.fn(async (address: URL | string | Request, init?: RequestInit) => {
-          const url = addressOf(address);
-          urls.push(url);
-          expect(new Headers(init?.headers).has('cookie')).toBe(false);
-          expect(new Headers(init?.headers).has('authorization')).toBe(false);
-          if (url.includes('/broadcasts/'))
-            return Response.json({ item: { status: 'off', isLive: false, snapshotTimestamp: 0 } });
-          if (url === 'https://stripchat.com/api/front/models/42')
-            return Response.json({ avatarUrl });
-          return new Response(image);
-        });
-      const previews = f.open({ fetch });
-      await expect(previews.cover('stripchat:42')).rejects.toMatchObject({
-        code: 'preview_not_found',
-      });
-      expect(urls).toEqual(['https://stripchat.com/api/front/v2/broadcasts/42']);
-    }
+    const f = fixture([]),
+      fetch = vi.fn(async () => new Response(image));
+    f.archive.subjectPreview.mockResolvedValue(null);
+    const previews = createPreviews({
+      archive: {
+        ...f.archive,
+        getSetting: async (key) =>
+          key === 'preview.avatar-source.stripchat:42'
+            ? 'https://static-proxy.strpst.com/avatars/synthetic'
+            : null,
+      },
+      decoder: f.decoder,
+      fetch,
+    });
+    cleanups.push(previews);
+    await expect(previews.cover('stripchat:42')).rejects.toMatchObject({
+      code: 'preview_not_found',
+    });
+    expect(fetch).not.toHaveBeenCalled();
   });
   it('accepts actual WebP and PNG signatures even under an inaccurate upstream MIME, expires cached covers and rejects text', async () => {
     // These synthetic bytes exercise format dispatch; no upstream media fixture.
@@ -308,27 +295,23 @@ describe('bounded anonymous covers and recorded unit snapshots', () => {
     for (const imageBytes of [webp, png]) {
       const f = fixture([]);
       let now = 1000;
-      const fetch = vi.fn(async (address: URL | string | Request) =>
-        addressOf(address).includes('/broadcasts/')
-          ? Response.json({ item: { status: 'public', isLive: true, snapshotTimestamp: 123 } })
-          : new Response(imageBytes, { headers: { 'content-type': 'application/octet-stream' } }),
+      const fetch = vi.fn(
+        async () =>
+          new Response(imageBytes, { headers: { 'content-type': 'application/octet-stream' } }),
       );
       const previews = f.open({ fetch, now: () => now });
       expect([...(await previews.cover('stripchat:42'))]).toEqual([...imageBytes]);
       now += 14999;
       await previews.cover('stripchat:42');
-      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(fetch).toHaveBeenCalledOnce();
       now += 2;
       await previews.cover('stripchat:42');
-      expect(fetch).toHaveBeenCalledTimes(4);
+      expect(fetch).toHaveBeenCalledTimes(2);
     }
     const f = fixture([]),
-      fetch = vi.fn(async (address: URL | string | Request) =>
-        addressOf(address).includes('/broadcasts/')
-          ? Response.json({ item: { status: 'public', isLive: true, snapshotTimestamp: 123 } })
-          : new Response('<html>not an image</html>', {
-              headers: { 'content-type': 'image/webp' },
-            }),
+      fetch = vi.fn(
+        async () =>
+          new Response('<html>not an image</html>', { headers: { 'content-type': 'image/webp' } }),
       );
     await expect(f.open({ fetch }).cover('stripchat:42')).rejects.toMatchObject({
       code: 'preview_not_found',
@@ -342,16 +325,11 @@ describe('bounded anonymous covers and recorded unit snapshots', () => {
     const gate = new Promise<void>((resolve) => {
       release = resolve;
     });
-    const fetch = vi.fn(async (address: URL | string | Request) => {
+    const fetch = vi.fn(async () => {
       active++;
       maximum = Math.max(maximum, active);
       try {
-        if (addressOf(address).includes('/broadcasts/')) {
-          await gate;
-          return Response.json({
-            item: { status: 'public', isLive: true, snapshotTimestamp: 123 },
-          });
-        }
+        await gate;
         return new Response(image);
       } finally {
         active--;
@@ -371,7 +349,7 @@ describe('bounded anonymous covers and recorded unit snapshots', () => {
       release?.();
       await Promise.all(requests);
       expect(maximum).toBe(2);
-      expect(fetch).toHaveBeenCalledTimes(4);
+      expect(fetch).toHaveBeenCalledTimes(2);
       expect([...(await previews.cover('stripchat:42'))]).toEqual([...image]);
     } finally {
       release?.();
@@ -386,13 +364,12 @@ describe('bounded anonymous covers and recorded unit snapshots', () => {
     });
     let active = 0,
       maximum = 0;
-    const fetch = vi.fn(async (address: URL | string | Request) => {
-      if (!addressOf(address).includes('/broadcasts/')) return new Response(image);
+    const fetch = vi.fn(async () => {
       active++;
       maximum = Math.max(maximum, active);
       try {
         await gate;
-        return Response.json({ item: { status: 'public', isLive: true, snapshotTimestamp: 123 } });
+        return new Response(image);
       } finally {
         active--;
       }

@@ -60,6 +60,7 @@ export function useWorkbenchPlayback(
   const coordinatorRef = useRef<PlaybackCoordinator<PlayerSource> | null>(null);
   coordinatorRef.current ??= new PlaybackCoordinator(closeSource);
   const coordinator = coordinatorRef.current;
+  const monitorRelease = useRef<Promise<void>>();
   const review = useReviewWindow(
     selectedId,
     selectedIdRef,
@@ -87,7 +88,7 @@ export function useWorkbenchPlayback(
   useSyncRefresh(
     ['playback'],
     async (signal) => {
-      if (!selectedId) return;
+      if (!selectedId || monitorRelease.current) return;
       const version = coordinator.stamp();
       const progress = await request<LiveProgress | null>(
         `/api/subjects/${encodeURIComponent(selectedId)}/live-progress`,
@@ -124,6 +125,15 @@ export function useWorkbenchPlayback(
     setTargetMs(null);
     closeReview();
   }, [invalidatePlayback, setTargetMs, closeReview]);
+  function trackMonitorRelease(released: Promise<void>): void {
+    const previous = monitorRelease.current;
+    const pending = previous ? Promise.all([previous, released]).then(() => undefined) : released;
+    monitorRelease.current = pending;
+    const clear = (): void => {
+      if (monitorRelease.current === pending) monitorRelease.current = undefined;
+    };
+    void pending.then(clear, clear);
+  }
   useEffect(
     () => () => {
       coordinator.invalidate();
@@ -241,6 +251,11 @@ export function useWorkbenchPlayback(
     const controller = coordinator.begin('playback');
     const version = coordinator.stamp();
     try {
+      if (utc === undefined && monitorRelease.current) {
+        // Monitor sessions still own live admission slots after the workbench returns.
+        await monitorRelease.current;
+        if (!coordinator.owns('playback', controller)) return;
+      }
       const result =
         utc === undefined
           ? await openLiveSource(
@@ -458,6 +473,7 @@ export function useWorkbenchPlayback(
     playSnapshot,
     onMediaDeletion,
     closePlayer,
+    trackMonitorRelease,
     position,
     restore,
     cursor,

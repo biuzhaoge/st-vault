@@ -5,7 +5,6 @@ import { expect, it, vi } from 'vitest';
 import { createSubjectAvatars } from './avatars.js';
 import type { Subject } from '@st-vault/api-schema';
 import { SyncClock } from '../runtime/sync-clock.js';
-import { SiteRoutes } from '../provider/site-routes.js';
 const urlOf = (url: string | URL | Request) =>
   typeof url === 'string' ? url : url instanceof URL ? url.href : url.url;
 it('drains all queued portraits in one heartbeat with bounded parallel downloads', async () => {
@@ -59,6 +58,7 @@ it('retries a failed portrait on the next heartbeat without another browser imag
   const fetch = vi
     .fn<typeof globalThis.fetch>()
     .mockResolvedValueOnce(new Response(null, { status: 503 }))
+    .mockResolvedValueOnce(new Response(null, { status: 502 }))
     .mockResolvedValueOnce(new Response(image));
   const settings = new Map([
     ['preview.avatar-source.stripchat:42', 'https://static-cdn.strpst.com/avatars/first'],
@@ -78,10 +78,25 @@ it('retries a failed portrait on the next heartbeat without another browser imag
   try {
     await service.read('stripchat:42');
     await service.refresh();
-    expect(service.status()).toMatchObject({ state: 'retrying', failed: 1 });
+    expect(service.status()).toMatchObject({
+      state: 'retrying',
+      failed: 1,
+      consecutiveFailures: 1,
+    });
     await service.refresh();
-    expect(fetch).toHaveBeenCalledTimes(2);
-    expect(service.status()).toMatchObject({ state: 'idle', failed: 0, error: null });
+    expect(service.status()).toMatchObject({
+      state: 'retrying',
+      failed: 1,
+      consecutiveFailures: 2,
+    });
+    await service.refresh();
+    expect(fetch).toHaveBeenCalledTimes(3);
+    expect(service.status()).toMatchObject({
+      state: 'idle',
+      failed: 0,
+      error: null,
+      consecutiveFailures: 0,
+    });
   } finally {
     await service.close();
     await rm(root, { recursive: true, force: true });
@@ -122,50 +137,39 @@ it('retains imported portraits across a temporary roster read failure', async ()
     await rm(root, { recursive: true, force: true });
   }
 });
-it('retains the bound avatar profile host on failure and uses a newly bound host after account change', async () => {
+it('waits for a stored portrait source before downloading an avatar', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'stv-avatar-sites-'));
   const image = Buffer.from([255, 216, 255, 217]);
+  const id = 'stripchat:42';
+  const source = 'https://static-cdn.strpst.com/avatars/frame';
+  const settings = new Map<string, string>();
   const fetch = vi.fn((input: string | URL | Request) => {
-    const url = new URL(urlOf(input));
-    return Promise.resolve(
-      url.hostname === 'stripchat.com'
-        ? new Response(null, { status: 503 })
-        : url.hostname === 'backup.invalid'
-          ? Response.json({
-              user: { user: { id: 42, avatarUrl: 'https://static-cdn.strpst.com/avatars/frame' } },
-            })
-          : new Response(image),
-    );
-  });
-  const sites = new SiteRoutes({
-    origins: ['https://stripchat.com', 'https://backup.invalid'],
-    fetch,
+    expect(urlOf(input)).toBe(source);
+    return Promise.resolve(new Response(image));
   });
   const service = createSubjectAvatars({
     root,
-    sites,
     fetch,
     archive: {
-      listSubjects: () => Promise.resolve([{ id: 'stripchat:42', providerId: 42 } as Subject]),
-      getSetting: () => Promise.resolve(null),
-      setSetting: () => Promise.resolve(),
+      listSubjects: () => Promise.resolve([{ id, providerId: 42 } as Subject]),
+      getSetting: (key) => Promise.resolve(settings.get(key) ?? null),
+      setSetting: (key, value) => {
+        settings.set(key, value);
+        return Promise.resolve();
+      },
     },
   });
   try {
-    await service.read('stripchat:42');
+    await service.read(id);
     await service.refresh();
-    expect(await service.read('stripchat:42')).toBeNull();
-    expect(sites.status().selectedOrigin).toBe('https://stripchat.com');
-    expect(
-      fetch.mock.calls.every(([input]) => new URL(urlOf(input)).hostname === 'stripchat.com'),
-    ).toBe(true);
-    sites.configure('https://backup.invalid');
-    await service.refresh();
-    expect(await service.read('stripchat:42')).toEqual(image);
-    expect(sites.status().selectedOrigin).toBe('https://backup.invalid');
+    expect(await service.read(id)).toBeNull();
+    expect(fetch).not.toHaveBeenCalled();
+    settings.set(`preview.avatar-source.${id}`, source);
+    await service.warm([id]);
+    expect(await service.read(id)).toEqual(image);
+    expect(fetch).toHaveBeenCalledOnce();
   } finally {
     await service.close();
-    sites.close();
     await rm(root, { recursive: true, force: true });
   }
 });
@@ -259,22 +263,15 @@ it('warms requested avatars, skips unchanged versions across restarts and retain
   }
 });
 
-it('resolves a missing portrait anonymously by stable id and rejects an unrelated profile or unsafe image source', async () => {
+it('rejects an unsafe stored portrait URL without making a network request', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'stv-avatar-profile-'));
-  let id = 99;
-  const fetch = vi.fn((url: string | URL | Request) =>
-    Promise.resolve(
-      urlOf(url).includes('/cam')
-        ? Response.json({ user: { user: { id, avatarUrl: 'https://attacker.invalid/portrait' } } })
-        : new Response('unexpected'),
-    ),
-  );
+  const fetch = vi.fn(() => Promise.resolve(new Response('unexpected')));
   const service = createSubjectAvatars({
     root,
     fetch,
     archive: {
       listSubjects: () => Promise.resolve([{ id: 'stripchat:42', providerId: 42 } as Subject]),
-      getSetting: () => Promise.resolve(null),
+      getSetting: () => Promise.resolve('https://attacker.invalid/portrait'),
       setSetting: () => Promise.resolve(),
     },
   });
@@ -282,14 +279,7 @@ it('resolves a missing portrait anonymously by stable id and rejects an unrelate
     await service.read('stripchat:42');
     await service.refresh();
     expect(await service.read('stripchat:42')).toBeNull();
-    id = 42;
-    await service.refresh();
-    expect(
-      fetch.mock.calls.every(
-        ([url]) => urlOf(url) === 'https://stripchat.com/api/front/v2/models/42/cam',
-      ),
-    ).toBe(true);
-    expect(await service.read('stripchat:42')).toBeNull();
+    expect(fetch).not.toHaveBeenCalled();
   } finally {
     await service.close();
     await rm(root, { recursive: true, force: true });

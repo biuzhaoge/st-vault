@@ -3,6 +3,32 @@ import { accountSiteOrigin, SiteRoutes } from './site-routes.js';
 import { ProviderError } from './http.js';
 const origins = ['https://one.invalid', 'https://two.invalid'];
 const decode = (text: string): { value: number } => JSON.parse(text) as { value: number };
+it('clears route observations without changing the bound host and ignores late old observations', async () => {
+  const fetch = vi
+    .fn<typeof globalThis.fetch>()
+    .mockImplementation(() => Promise.resolve(Response.json({ value: 1 })));
+  const routes = new SiteRoutes({ origins, fetch });
+  try {
+    routes.configure(origins[1]);
+    await routes.read('/api/front/test', decode);
+    const late = routes.beginAccess(origins[1]);
+    routes.resetTransport();
+    expect(routes.status()).toMatchObject({
+      selectedOrigin: origins[1],
+      access: { checkedAtMs: null, lastSuccessAtMs: null },
+    });
+    late();
+    expect(routes.status().access?.checkedAtMs).toBeNull();
+    await routes.read('/api/front/test', decode);
+    expect(routes.status().access?.lastSuccessAtMs).not.toBeNull();
+    expect(fetch.mock.calls.map(([address]) => address)).toEqual([
+      `${origins[1]}/api/front/test`,
+      `${origins[1]}/api/front/test`,
+    ]);
+  } finally {
+    routes.close();
+  }
+});
 it('keeps a manual health check failed until the expected site configuration actually loads', async () => {
   const fetch = vi
     .fn<typeof globalThis.fetch>()
@@ -70,26 +96,67 @@ it('recovers from an earlier concurrent failure using a newer successful request
 it('requires an independent retry before a transient failure can invalidate a healthy binding', async () => {
   let healthy = true;
   let now = 10000;
+  let period = 0;
   const routes = new SiteRoutes({
     origins,
     now: () => now,
+    observationPeriod: () => period,
     fetch: () =>
       healthy ? Promise.resolve(Response.json({ value: 1 })) : Promise.reject(new TypeError()),
   });
   try {
     await routes.read('/api/front/test', decode);
     healthy = false;
+    const fail = () =>
+      expect(routes.read('/api/front/test', decode)).rejects.toMatchObject({
+        code: 'upstream-request',
+      });
+    await fail();
+    expect(routes.status().access?.lastFailedRound).toBeNull();
+    period++;
     const burst = Array.from({ length: 8 }, () => routes.read('/api/front/test', decode));
     await Promise.allSettled(burst);
-    expect(routes.status().access).toMatchObject({ error: null, lastSuccessAtMs: now });
-    now += 5000;
-    await expect(routes.read('/api/front/test', decode)).rejects.toMatchObject({
-      code: 'upstream-request',
+    expect(routes.status().access).toMatchObject({
+      error: null,
+      lastSuccessAtMs: now,
+      lastFailedRound: { error: 'upstream-request', atMs: now, consecutiveFailures: 1 },
     });
+    now += 5000;
+    period++;
+    await fail();
     expect(routes.status().access?.error).toBe('upstream-request');
+    expect(routes.status().access?.lastFailedRound?.consecutiveFailures).toBe(2);
+    period++;
+    expect(routes.status().access?.lastFailedRound?.consecutiveFailures).toBe(2);
     healthy = true;
     await routes.read('/api/front/test', decode);
     expect(routes.status().access?.error).toBeNull();
+    expect(routes.status().access?.lastFailedRound).toBeNull();
+  } finally {
+    routes.close();
+  }
+});
+it('counts a late valid response from the same heartbeat even when a newer request fails first', async () => {
+  let resolveEarlier!: (response: Response) => void;
+  const earlier = new Promise<Response>((resolve) => {
+    resolveEarlier = resolve;
+  });
+  const fetch = vi
+    .fn<typeof globalThis.fetch>()
+    .mockReturnValueOnce(earlier)
+    .mockResolvedValueOnce(new Response(null, { status: 503 }));
+  const routes = new SiteRoutes({ origins, observationPeriod: () => 1, fetch });
+  try {
+    const successful = routes.read('/api/front/test', decode);
+    await expect(routes.read('/api/front/test', decode)).rejects.toMatchObject({ status: 503 });
+    expect(routes.status().access?.lastFailedRound?.consecutiveFailures).toBe(1);
+    resolveEarlier(Response.json({ value: 1 }));
+    await successful;
+    expect(routes.status().access).toMatchObject({
+      lastFailedRound: null,
+      error: 'upstream-http:503',
+    });
+    expect(routes.status().access?.lastSuccessAtMs).not.toBeNull();
   } finally {
     routes.close();
   }

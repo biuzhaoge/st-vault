@@ -14,7 +14,7 @@ function subject(id: number): Subject {
   };
 }
 
-function stateFor(subjects: Subject[]) {
+function stateFor(subjects: Subject[], archiveReason?: (row: Subject) => Subject['archiveReason']) {
   const revisions = { media: 1, events: 1, personal: 1 };
   const state = createSyncState({
     archive: {
@@ -34,10 +34,50 @@ function stateFor(subjects: Subject[]) {
         error: null,
       }),
     },
+    archiveReasons: archiveReason && { snapshot: () => archiveReason },
     keyCount: () => 0,
   });
   return { read: state.read, revisions };
 }
+
+it('refreshes the directory when an archive reason becomes known without modifying the timeline', async () => {
+  const subjects = [{ ...subject(1), providerStatus: 'UNKNOWN' as const, archived: true }];
+  const evidence: { reason?: Subject['archiveReason'] } = {};
+  const { read } = stateFor(subjects, () => evidence.reason);
+  const unconfirmed = await read();
+  evidence.reason = 'region_restricted';
+  const confirmed = await read();
+  expect(confirmed.subjects).not.toBe(unconfirmed.subjects);
+  expect(confirmed.timeline).toBe(unconfirmed.timeline);
+});
+
+it('will publish a stored unfollow even when a route observation still exists', async () => {
+  const archived: Subject = { ...subject(1), providerStatus: 'UNKNOWN', archived: true };
+  const { read } = stateFor([archived], () => 'region_restricted');
+  const before = await read();
+  archived.archiveReason = 'unfollowed';
+  const after = await read();
+  expect(after.subjects).not.toBe(before.subjects);
+  expect(after.subjects).toContain('unfollowed');
+  expect(after.timeline).toBe(before.timeline);
+});
+
+it('refreshes the directory and timeline when an unfollowed archive is purged', async () => {
+  const archived: Subject = {
+    ...subject(1),
+    providerStatus: 'UNKNOWN',
+    archived: true,
+    archiveReason: 'unfollowed',
+  };
+  const subjects = [subject(2), archived];
+  const { read } = stateFor(subjects);
+  const before = await read();
+  subjects.pop();
+  const after = await read();
+  expect(after.subjects).not.toBe(before.subjects);
+  expect(after.timeline).not.toBe(before.timeline);
+  expect(after.timelineSubjectIds).toBeUndefined();
+});
 
 it('scopes lease renewals and leaves media changes, roster changes and transitions broad', async () => {
   const subjects = [subject(1), subject(2)];

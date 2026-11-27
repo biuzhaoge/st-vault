@@ -13,12 +13,13 @@ import { createSupervisor } from './capture/supervisor.js';
 import { KeyVault } from './http/key-vault.js';
 import { buildApp } from './http/app.js';
 import { createShutdown, drainServices } from './runtime/lifecycle.js';
-import type { AccountSyncPort, ProviderPort, SupervisorPort } from './ports.js';
+import type { ProviderPort, SupervisorPort } from './ports.js';
 import { SettingsStore } from './runtime/settings.js';
+import { SocksProxySettings } from './runtime/socks-proxy.js';
 import { SyncClock } from './runtime/sync-clock.js';
 import { ResourceMonitor } from './runtime/resources.js';
 import { ArchiveHealthMonitor } from './runtime/archive-health.js';
-import { createAccountSync } from './account/account-sync.js';
+import { createAccountSync, type AccountSyncService } from './account/account-sync.js';
 import { createRunEvents } from './runtime/run-events.js';
 import { createPreviews } from './previews/index.js';
 import type { PreviewsPort } from './ports.js';
@@ -80,12 +81,14 @@ const runEvents = createRunEvents(
 let outcome: 'normal' | 'abnormal' = 'normal';
 let supervisor: SupervisorPort | undefined;
 let resources: ResourceMonitor | undefined;
-let accountSync: AccountSyncPort | undefined;
+let accountSync: AccountSyncService | undefined;
 let previews: PreviewsPort | undefined;
 let ingress: IngressHub | undefined;
 let statusEvidence: StatusEvidence | undefined;
 let archiveHealth: ArchiveHealthMonitor | undefined;
-const sites = new SiteRoutes();
+let boundSites: SiteRoutes | undefined;
+let proxySettings: SocksProxySettings | undefined;
+let detachProxy: (() => void) | undefined;
 let network: NetworkRouting | undefined;
 let app: Awaited<ReturnType<typeof buildApp>> | undefined;
 // The same ownership graph handles normal exit and partial initialization.
@@ -93,23 +96,28 @@ const stop = createShutdown({
   closeProducers: async () => {
     archiveHealth?.close();
     clock.stop();
-    sites.close();
-    await drainServices([
-      () => network?.close(),
-      () => runEvents.pause(),
-      () =>
-        app
-          ? app.close()
-          : drainServices([
-              () => supervisor?.close(),
-              () => accountSync?.close(),
-              () => previews?.close(),
-            ]),
-      () => ingress?.close(),
-      () => statusEvidence?.close(),
-      () => resources?.close(),
-      () => clock.close(),
-    ]);
+    boundSites?.close();
+    detachProxy?.();
+    try {
+      await drainServices([
+        () => network?.close(),
+        () => runEvents.pause(),
+        () =>
+          app
+            ? app.close()
+            : drainServices([
+                () => supervisor?.close(),
+                () => accountSync?.close(),
+                () => previews?.close(),
+              ]),
+        () => ingress?.close(),
+        () => statusEvidence?.close(),
+        () => resources?.close(),
+        () => clock.close(),
+      ]);
+    } finally {
+      await proxySettings?.close();
+    }
   },
   closeArchive: async () => {
     await runEvents.finish(outcome);
@@ -120,10 +128,22 @@ const stop = createShutdown({
 });
 try {
   const vault = await KeyVault.open(root, archive);
-  network = await NetworkRouting.open(archive, sites, { keyLookup: vault.lookup });
+  const socksProxy = (proxySettings = await SocksProxySettings.open(vault));
+  const fetch = socksProxy.fetch;
+  const transportSignal = () => socksProxy.signal();
+  const sites = (boundSites = new SiteRoutes({
+    fetch,
+    observationPeriod: () => clock.periodNumber(),
+  }));
+  network = await NetworkRouting.open(archive, sites, {
+    fetch,
+    transportSignal,
+    keyLookup: vault.lookup,
+  });
   // Restore the account origin before admitting any anonymous network workers.
   const upstream = createProvider({
     sites,
+    fetch,
     accountOrigin: accountSiteOrigin(process.env.STV_ACCOUNT_ORIGIN),
     onCoverObserved: (id, source) => previews?.observeCover?.(id, source),
   });
@@ -132,19 +152,24 @@ try {
     clock,
     archive,
     provider: upstream,
+    fetch,
+    transportSignal,
     supervisor: { reconcile: () => supervisor?.reconcile() ?? Promise.resolve() },
     vault,
     onImported: (ids) => previews?.warmSubjectImages?.(ids),
   });
-  const bindAccountSite = (): void =>
-    sites.configure(
-      accountSync!.status().origin ?? accountSiteOrigin(process.env.STV_ACCOUNT_ORIGIN),
-    );
+  const bindAccountSite = (): void => {
+    const origin =
+      accountSync!.status().origin ?? accountSiteOrigin(process.env.STV_ACCOUNT_ORIGIN);
+    const previous = sites.status().selectedOrigin;
+    sites.configure(origin);
+    if (origin !== previous) statusEvidence?.resetTransport();
+  };
   bindAccountSite();
   accountSync.subscribe?.(bindAccountSite);
   previews = createPreviews({
     ...execution.previews,
-    sites,
+    fetch,
     clock,
     archive,
     cacheRoot: path.join(root, 'jobs', libraryId),
@@ -180,6 +205,8 @@ try {
     persist: (id, status, at, lease, transitionAt) =>
       archive.setObservation(id, status, at, lease, transitionAt),
   }));
+  const proxyView = socksProxy.get();
+  if (proxyView.enabled || proxyView.error) evidence.resetTransport();
   const mediaMemoryBytes = ingressMemoryBytes(
     process.env.STV_INGRESS_MEMORY_MB,
     execution.memoryBytes,
@@ -193,6 +220,7 @@ try {
   );
   const sharedIngress = (ingress = createIngressHub({
     evidence,
+    fetch,
     maxBytes: mediaMemoryBytes,
     preferredCdn: network.preferredCdn,
     onCdnSelected: network.selectedCdn,
@@ -203,6 +231,13 @@ try {
     sourceCheckpoint: (id) => archive.sourceCheckpoint(id),
   }));
   network.subscribeCdn(() => sharedIngress.changeCdn());
+  const routing = network;
+  detachProxy = socksProxy.subscribe(() => {
+    sites.resetTransport();
+    routing.resetTransport();
+    evidence.resetTransport();
+    sharedIngress.changeCdn();
+  });
   const provider: ProviderPort = {
     ...upstream,
     capture: (subject, sink, signal) =>
@@ -236,8 +271,10 @@ try {
     supervisor,
     vault,
     accountSync,
+    openArchiveReasonProbe: accountSync.openArchiveReasonProbe,
     previews,
     settings,
+    socksProxy,
     resources,
     siteRoutes: () => sites.status(),
     network,

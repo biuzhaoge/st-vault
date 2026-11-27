@@ -17,6 +17,7 @@ import type {
   AccountSyncConfig,
   AccountSyncResult,
   AccountSyncStatus,
+  ArchiveReason,
   CaptureState,
   CoverageResponse,
   EventMeta,
@@ -40,6 +41,7 @@ import type {
   SnapshotItem,
   SnapshotJobsStatus,
 } from '@st-vault/api-schema';
+import type { ImportedAccount, ImportedAccountProfile } from './provider/account-profile.js';
 
 export const ARCHIVE_MEDIA_BATCH_LIMIT = 600;
 
@@ -49,6 +51,18 @@ export interface SubjectInput {
   handle: string;
   previewSourceUrl?: string;
   avatarSourceUrl?: string;
+  /** An ID whose official profile has not yet been loaded. */
+  subjectProfilePending?: true;
+  /** Explicit access or membership evidence from the authenticated provider. */
+  accountArchiveReason?: ArchiveReason;
+  /** A current, exact account response affirmatively reports a block. */
+  accountBlockedConfirmed?: true;
+  /** The current authenticated roster and card confirm unfollowing. */
+  accountUnfollowConfirmed?: true;
+  /** An exact current room response explicitly lifted the stored regional restriction. */
+  accountRegionCleared?: true;
+  /** Positive favorites evidence, with a previous archive awaiting accessibility confirmation. */
+  accountArchivePending?: true;
 }
 export interface CommitInput {
   subjectId: string;
@@ -70,6 +84,7 @@ export interface MediaObject {
 export type MediaChange =
   | { kind: 'commit'; segment: Segment }
   | { kind: 'delete'; subjectId: string; fromMs: number; toMs: number };
+export type UnfollowedSubjectResult = 'retained' | 'purged' | 'missing' | 'stale';
 export interface ArchivePort {
   /** Background source/maintenance reads must not consume playback execution reserves. */
   withBackgroundReads?<T>(action: () => Promise<T>): Promise<T>;
@@ -158,11 +173,47 @@ export interface ArchivePort {
   subscribeMedia?(listener: (change: MediaChange) => void): () => void;
   subjectPreview?(subjectId: string): Promise<string | null>;
   upsertSubjects(subjects: SubjectInput[], options?: { syncAccount?: boolean }): Promise<void>;
-  prepareAccountSubjects(subjects: SubjectInput[], generation: string): Promise<void>;
+  prepareAccountSubjects(
+    subjects: SubjectInput[],
+    generation: string,
+    resetUnfollows?: true,
+  ): Promise<void>;
   activateAccountSubjects(generation: string): Promise<void>;
   accountActivation(): Promise<string | null>;
+  addIndexedAccountSubjects?(
+    indexedIds: readonly number[],
+    generation: string,
+    signal?: AbortSignal,
+  ): Promise<number>;
+  followedAccountSubjects(includeUnassigned?: true): Promise<SubjectInput[]>;
+  archivedAccountSubjects(
+    afterProviderId: number,
+    limit: number,
+    matchingProviderIds?: readonly number[],
+  ): Promise<SubjectInput[]>;
   discardAccountPreparation(generation: string): Promise<void>;
-  listSubjects(options?: { activity?: false }): Promise<Subject[]>;
+  listSubjects(options?: { activity?: false; includeCleanup?: true }): Promise<Subject[]>;
+  recordVerifiedUnfollowed?(id: string, generation: string): Promise<UnfollowedSubjectResult>;
+  recordManualUnfollow?(
+    id: string,
+    generation: string,
+    removeFavorite: () => Promise<void>,
+  ): Promise<UnfollowedSubjectResult>;
+  recordVerifiedBlocked?(
+    id: string,
+    generation: string,
+    removeFavorite: () => Promise<void>,
+  ): Promise<UnfollowedSubjectResult>;
+  acceptedSubjectCleanupIds?(
+    afterProviderId: number,
+    limit: number,
+  ): Promise<{ id: string; providerId: number }[]>;
+  resumeAcceptedSubjectCleanup?(id: string, generation: string): Promise<UnfollowedSubjectResult>;
+  recordArchiveRestriction?(
+    id: string,
+    generation: string,
+    reason: Exclude<ArchiveReason, 'unfollowed'>,
+  ): Promise<boolean>;
   setGlobalRecording(enabled: boolean): Promise<string[]>;
   getSubject(id: string, options?: { activity?: false }): Promise<Subject | null>;
   setPolicy(
@@ -250,11 +301,12 @@ export interface CaptureSink {
   commit(input: CommitInput): Promise<Segment>;
 }
 export interface AccountSyncPort {
-  subscribe?(listener: () => void): () => void;
+  subscribe?(listener: (topic?: 'subjects') => void): () => void;
   status(): AccountSyncStatus;
   avatar?(signal?: AbortSignal): Promise<Uint8Array>;
   configure(config: AccountSyncConfig, signal?: AbortSignal): Promise<AccountSyncResult>;
   refresh(signal?: AbortSignal): Promise<AccountSyncResult>;
+  unfollow?(id: string, binding: string, signal?: AbortSignal): Promise<void>;
   disconnect(): Promise<AccountSyncConfig | null>;
   close(): Promise<void>;
 }
@@ -294,15 +346,35 @@ export interface PreviewsPort {
   observeCover?(subjectId: string, source: string | null): void;
   close(): Promise<void>;
 }
+export interface IndexedAccountSnapshot {
+  profile: ImportedAccountProfile;
+  indexedIds: readonly number[];
+}
+export interface AccountImportOptions {
+  onIndexed?: (snapshot: IndexedAccountSnapshot) => Promise<void>;
+  refreshProfiles?: boolean;
+}
 export interface ProviderPort {
   importList(cookiesText: string, signal?: AbortSignal): Promise<SubjectInput[]>;
+  unfollowAccountSubject?(
+    cookiesText: string,
+    origin: string,
+    expectedUsername: string,
+    providerId: number,
+    signal: AbortSignal,
+  ): Promise<void>;
   importAccount?(
     cookiesText: string,
     signal?: AbortSignal,
-  ): Promise<{
-    subjects: SubjectInput[];
-    profile: { username: string; followingCount: number; avatarSourceUrl: string | null };
-  }>;
+    onValidated?: () => void,
+    origin?: string,
+    known?: (username: string) => Promise<readonly SubjectInput[]>,
+    recover?: (
+      username: string,
+      indexedIds?: readonly number[],
+    ) => Promise<readonly SubjectInput[]>,
+    options?: AccountImportOptions,
+  ): Promise<ImportedAccount>;
   status(providerId: number, signal?: AbortSignal): Promise<PublicStatus>;
   capture(subject: Subject, sink: CaptureSink, signal: AbortSignal): Promise<void>;
 }

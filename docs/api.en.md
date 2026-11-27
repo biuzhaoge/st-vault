@@ -8,19 +8,26 @@ Except for health, static resources, and local login/setup entry points, busines
 
 ## Sessions and accounts
 
-| Method and path                        | Behavior                                                                                                         |
-| -------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| `GET /api/session`                     | Administrator authentication and setup stage                                                                     |
-| `POST /api/setup/session`              | Restricted setup authorization; legacy installations must verify the old password                                |
-| `POST /api/setup`                      | Complete setup with `{pin}`, without requiring a site account                                                    |
-| `POST /api/login` / `POST /api/logout` | PIN unlock / revoke current session                                                                              |
-| `GET /api/account-sync`                | Account metadata and sync status, without credentials                                                            |
-| `PUT /api/account-sync`                | Import `{cookiesText, origin}`                                                                                   |
-| `DELETE /api/account-sync`             | Disconnect and return `{status, draft}` with former `{cookiesText, origin}` or null. The response uses no-store. |
+| Method and path                          | Behavior                                                                                                                                                                     |
+| ---------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GET /api/session`                       | Administrator authentication and setup stage                                                                                                                                 |
+| `POST /api/setup/session`                | Restricted setup authorization; legacy installations must verify the old password                                                                                            |
+| `POST /api/setup`                        | Complete setup with `{pin}`, without requiring a site account                                                                                                                |
+| `POST /api/login` / `POST /api/logout`   | PIN unlock / revoke current session                                                                                                                                          |
+| `GET /api/account-sync`                  | Account metadata and sync status, without credentials                                                                                                                        |
+| `PUT /api/account-sync`                  | Import `{cookiesText, origin}`                                                                                                                                               |
+| `DELETE /api/account-sync`               | Disconnect and return `{status, draft}` with former `{cookiesText, origin}` or null. The response uses no-store.                                                             |
+| `DELETE /api/account-sync/favorites/:id` | Unfollow one broadcaster on the bound account and return `{subject}`. Returns the archived record when footage exists and `null` during or after cleanup of an empty record. |
 
 Setup authorization is only for completing the PIN, not account, media or settings access. There are no site-password login, verification-code task or direct following-list import endpoints. Accounts use pasted cookies only. See [http/app.ts](../apps/server/src/http/app.ts).
 
 Account endpoints require an unlocked administrator and return `Cache-Control: no-store, private`. Imports without an origin use the current source, or the default when disconnected. A connected domain is locked; updates for another domain return 409 `account_origin_locked`. Website probes obey the same connection lock. Disconnecting durably applies an empty following list, archives all broadcasters and stops recording; recovery continues after restart and existing recordings remain.
+
+Manual unfollow submits `{binding}` using `unfollowBinding` from the directory response. A request from a directory loaded for a previous account receives 409. The local membership changes after the original site acknowledges the request.
+
+After synchronization, `favoritesIndexCount` gives the number of unique IDs in the provider's favorites index. When present, `pendingProfileCount` gives the number of IDs still awaiting official profile data. The status panel shows pending profiles in Following sync. The broadcaster list filters show the group counts.
+
+When a connected account's heartbeat confirms a new following ID, `GET /api/subjects` can return the entry with a temporary `主播 #ID` label. The sync stream notifies the directory when the entry is available. The label and images are filled in as profile data arrives.
 
 ## Workbench and media
 
@@ -36,6 +43,8 @@ Account endpoints require an unlocked administrator and return `Cache-Control: n
 | Administration | system, settings, keys, me/favorites                                                                                                                    |
 
 `GET /api/subjects` can include `onlineSinceMs`, the earliest observed time in the latest continuous online session used to sort online rows. Adjacent public and private intervals belong to the same session. `lastOnlineAtMs` remains the start of the latest online status interval for offline and archived sorting.
+
+Each broadcaster's `directory` exposes its `group` (ONLINE, OFFLINE, or ARCHIVED), `orderStatus` and `pending` flag. `providerStatus` represents a current upstream broadcast observation. The group can retain `lastKnownStatus` after the observation expires. `archiveReason` describes an archived row. Followed region-restricted rows also expose `archiveReason: "region_restricted"` while remaining grouped by status. Confirmed unfollowed or blocked rows with no recordings are excluded while cleanup is pending.
 
 `GET /api/archive-calendar` returns `{emptyDays:[{fromMs,toMs}]}` as sorted half-open UTC ranges. Each range covers completed dates in the deployment zone with no playable recordings from any broadcaster. Consecutive empty dates are merged. The endpoint requires an administrator session and disables caching. Workbench and run-history reads allow up to eight UTC days of visible time. Recording bounds, playback, screenshot pages and bulk commands allow up to nine. For ranges crossing longer gaps the server verifies the visible duration against its archive calendar. The raw fragment list and the individual status-history and coverage endpoints retain their own wall-clock limits.
 
@@ -74,6 +83,8 @@ Hover previews use `GET /api/subjects/:id/snapshot-point?at=<milliseconds>` and 
 A `change` message can carry up to 64 `timelineSubjectIds` when the timeline changed only because observations renewed the same status. The scope applies to the `timeline` topic in that message. An absent scope refreshes the whole topic. Media revisions, confirmed transitions and changes to the subject roster still use broad invalidation.
 
 `GET /api/system` includes health, disk, recording and screenshots plus capturedAtMs, backgroundTasks and ingress. Each task has a stable id, group, state and optional last-run/success/next-run timestamps, processed/total/pending/failed counts. Without a total, clients must not invent a percentage. Target contains only public endpoint hostnames and latency, not credentials, media URLs or local paths. Ingress reports shared live broadcaster count, retained bytes and budget.
+
+Periodic data sync tasks can report `consecutiveFailures` for consecutive incomplete runs or repeated failed attempts on the same asset. The separate `failed` count tracks failed items. Reading system status leaves the counts unchanged. The following sync task reports `account-reconnect` in `detail` when its credentials need attention.
 
 `POST /api/system/retry` accepts `{target}` for one item, such as `cover-sync`, `disk-check`, or `deletion`. `GET /api/system` exposes the available independent actions in `retryableTargets`. An accepted attempt returns 202 with its state. A recovered item or one requiring external intervention returns 409 `system_retry_not_applicable`. Requests for the same running item or within five seconds share its attempt. Other items run independently. Use `retries` and sync notifications for progress and the item's diagnostic for recovery. A deletion retry rechecks storage and then wakes one bounded batch of already confirmed jobs. A recurring failure restores backoff.
 

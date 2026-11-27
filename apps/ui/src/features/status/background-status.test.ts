@@ -26,16 +26,92 @@ it('shows schedule, healthy cached images and disconnected account as independen
 
 it('keeps real failures and their reasons on the affected item', () => {
   const tasks = [
-    task('site-access', { state: 'error', error: 'site_unavailable' }),
-    task('account-list', { state: 'error', error: 'cookies_domain_mismatch' }),
-    task('cover-sync', { state: 'retrying', error: 'cover_refresh_partial' }),
+    task('site-access', { state: 'error', error: 'site_unavailable', consecutiveFailures: 3 }),
+    task('account-list', {
+      state: 'error',
+      error: 'cookies_domain_mismatch',
+      consecutiveFailures: 3,
+    }),
+    task('cover-sync', {
+      state: 'retrying',
+      error: 'cover_refresh_partial',
+      consecutiveFailures: 1,
+    }),
     task('avatar-sync', { state: 'idle' }),
   ];
   const rows = statusGroups(tasks, now).sync;
-  expect(rows.map((item) => item.value.tone)).toEqual(['error', 'error', 'warning', undefined]);
+  expect(rows.map((item) => item.value.tone)).toEqual(['error', 'error', undefined, undefined]);
   expect(rows[1].value.note).toContain('Cookies 与所选站点域名不匹配');
   expect(rows[2].value.note).toContain('下载失败');
   expect(backgroundTaskAlert(tasks)).toBe('绑定站点访问异常');
+});
+
+it('only raises a sync alert after three failed rounds and keeps the original reason', () => {
+  for (const consecutiveFailures of [undefined, 1, 2]) {
+    const cover = task('cover-sync', {
+      state: 'retrying',
+      error: 'cover_refresh_partial',
+      consecutiveFailures,
+      failed: 41,
+    });
+    expect(statusGroups([cover], now).sync[0].value).toEqual({
+      text: '本轮未完成',
+      note: '部分图片下载失败，已有图片继续使用。',
+    });
+    expect(backgroundTaskAlert([cover])).toBeUndefined();
+  }
+  const capture = task('capture-status', {
+    state: 'running',
+    consecutiveFailures: 3,
+    error: 'status_sync_failed',
+  });
+  const alarm = statusGroups([capture], now).sync[0].value;
+  expect(alarm).toMatchObject({ text: '异常', tone: 'error' });
+  expect(alarm.note).toContain('连续 3 轮未完成');
+  expect(backgroundTaskAlert([capture])).toBe('后台任务异常');
+  const recovered = { ...capture, state: 'waiting', consecutiveFailures: 0, error: null } as const;
+  expect(backgroundTaskAlert([recovered])).toBeUndefined();
+  expect(statusGroups([recovered], now).sync[0].value).toEqual({ text: '等待' });
+});
+
+it('keeps a stopped account connection actionable without promising a scheduled retry', () => {
+  const account = task('account-list', {
+    state: 'error',
+    detail: 'account-reconnect',
+    error: 'cookies_expired',
+    consecutiveFailures: 1,
+  });
+  const reconnect = statusGroups([account], now).sync[0].value;
+  expect(reconnect).toMatchObject({ text: '需要更新 Cookies', tone: 'warning' });
+  expect(reconnect.note).toContain('更新 Cookies');
+  expect(backgroundTaskAlert([account])).toBe('需要更新 Cookies');
+});
+
+it('explains how many followed broadcasters are retained while the list is rechecked', () => {
+  const account = task('account-list', { detail: 'account-roster-pending', pending: 18 });
+  expect(statusGroups([account], now).sync[0].value).toEqual({
+    text: '原站清单缺项 · 18 位主播',
+    tone: 'warning',
+    note: '已保留这些主播，清单同步会继续核实。',
+  });
+  expect(backgroundTaskAlert([account])).toBeUndefined();
+});
+
+it('shows pending profiles without repeating the following total', () => {
+  const account = task('account-list', {
+    detail: 'account-roster-pending',
+    pending: 18,
+    accountRoster: { favoritesIndexCount: 132, pendingProfileCount: 4 },
+  });
+  expect(statusGroups([account], now).sync[0].value).toEqual({
+    text: '原站清单缺项 · 18 位主播',
+    tone: 'warning',
+    note: '已保留这些主播，清单同步会继续核实。 待补资料 4',
+  });
+  const empty = task('account-list', {
+    accountRoster: { favoritesIndexCount: 0, pendingProfileCount: 0 },
+  });
+  expect(statusGroups([empty], now).sync[0].value.note).toBeUndefined();
 });
 
 it('keeps manual site testing separate and treats an unreadable task as unconfirmed', () => {

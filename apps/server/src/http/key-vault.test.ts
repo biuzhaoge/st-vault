@@ -133,4 +133,27 @@ describe('purpose-bound account credential encryption', () => {
     await archive.setSetting('private.sealed.account-sync', saved);
     expect(await vault.readSealedSecret('account-sync')).toBe('synthetic-cookie-secret');
   });
+  it('seals the SOCKS proxy configuration in its own authenticated private setting', async () => {
+    const { root, archive, vault } = await fixture();
+    const plain = JSON.stringify({
+      endpoint: 'socks5://fixture.invalid:1080',
+      password: 'fixture-only',
+    });
+    await vault.writeSealedSecret('account-sync', 'fixture account setting');
+    await vault.writeSealedSecret('socks-proxy', plain);
+    const sealed = (await archive.getSetting('private.sealed.socks-proxy'))!;
+    expect(sealed).not.toContain('fixture-only');
+    expect(sealed).not.toContain('fixture.invalid');
+    const reopened = await KeyVault.open(root, archive);
+    expect(await reopened.readSealedSecret('socks-proxy')).toBe(plain);
+    expect(await reopened.readSealedSecret('account-sync')).toBe('fixture account setting');
+    const envelope = JSON.parse(sealed) as Record<string, unknown>;
+    await archive.setSetting(
+      'private.sealed.account-sync',
+      JSON.stringify({ ...envelope, purpose: 'account-sync' }),
+    );
+    await expect(reopened.readSealedSecret('account-sync')).rejects.toThrow(
+      'SEALED_SECRET_INVALID',
+    );
+  });
 });

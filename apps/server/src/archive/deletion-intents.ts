@@ -169,7 +169,7 @@ export class DeletionIntents {
         .run(await publish(), id);
     return await this.get(id);
   }
-  async cleanup(): Promise<boolean> {
+  async cleanup(subject?: string): Promise<boolean> {
     return this.jobs.cleanup(async (id) => {
       const key = receiptKey(id);
       const intent = await this.db
@@ -184,7 +184,7 @@ export class DeletionIntents {
       await this.db
         .prepare('INSERT INTO settings(key,value) VALUES(?,?)')
         .run(key, JSON.stringify({ target: intent.target, job }));
-    });
+    }, subject);
   }
   /** Hidden units cannot be newly liked. Preserve only those exclusions which
    * an accepted unlike would otherwise remove, without scanning the delete

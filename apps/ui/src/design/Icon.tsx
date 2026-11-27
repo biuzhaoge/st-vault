@@ -15,6 +15,12 @@ const paths = {
       <path d="m15 10 6-4v12l-6-4Z" />
     </>
   ),
+  'monitor-wall': (
+    <>
+      <rect x="3" y="4" width="18" height="16" rx="3" />
+      <path d="M12 4v16M3 12h18" />
+    </>
+  ),
   'hard-drive': (
     <>
       <path d="m3 13 3-8h12l3 8" />

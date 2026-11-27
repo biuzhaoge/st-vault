@@ -16,6 +16,7 @@ import type {
   MediaDeletePlan,
   NetworkRoutesStatus,
   BackgroundTask,
+  Subject,
   SystemRetry,
   SystemRetryTarget,
 } from '@st-vault/api-schema';
@@ -23,7 +24,9 @@ import { SettingsStore } from '../runtime/settings.js';
 import { SiteRoutes } from '../provider/site-routes.js';
 import { NetworkRouting } from '../network/network-routing.js';
 import { ResourceMonitor } from '../runtime/resources.js';
+import { SyncClock } from '../runtime/sync-clock.js';
 import { ProviderError } from '../provider/http.js';
+import type { AccountSyncOptions } from '../account/account-sync.js';
 import { PreviewError } from '../previews/index.js';
 import type { LiveProxy } from '../live/index.js';
 import type { PersonalTimeline, SessionInfo } from '@st-vault/api-schema';
@@ -38,8 +41,9 @@ async function fixture(
   live?: LiveProxy,
   now?: () => number,
   archiveHealth?: Parameters<typeof buildApp>[0]['archiveHealth'],
-  _unused?: undefined,
+  archiveObservation?: Pick<Parameters<typeof buildApp>[0], 'clock' | 'openArchiveReasonProbe'>,
   initialized = true,
+  socksProxy?: Parameters<typeof buildApp>[0]['socksProxy'],
 ): Promise<{
   root: string;
   app: FastifyInstance;
@@ -118,6 +122,8 @@ async function fixture(
     live,
     now,
     archiveHealth,
+    socksProxy,
+    ...archiveObservation,
   });
   cleanups.push(async () => {
     await app.close();
@@ -131,6 +137,317 @@ async function fixture(
 }
 
 describe('server integration boundaries', () => {
+  it('notifies the directory as soon as the bound favorite index adds a subject', async () => {
+    let time = 2_000_000_000_000;
+    const now = () => time;
+    const clock = new SyncClock({ intervalMs: () => 300000, now });
+    const create = syncModule.createSyncHub;
+    const notify = vi.fn();
+    const hub = vi.spyOn(syncModule, 'createSyncHub').mockImplementation((options) => ({
+      ...create(options),
+      notify,
+    }));
+    let published!: () => void;
+    let release!: () => void;
+    const listed = new Promise<void>((resolve) => {
+      published = resolve;
+    });
+    const details = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let refresh: Promise<void> | undefined;
+    try {
+      const { app, cookie, provider } = await fixture(undefined, undefined, now, undefined, {
+        clock,
+      });
+      const existing = { id: 'stripchat:42', providerId: 42, handle: 'Existing' };
+      const newcomer = { id: 'stripchat:43', providerId: 43, handle: 'Newcomer' };
+      const profile = { username: 'fixture-account', followingCount: 1, avatarSourceUrl: null };
+      provider.importAccount = vi
+        .fn<NonNullable<ProviderPort['importAccount']>>()
+        .mockResolvedValueOnce({ subjects: [existing], profile })
+        .mockImplementationOnce(async (...args) => {
+          await args[6]?.onIndexed?.({ profile, indexedIds: [43] });
+          published();
+          await details;
+          return { subjects: [existing, newcomer], profile, unverifiedMissingCount: 1 };
+        });
+      const bound = await app.inject({
+        method: 'PUT',
+        url: '/api/account-sync',
+        headers: { cookie },
+        payload: { cookiesText: 'session=synthetic' },
+      });
+      expect(bound.statusCode).toBe(200);
+      const directory = async () =>
+        (await app.inject({ url: '/api/subjects', headers: { cookie } })).json<Subject[]>();
+      time += 300000;
+      refresh = clock.runNow('account-list');
+      await listed;
+      expect(notify).toHaveBeenCalledWith('subjects');
+      expect(await directory()).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ id: existing.id, handle: existing.handle, archived: false }),
+          expect.objectContaining({ id: newcomer.id, handle: '主播 #43', archived: false }),
+        ]),
+      );
+      release();
+      await refresh;
+      expect(await directory()).toEqual(
+        expect.arrayContaining([expect.objectContaining({ id: newcomer.id, handle: 'Newcomer' })]),
+      );
+    } finally {
+      release();
+      await refresh;
+      hub.mockRestore();
+      await clock.close();
+    }
+  });
+
+  it('authenticates manual unfollow and preserves recordings and protected regions', async () => {
+    const { app, archive, cookie, provider } = await fixture();
+    const accountProvider: AccountSyncOptions['provider'] = provider;
+    accountProvider.importAccount = vi.fn((cookiesText: string) =>
+      Promise.resolve({
+        subjects: [
+          { id: 'stripchat:42', providerId: 42, handle: 'empty' },
+          { id: 'stripchat:43', providerId: 43, handle: 'recorded' },
+          {
+            id: 'stripchat:44',
+            providerId: 44,
+            handle: 'regional',
+            accountArchiveReason: 'region_restricted' as const,
+            accountArchivePending: true as const,
+          },
+          { id: 'stripchat:45', providerId: 45, handle: 'followed by both accounts' },
+        ],
+        profile: {
+          username: cookiesText === 'session=second' ? 'second' : 'owner',
+          followingCount: 4,
+          avatarSourceUrl: null,
+        },
+      }),
+    );
+    const remove = vi
+      .fn<NonNullable<ProviderPort['unfollowAccountSubject']>>()
+      .mockResolvedValue(undefined);
+    accountProvider.unfollowAccountSubject = remove;
+    let binding = '';
+    const mutate = (id: number, headers?: { cookie: string; origin?: string }) =>
+      app.inject({
+        method: 'DELETE',
+        url: `/api/account-sync/favorites/stripchat:${id}`,
+        headers,
+        payload: { binding },
+      });
+    expect((await mutate(42)).statusCode).toBe(401);
+    expect((await mutate(42, { cookie, origin: 'https://cross-origin.invalid' })).statusCode).toBe(
+      403,
+    );
+    expect(
+      (
+        await app.inject({
+          method: 'PUT',
+          url: '/api/account-sync',
+          headers: { cookie },
+          payload: { cookiesText: 'session=synthetic' },
+        })
+      ).statusCode,
+    ).toBe(200);
+    const directory = (await app.inject({ url: '/api/subjects', headers: { cookie } })).json<
+      Subject[]
+    >();
+    binding = directory.find(({ id }) => id === 'stripchat:42')?.unfollowBinding ?? '';
+    expect(binding).toMatch(/^[a-f0-9]{64}$/);
+    const media = await archive.commit({
+      subjectId: 'stripchat:43',
+      sourceEpoch: 'retained',
+      sourceSequence: '1',
+      init: null,
+      bytes: new Uint8Array([1]),
+      durationSeconds: 1,
+      wallStartMs: 1000,
+      timeBasis: 'source-pdt',
+      uncertaintyMs: null,
+      discontinuity: false,
+    });
+    expect((await mutate(44, { cookie })).statusCode).toBe(409);
+    expect(remove).not.toHaveBeenCalled();
+    remove.mockRejectedValueOnce(new ProviderError('upstream-http', 400));
+    expect((await mutate(42, { cookie })).statusCode).toBe(502);
+    expect((await archive.getSubject('stripchat:42'))?.archived).toBe(false);
+
+    const deleted = await mutate(42, { cookie });
+    expect(deleted.statusCode).toBe(200);
+    expect(deleted.headers['cache-control']).toContain('no-store');
+    expect(deleted.json()).toEqual({ subject: null });
+    expect(
+      (await archive.listSubjects({ includeCleanup: true })).map(({ id }) => id),
+    ).not.toContain('stripchat:42');
+    const retained = await mutate(43, { cookie });
+    expect(retained.json()).toMatchObject({
+      subject: { archived: true, archiveReason: 'unfollowed' },
+    });
+    expect(await archive.hasMedia([media.mediaObjectId])).toBe(true);
+    expect(await archive.getSubject('stripchat:44')).toMatchObject({
+      archived: true,
+      archiveReason: 'region_restricted',
+    });
+    expect(remove.mock.calls.map((call) => call.slice(1, 4))).toEqual([
+      ['https://stripchat.com', 'owner', 42],
+      ['https://stripchat.com', 'owner', 42],
+      ['https://stripchat.com', 'owner', 43],
+    ]);
+    const replacement = await app.inject({
+      method: 'PUT',
+      url: '/api/account-sync',
+      headers: { cookie },
+      payload: { cookiesText: 'session=second' },
+    });
+    expect(replacement.statusCode).toBe(200);
+    expect((await archive.getSubject('stripchat:45'))?.archived).toBe(false);
+    const stale = await mutate(45, { cookie });
+    expect(stale.statusCode).toBe(409);
+    expect(stale.json()).toEqual({ error: 'account_unfollow_account_changed' });
+    expect(remove).toHaveBeenCalledTimes(3);
+  });
+
+  it('keeps SOCKS5 proxy settings in their authenticated private endpoint', async () => {
+    const initial = { enabled: false, endpoint: '', username: '', passwordSet: false };
+    const saved = {
+      enabled: true,
+      endpoint: 'socks5://proxy.test:1080',
+      username: 'fixture',
+      passwordSet: true,
+    };
+    const update = vi.fn(() => Promise.resolve(saved));
+    const socksProxy = { get: () => initial, update, signal: () => new AbortController().signal };
+    const { app, cookie } = await fixture(
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      true,
+      socksProxy,
+    );
+    const url = '/api/settings/socks-proxy';
+    const payload = {
+      enabled: true,
+      endpoint: saved.endpoint,
+      username: saved.username,
+      password: 'fixture-secret',
+    };
+
+    expect((await app.inject({ url })).statusCode).toBe(401);
+    expect(
+      (
+        await app.inject({
+          method: 'PUT',
+          url,
+          headers: { cookie, origin: 'https://cross-origin.invalid' },
+          payload,
+        })
+      ).statusCode,
+    ).toBe(403);
+    expect(update).not.toHaveBeenCalled();
+    const read = await app.inject({ url, headers: { cookie } });
+    expect(read.json()).toEqual(initial);
+    expect(read.headers['cache-control']).toContain('no-store');
+    const response = await app.inject({ method: 'PUT', url, headers: { cookie }, payload });
+    expect(response.json()).toEqual(saved);
+    expect(response.headers['cache-control']).toContain('no-store');
+    expect(update).toHaveBeenCalledExactlyOnceWith(payload);
+    const system = await app.inject({ url: '/api/system', headers: { cookie } });
+    expect(system.body).not.toContain(saved.endpoint);
+    expect(system.body).not.toContain(payload.password);
+  });
+
+  it('purges verified unfollows without footage and keeps recorded, disabled, and unverified archives', async () => {
+    let now = Date.now();
+    const clock = new SyncClock({ intervalMs: () => 60_000, now: () => now });
+    cleanups.push(() => clock.close());
+    const { app, archive, cookie, provider } = await fixture(
+      undefined,
+      undefined,
+      () => now,
+      undefined,
+      {
+        clock,
+        openArchiveReasonProbe: () => {
+          const reasons = new Map<number, Subject['archiveReason']>([
+            [21, 'account_disabled'],
+            [22, 'unfollowed'],
+            [23, 'unfollowed'],
+          ]);
+          return Promise.resolve((id) => Promise.resolve(reasons.get(id) ?? null));
+        },
+      },
+    );
+    await archive.upsertSubjects(
+      [
+        { id: 'stripchat:21', providerId: 21, handle: 'disabled-fixture' },
+        { id: 'stripchat:22', providerId: 22, handle: 'unfollowed-fixture' },
+        { id: 'stripchat:23', providerId: 23, handle: 'recorded-fixture' },
+        { id: 'stripchat:24', providerId: 24, handle: 'unverified-fixture' },
+      ],
+      { syncAccount: true },
+    );
+    await archive.commit({
+      subjectId: 'stripchat:23',
+      sourceEpoch: 'fixture',
+      sourceSequence: '1',
+      init: null,
+      bytes: new Uint8Array([1]),
+      durationSeconds: 2,
+      wallStartMs: 60_000,
+      timeBasis: 'source-pdt',
+      uncertaintyMs: 0,
+      discontinuity: false,
+    });
+    const connection = await app.inject({
+      method: 'PUT',
+      url: '/api/account-sync',
+      headers: { cookie },
+      payload: { cookiesText: 'session=fixture' },
+    });
+    expect(connection.statusCode).toBe(200);
+    await clock.runNow('archive-reasons');
+
+    const directory = (await app.inject({ url: '/api/subjects', headers: { cookie } })).json<
+      Subject[]
+    >();
+    expect(directory.find(({ providerId }) => providerId === 21)).toMatchObject({
+      archived: true,
+      archiveReason: 'account_disabled',
+    });
+    expect(directory.some(({ providerId }) => providerId === 22)).toBe(false);
+    expect(await archive.getSubject('stripchat:22')).toBeNull();
+    expect(directory.find(({ providerId }) => providerId === 23)).toMatchObject({
+      archived: true,
+      archiveReason: 'unfollowed',
+    });
+    expect(await archive.getSubject('stripchat:23')).toMatchObject({ archiveReason: 'unfollowed' });
+    expect((await archive.timeline('stripchat:23', 60_000, 62_000)).segments).toHaveLength(1);
+    expect(directory.find(({ providerId }) => providerId === 24)).toMatchObject({ archived: true });
+    const retired = await app.inject({
+      method: 'POST',
+      url: '/api/subjects/stripchat:24/confirm-unfollow',
+      headers: { cookie },
+      payload: { confirmed: true },
+    });
+    expect(retired.statusCode).toBe(404);
+    expect(await archive.getSubject('stripchat:24')).not.toBeNull();
+
+    vi.mocked(provider.importList).mockResolvedValueOnce([
+      { id: 'stripchat:42', providerId: 42, handle: 'Fixture' },
+      { id: 'stripchat:22', providerId: 22, handle: 'unfollowed-fixture' },
+    ]);
+    now += 60_001;
+    await clock.runNow('account-list');
+    expect(await archive.getSubject('stripchat:22')).toMatchObject({ archived: false });
+  });
+
   it('rebuilds snapshot preparation invalidated by a concurrent deletion and returns fresh coverage', async () => {
     const { app, archive, cookie } = await fixture();
     const id = 'stripchat:42';
@@ -2210,7 +2527,7 @@ describe('server integration boundaries', () => {
     ).toBe(401);
   });
 
-  it('adds public targets and applies batch policies atomically without an account', async () => {
+  it('applies batch policies atomically and rejects manual directory additions', async () => {
     const { app, archive, cookie } = await fixture();
     const add = await app.inject({
       method: 'POST',
@@ -2218,13 +2535,12 @@ describe('server integration boundaries', () => {
       headers: { cookie },
       payload: { providerId: 42 },
     });
-    expect(add.statusCode).toBe(201);
-    await app.inject({
-      method: 'POST',
-      url: '/api/subjects',
-      headers: { cookie },
-      payload: { providerId: 43, handle: 'Another' },
-    });
+    expect(add.statusCode).toBe(404);
+    expect(await archive.listSubjects()).toEqual([]);
+    await archive.upsertSubjects([
+      { id: 'stripchat:42', providerId: 42, handle: 'First' },
+      { id: 'stripchat:43', providerId: 43, handle: 'Another' },
+    ]);
     const bulk = await app.inject({
       method: 'PATCH',
       url: '/api/subjects/policies',

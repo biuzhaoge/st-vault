@@ -1,7 +1,7 @@
 /* eslint-disable @typescript-eslint/require-await -- Offline ports preserve their asynchronous production signatures. */
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { SyncClock } from '../runtime/sync-clock.js';
-import { createAccountSync } from './account-sync.js';
+import { createAccountSync, type AccountSyncOptions } from './account-sync.js';
 import type { AccountSyncPort, SubjectInput } from '../ports.js';
 import { ProviderError } from '../provider/http.js';
 import type { ImportedAccount } from '../provider/account-profile.js';
@@ -35,6 +35,10 @@ function fixture() {
       userId: 'fixture',
       timelineStartMs: 0,
     })),
+    followedAccountSubjects: vi.fn(async () => following),
+    archivedAccountSubjects: vi
+      .fn<AccountSyncOptions['archive']['archivedAccountSubjects']>()
+      .mockResolvedValue([]),
     prepareAccountSubjects: vi.fn(async (subjects: SubjectInput[], id: string) => {
       preparations.set(id, subjects);
     }),
@@ -67,16 +71,385 @@ function fixture() {
     following: () => following,
   };
 }
-async function open(f: ReturnType<typeof fixture>, timeoutMs = 120000): Promise<AccountSyncPort> {
+async function open(
+  f: ReturnType<typeof fixture>,
+  timeoutMs = 120000,
+  transportSignal?: () => AbortSignal,
+): Promise<AccountSyncPort> {
   const service = await createAccountSync({
     ...f,
     timeoutMs,
     startupDelayMs: 1000,
+    transportSignal,
   });
   cleanups.push(service);
   return service;
 }
+
+describe('account roster reconciliation', () => {
+  it('queues an archived room confirmed disabled behind a refresh and uses its active generation', async () => {
+    const f = fixture();
+    const profile = { username: 'fixture-account', followingCount: 0, avatarSourceUrl: null };
+    let release!: () => void;
+    let started!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const refreshing = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const importAccount = vi
+      .fn<NonNullable<AccountSyncOptions['provider']['importAccount']>>()
+      .mockResolvedValueOnce({ subjects: [], profile })
+      .mockImplementationOnce(async () => {
+        started();
+        await gate;
+        return { subjects: [], profile };
+      });
+    const removeFavorite = vi.fn(async () => undefined);
+    const openArchiveReasonProbe = vi.fn(async () =>
+      Object.assign(async () => 'account_disabled' as const, { unfollowBlocked: removeFavorite }),
+    );
+    const recordVerifiedBlocked = vi.fn(
+      async (_id: string, _generation: string, remove: () => Promise<void>) => {
+        await remove();
+        return 'purged' as const;
+      },
+    );
+    const service = await createAccountSync({
+      ...f,
+      archive: { ...f.archive, recordVerifiedBlocked },
+      provider: { ...f.provider, importAccount, openArchiveReasonProbe },
+    });
+    cleanups.push(service);
+    await service.configure({ cookiesText: 'synthetic' });
+    const before = await f.archive.accountActivation();
+    const signal = new AbortController().signal;
+    const refresh = service.refresh();
+    try {
+      await refreshing;
+      const probe = await service.openArchiveReasonProbe('https://stripchat.com', signal);
+      expect(await probe(42, signal)).toBe('account_disabled');
+      expect(probe.cleanupBlocked).toBeTypeOf('function');
+      const cleanup = probe.cleanupBlocked!('stripchat:42', 42, signal);
+      await tick();
+      expect(recordVerifiedBlocked).not.toHaveBeenCalled();
+      release();
+      await refresh;
+      expect(await cleanup).toBe('purged');
+      const active = await f.archive.accountActivation();
+      expect(active).not.toBe(before);
+      expect(recordVerifiedBlocked).toHaveBeenCalledWith(
+        'stripchat:42',
+        active,
+        expect.any(Function),
+      );
+      expect(removeFavorite).toHaveBeenCalledWith(42, expect.any(AbortSignal));
+
+      const unavailable = new ProviderError('upstream-http', 429);
+      removeFavorite.mockRejectedValueOnce(unavailable);
+      const retry = await service.openArchiveReasonProbe('https://stripchat.com', signal);
+      expect(await retry(42, signal)).toBe('account_disabled');
+      await expect(retry.cleanupBlocked!('stripchat:42', 42, signal)).rejects.toBe(unavailable);
+      expect(service.status().error).toBeNull();
+    } finally {
+      release();
+      await refresh;
+    }
+  });
+
+  it('publishes newly indexed IDs while a same-account refresh waits for profiles', async () => {
+    const f = fixture();
+    const existing = { id: 'stripchat:42', providerId: 42, handle: 'Existing' };
+    const newcomer = { id: 'stripchat:43', providerId: 43, handle: 'Newcomer' };
+    const profile = { username: 'fixture-account', followingCount: 2, avatarSourceUrl: null };
+    let published!: () => void;
+    let release!: () => void;
+    const indexed = new Promise<void>((resolve) => {
+      published = resolve;
+    });
+    const details = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const addIndexedAccountSubjects = vi.fn().mockResolvedValue(1);
+    const importAccount = vi
+      .fn<NonNullable<AccountSyncOptions['provider']['importAccount']>>()
+      .mockResolvedValueOnce({ subjects: [existing], profile })
+      .mockImplementationOnce(async (...args) => {
+        await args[6]?.onIndexed?.({ profile, indexedIds: [42, 43] });
+        published();
+        await details;
+        return { subjects: [existing, newcomer], profile };
+      });
+    const service = await createAccountSync({
+      ...f,
+      archive: { ...f.archive, addIndexedAccountSubjects },
+      provider: { ...f.provider, importAccount },
+    });
+    cleanups.push(service);
+    await service.configure({ cookiesText: 'synthetic' });
+    const listener = vi.fn();
+    service.subscribe?.(listener);
+    const generation = await f.archive.accountActivation();
+    const refresh = service.refresh();
+    try {
+      await indexed;
+      expect(addIndexedAccountSubjects).toHaveBeenCalledWith(
+        [42, 43],
+        generation,
+        expect.any(AbortSignal),
+      );
+      expect(listener).toHaveBeenCalledWith('subjects');
+      expect(f.following()).toEqual([existing]);
+    } finally {
+      release();
+      await refresh;
+    }
+    expect(f.following()).toEqual([existing, newcomer]);
+  });
+
+  it('refreshes full profiles on a slower cadence while keeping the roster heartbeat', async () => {
+    vi.useFakeTimers();
+    const first = 2_000_000_000_000;
+    vi.setSystemTime(first);
+    const f = fixture();
+    const importAccount = vi
+      .fn<NonNullable<AccountSyncOptions['provider']['importAccount']>>()
+      .mockResolvedValue({
+        subjects: [],
+        profile: { username: 'fixture-account', followingCount: 0, avatarSourceUrl: null },
+      });
+    const service = await createAccountSync({ ...f, provider: { ...f.provider, importAccount } });
+    cleanups.push(service);
+    await service.configure({ cookiesText: 'synthetic' });
+    expect(importAccount.mock.calls.map((args) => args[6]?.refreshProfiles)).toEqual([true]);
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(importAccount.mock.calls.map((args) => args[6]?.refreshProfiles)).toEqual([true, false]);
+    vi.setSystemTime(first + 5 * 60_000);
+    await f.clock.runNow('account-list');
+    expect(importAccount.mock.calls.map((args) => args[6]?.refreshProfiles)).toEqual([
+      true,
+      false,
+      true,
+    ]);
+  });
+
+  it('keeps the bound roster if an ordinary refresh reports a different owner', async () => {
+    const f = fixture();
+    const existing = { id: 'stripchat:42', providerId: 42, handle: 'Existing' };
+    const profile = { username: 'fixture-account', followingCount: 1, avatarSourceUrl: null };
+    const other = { ...profile, username: 'other-account' };
+    const addIndexedAccountSubjects = vi.fn().mockResolvedValue(1);
+    const importAccount = vi
+      .fn<NonNullable<AccountSyncOptions['provider']['importAccount']>>()
+      .mockResolvedValueOnce({ subjects: [existing], profile })
+      .mockImplementationOnce(async (...args) => {
+        await args[6]?.onIndexed?.({ profile: other, indexedIds: [43] });
+        return { subjects: [], profile: other };
+      });
+    const service = await createAccountSync({
+      ...f,
+      archive: { ...f.archive, addIndexedAccountSubjects },
+      provider: { ...f.provider, importAccount },
+    });
+    cleanups.push(service);
+    await service.configure({ cookiesText: 'synthetic' });
+    await expect(service.refresh()).rejects.toMatchObject({ code: 'list_import_failed' });
+    expect(addIndexedAccountSubjects).not.toHaveBeenCalled();
+    expect(f.following()).toEqual([existing]);
+    expect(service.status().profile?.username).toBe(profile.username);
+  });
+
+  it('stages the provider-verified roster and reports any missing subjects held for verification', async () => {
+    const f = fixture();
+    const present = { id: 'stripchat:42', providerId: 42, handle: 'Present' };
+    const held = { id: 'stripchat:43', providerId: 43, handle: 'Held' };
+    const removed = { id: 'stripchat:44', providerId: 44, handle: 'Unfollowed' };
+    const profile = { username: 'fixture-account', followingCount: 3, avatarSourceUrl: null };
+    const importAccount =
+      vi.fn<
+        (
+          cookies: string,
+          signal?: AbortSignal,
+          onValidated?: () => void,
+          origin?: string,
+          known?: (username: string) => Promise<readonly SubjectInput[]>,
+        ) => Promise<ImportedAccount>
+      >();
+    importAccount.mockImplementationOnce(async (...args) => {
+      expect(await args[4]!(profile.username)).toEqual([]);
+      return { subjects: [present, held, removed], profile };
+    });
+    const service = await createAccountSync({ ...f, provider: { ...f.provider, importAccount } });
+    cleanups.push(service);
+    await service.configure({ cookiesText: 'synthetic-A' });
+    expect(importAccount).toHaveBeenLastCalledWith(
+      'synthetic-A',
+      expect.any(AbortSignal),
+      expect.any(Function),
+      'https://stripchat.com',
+      expect.any(Function),
+      expect.any(Function),
+      expect.objectContaining({ refreshProfiles: true }),
+    );
+
+    importAccount.mockImplementationOnce(async (...args) => {
+      expect(await args[4]!(profile.username)).toEqual([present, held, removed]);
+      return { subjects: [present, held], profile, unverifiedMissingCount: 1 };
+    });
+    expect(await service.refresh()).toMatchObject({
+      imported: 1,
+      status: { pendingMissingCount: 1, error: null, needsReconnect: false },
+    });
+    expect(importAccount).toHaveBeenLastCalledWith(
+      'synthetic-A',
+      expect.any(AbortSignal),
+      expect.any(Function),
+      'https://stripchat.com',
+      expect.any(Function),
+      expect.any(Function),
+      expect.objectContaining({ refreshProfiles: true }),
+    );
+    expect(f.following()).toEqual([present, held]);
+    importAccount.mockResolvedValueOnce({ subjects: [present, held], profile });
+    expect((await service.refresh()).status.pendingMissingCount).toBeUndefined();
+    const nextProfile = { ...profile, username: 'next-owner' };
+    importAccount.mockImplementationOnce(async (...args) => {
+      expect(await args[4]!(nextProfile.username)).toEqual([]);
+      return { subjects: [present], profile: nextProfile };
+    });
+    await service.configure({ cookiesText: 'synthetic-B' });
+    expect(f.following()).toEqual([present]);
+    await service.disconnect();
+    expect(f.following()).toEqual([]);
+  });
+
+  it('rotates bounded archived candidates and starts over when the roster reaches the end', async () => {
+    const f = fixture();
+    const candidates = [1, 2, 3, 4, 5].map((providerId) => ({
+      id: `stripchat:${providerId}`,
+      providerId,
+      handle: `archived-${providerId}`,
+    }));
+    f.archive.archivedAccountSubjects.mockImplementation(async (cursor, limit) =>
+      candidates.filter(({ providerId }) => providerId > cursor).slice(0, limit),
+    );
+    const profile = { username: 'fixture-account', followingCount: 0, avatarSourceUrl: null };
+    const importAccount = vi.fn<NonNullable<AccountSyncOptions['provider']['importAccount']>>(
+      async (_cookies, _signal, _onValidated, _origin, _known, recover) => {
+        await recover?.(profile.username);
+        return { subjects: [], profile };
+      },
+    );
+    const service = await createAccountSync({ ...f, provider: { ...f.provider, importAccount } });
+    cleanups.push(service);
+    await service.configure({ cookiesText: 'synthetic-A' });
+    await service.refresh();
+    await service.refresh();
+    expect(f.archive.archivedAccountSubjects.mock.calls).toEqual([
+      [0, 4],
+      [4, 4],
+      [0, 4],
+    ]);
+  });
+
+  it('includes indexed archived IDs outside the rotation and publishes roster counts', async () => {
+    const f = fixture();
+    const old = { id: 'stripchat:1', providerId: 1, handle: 'old' };
+    const indexed = { id: 'stripchat:9', providerId: 9, handle: 'indexed' };
+    const pending = { id: 'stripchat:15', providerId: 15, handle: '主播 #15' };
+    const importAccount = vi.fn<NonNullable<AccountSyncOptions['provider']['importAccount']>>(
+      async (_cookies, _signal, _onValidated, _origin, _known, recover) => {
+        expect(await recover?.('fixture-account', [9, 15])).toEqual([old, indexed]);
+        return {
+          subjects: [
+            indexed,
+            { ...pending, subjectProfilePending: true },
+            { ...old, accountArchiveReason: 'region_restricted' },
+          ],
+          profile: { username: 'fixture-account', followingCount: 2, avatarSourceUrl: null },
+          indexCount: 2,
+          verifiedFollowingCount: 2,
+          unresolvedProfileCount: 1,
+        };
+      },
+    );
+    f.archive.archivedAccountSubjects.mockImplementation(async (_cursor, _limit, ids) =>
+      ids ? [indexed] : [old],
+    );
+    const service = await createAccountSync({ ...f, provider: { ...f.provider, importAccount } });
+    cleanups.push(service);
+    await expect(service.configure({ cookiesText: 'synthetic-A' })).resolves.toMatchObject({
+      imported: 2,
+      status: { favoritesIndexCount: 2, pendingProfileCount: 1 },
+    });
+    await service.disconnect();
+    expect(service.status()).not.toHaveProperty('favoritesIndexCount');
+    expect(service.status()).not.toHaveProperty('pendingProfileCount');
+  });
+});
+
 describe('persistent account synchronization', () => {
+  it('cancels an old transport import without treating its response as a credential failure', async () => {
+    const f = fixture();
+    let transport = new AbortController();
+    const service = await open(f, undefined, () => transport.signal);
+    await service.configure({ cookiesText: 'synthetic-A' });
+    let finish!: (value: SubjectInput[]) => void;
+    const oldImport = new Promise<SubjectInput[]>((resolve) => (finish = resolve));
+    f.provider.importList.mockReturnValueOnce(oldImport);
+    const pending = service.refresh();
+    const outcome = pending.catch((error: unknown) => error);
+    try {
+      await vi.waitFor(() => expect(f.provider.importList).toHaveBeenCalledTimes(2));
+      const signal = f.provider.importList.mock.calls[1][1];
+      transport.abort();
+      transport = new AbortController();
+      expect(signal?.aborted).toBe(true);
+      finish([{ id: 'stripchat:84', providerId: 84, handle: 'old-route' }]);
+      expect(await outcome).toMatchObject({ code: 'account_sync_cancelled' });
+      expect(f.following().map((row) => row.id)).toEqual(['stripchat:42']);
+      expect(service.status()).toMatchObject({ needsReconnect: false, error: null });
+      await service.refresh();
+      expect(f.provider.importList.mock.calls[2][1]?.aborted).toBe(false);
+    } finally {
+      finish([]);
+      await outcome;
+    }
+  });
+
+  it('rechecks the transport immediately before accepting prepared account membership', async () => {
+    const f = fixture();
+    let transport = new AbortController();
+    const service = await open(f, undefined, () => transport.signal);
+    await service.configure({ cookiesText: 'synthetic-A' });
+    const prepare = f.archive.prepareAccountSubjects.getMockImplementation()!;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    f.provider.importList.mockResolvedValueOnce([
+      { id: 'stripchat:84', providerId: 84, handle: 'old-route' },
+    ]);
+    f.archive.prepareAccountSubjects.mockImplementationOnce(async (...args) => {
+      await gate;
+      await prepare(...args);
+    });
+    const outcome = service.refresh().catch((error: unknown) => error);
+    try {
+      await vi.waitFor(() => expect(f.archive.prepareAccountSubjects).toHaveBeenCalledTimes(2));
+      transport.abort();
+      transport = new AbortController();
+      release();
+      expect(await outcome).toMatchObject({ code: 'account_sync_cancelled' });
+      expect(f.archive.activateAccountSubjects).toHaveBeenCalledOnce();
+      expect(f.archive.discardAccountPreparation).toHaveBeenCalledOnce();
+      expect(f.following().map((row) => row.id)).toEqual(['stripchat:42']);
+      expect(service.status()).toMatchObject({ needsReconnect: false, error: null });
+    } finally {
+      release();
+      await outcome;
+    }
+  });
+
   it('does not publish membership when cancellation arrives during preparation', async () => {
     const f = fixture(),
       service = await open(f);
@@ -543,6 +916,7 @@ describe('persistent account synchronization', () => {
       needsReconnect: false,
       error: 'account_access_denied',
       nextAttemptMs: Date.now() + 5000,
+      consecutiveFailures: 1,
     });
     await first.close();
     await vi.advanceTimersByTimeAsync(1000);
@@ -555,6 +929,7 @@ describe('persistent account synchronization', () => {
       error: 'list_import_failed',
       needsReconnect: false,
       nextAttemptMs: Date.now() + 5000,
+      consecutiveFailures: 1,
     });
     await resumed.close();
     await vi.advanceTimersByTimeAsync(6000);
@@ -565,6 +940,24 @@ describe('persistent account synchronization', () => {
     expect(f.provider.importList).toHaveBeenCalledTimes(3);
     await vi.advanceTimersByTimeAsync(3000);
     expect(f.provider.importList).toHaveBeenCalledTimes(4);
+    expect(overdue.status().consecutiveFailures).toBe(0);
+  });
+  it('counts only completed roster refreshes and resets after a successful interval', async () => {
+    vi.useFakeTimers();
+    const f = fixture();
+    const service = await open(f);
+    await service.configure({ cookiesText: 'synthetic-valid' });
+    f.provider.importList
+      .mockRejectedValueOnce(new ProviderError('upstream-http', 503))
+      .mockRejectedValueOnce(new ProviderError('upstream-http', 502));
+    let previousFailures = 0;
+    for (const consecutiveFailures of [1, 2, 0]) {
+      await vi.advanceTimersByTimeAsync(4000);
+      expect(service.status().consecutiveFailures).toBe(previousFailures);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(service.status().consecutiveFailures).toBe(consecutiveFailures);
+      previousFailures = consecutiveFailures;
+    }
   });
   it('coalesces manual refresh and holds single flight through timeout and delayed importer cleanup', async () => {
     vi.useFakeTimers();
@@ -664,7 +1057,7 @@ describe('persistent account synchronization', () => {
     release?.();
     await deleting;
     await tick();
-    expect(f.archive.prepareAccountSubjects).toHaveBeenCalledWith([], expect.any(String));
+    expect(f.archive.prepareAccountSubjects).toHaveBeenCalledWith([], expect.any(String), true);
     expect(f.saved()).toBeNull();
     expect(service.status()).toMatchObject({
       connected: false,
@@ -1013,6 +1406,9 @@ it('pins a validated account source across refreshes and restarts', async () => 
     expect.any(AbortSignal),
     expect.any(Function),
     'https://stripchat.org',
+    expect.any(Function),
+    expect.any(Function),
+    expect.objectContaining({ refreshProfiles: true }),
   );
   await service.close();
   const restarted = await createAccountSync({

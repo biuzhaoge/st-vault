@@ -1,4 +1,4 @@
-import type { UnitSeenEvidence } from '@st-vault/api-schema';
+import type { ArchiveReason, UnitSeenEvidence } from '@st-vault/api-schema';
 import type * as MetadataPolicyModule from './metadata-policy.js';
 import type {
   MediaSelectionMode,
@@ -19,6 +19,15 @@ import { FileLease } from '../database/file-lease.js';
 import { deploymentTimeZone } from '../runtime/time-zone.js';
 import { readStatusHistory } from './status-history.js';
 import { createCoverageReader, MINUTE, readWorkbenchHistory } from './coverage-reader.js';
+import {
+  archiveRestrictionPrefix,
+  blockedUnfollowPrefix,
+  hasSubjectFootage,
+  previewSettingSubject,
+  unfollowedPrefix,
+  UnfollowedSubjects,
+  verifiedUnfollowPrefix,
+} from './unfollowed-subjects.js';
 import type { SQLInputValue } from '../database/sql.js';
 import { join } from 'node:path';
 import { lstatSync, mkdirSync } from 'node:fs';
@@ -69,6 +78,9 @@ const { readEmptyDays, pruneEmptyHistory } = (await import(
 // for directory sorting, even when thousands of source fragments are hidden.
 // The status-interval end index finds each adjacent online predecessor. A mode
 // change continues the observed session; an OFFLINE interval or a gap ends it.
+const cleanupPending = `CASE WHEN a.following=0 AND
+  ((ar.value IS NULL AND uf.value='1' AND vu.value='accepted') OR (ar.value='account_disabled' AND bu.value IS NOT NULL))
+  THEN NOT ${hasSubjectFootage} ELSE false END`;
 const subjectSelect = (activity = true): string => `SELECT s.*,
   ${
     activity
@@ -98,9 +110,16 @@ const subjectSelect = (activity = true): string => `SELECT s.*,
   }
   (SELECT coalesce(json_agg(handle)::text,'[]') FROM
     (SELECT handle FROM subject_name_history WHERE subject=s.id AND handle<>s.handle ORDER BY changed_at DESC,handle)) AS former_names,
-  h.valid_until AS status_valid_until,a.following AS account_following,e.status AS last_known_status
+  h.valid_until AS status_valid_until,a.following AS account_following,e.status AS last_known_status,
+  COALESCE(ar.value,CASE WHEN uf.value='1' THEN 'unfollowed' END) AS archive_reason,
+  ${cleanupPending} AS cleanup_pending
   FROM subjects s LEFT JOIN status_heads h ON s.id=h.subject LEFT JOIN account_subjects a ON a.subject=s.id
   LEFT JOIN status_event_states e ON e.subject=s.id
+  LEFT JOIN settings uf ON a.following=0 AND uf.key='${unfollowedPrefix}'||s.id
+  LEFT JOIN settings ar ON ar.key='${archiveRestrictionPrefix}'||s.id
+    AND (a.following=0 OR ar.value='region_restricted')
+  LEFT JOIN settings bu ON a.following=0 AND bu.key='${blockedUnfollowPrefix}'||s.id
+  LEFT JOIN settings vu ON a.following=0 AND vu.key='${verifiedUnfollowPrefix}'||s.id
   ${
     activity
       ? `LEFT JOIN LATERAL (
@@ -125,6 +144,8 @@ interface SubjectRow {
   deletion_revision: number;
   status_valid_until?: number | null;
   account_following?: number | null;
+  archive_reason?: ArchiveReason | null;
+  cleanup_pending?: boolean;
 }
 interface ObjectRow {
   id: string;
@@ -144,6 +165,8 @@ interface DeletedSegment {
   visible: boolean;
 }
 interface RequestInput {
+  includeUnassigned?: true;
+  includeCleanup?: true;
   activity?: boolean;
   includeProtection?: boolean;
   includePendingDeletion?: boolean;
@@ -152,6 +175,9 @@ interface RequestInput {
   commandId?: string;
   deletionTarget?: MediaDeletionTarget;
   generation?: string;
+  resetUnfollows?: true;
+  restriction?: Exclude<ArchiveReason, 'unfollowed'>;
+  cleanupReason?: 'account_disabled' | 'unfollowed';
   selectionId?: string;
   selectionMode?: MediaSelectionMode;
   selectionOptions?: MediaSelectionOptions;
@@ -172,6 +198,7 @@ interface RequestInput {
   syncAccount?: boolean;
   id: string;
   subjects: SubjectInput[];
+  indexedIds: readonly number[];
   patch: {
     monitorEnabled?: boolean;
     autoRecord?: boolean;
@@ -189,6 +216,8 @@ interface RequestInput {
   sequence: string;
   hash: string;
   after: string;
+  afterProviderId: number;
+  matchingProviderIds?: number[];
   from: number;
   to: number;
   limit: number;
@@ -246,6 +275,7 @@ let personalStore!: PersonalStoreType;
 let deletionStore!: DeletionStore;
 let readCoverage!: ReturnType<typeof createCoverageReader>;
 let deletionIntents!: InstanceType<typeof DeletionIntentModule.DeletionIntents>;
+let unfollowedSubjects!: UnfollowedSubjects;
 let units!: InstanceType<typeof UnitsModule.RecordingUnits>;
 let favoriteCommands!: InstanceType<typeof FavoriteCommandsModule.FavoriteCommands>;
 let selections!: InstanceType<typeof SelectionModule.MediaSelectionStore>;
@@ -396,6 +426,7 @@ try {
     );
     await deletionIntents.initialize();
   });
+  unfollowedSubjects = new UnfollowedSubjects(db, eventStore, deletionIntents);
   const { SnapshotLayoutIndex } = (await import(
     new URL(
       import.meta.url.endsWith('.ts') ? './snapshot-layout-index.ts' : './snapshot-layout-index.js',
@@ -513,6 +544,7 @@ function subject(row: SubjectRow): Subject {
     monitorEnabled: row.monitor === 1 && row.account_following !== 0,
     autoRecord: row.auto_record === 1 && row.account_following !== 0,
     archived: row.account_following === 0,
+    ...(row.archive_reason ? { archiveReason: row.archive_reason } : {}),
     providerStatus:
       row.observed !== null &&
       row.observed <= now &&
@@ -557,18 +589,39 @@ function transaction<T>(action: () => Promise<T>): Promise<T> {
   if (libraryReady) return library.transaction(db, action);
   return db.transaction(action);
 }
+async function cleanupStep<T extends string>(
+  id: string,
+  generation: string | undefined,
+  step: () => Promise<T>,
+) {
+  return transaction(async () => {
+    if (!generation || (await accountSubjects.current()) !== generation) return 'stale' as const;
+    const result = await step();
+    if (result === 'purged')
+      db.afterCommit(() => {
+        snapshotLayouts.invalidate(id, 0, Number.MAX_SAFE_INTEGER, true);
+        personalStore.clearCoverageCache();
+      });
+    return result;
+  });
+}
 async function addSubject(value: SubjectInput, trackNames = false): Promise<void> {
   // Only a successful website-list sync supplies authoritative name changes.
   // Local placeholders and journal replay must not invent former website names.
-  const previous = trackNames
-    ? await one<{
-        handle: string;
-      }>(
-        'SELECT s.handle FROM subjects s JOIN account_subjects a ON a.subject=s.id WHERE s.id=?',
-        value.id,
-      )
-    : undefined;
-  if (previous && previous.handle !== value.handle)
+  const previous =
+    trackNames && !value.subjectProfilePending
+      ? await one<{
+          handle: string;
+        }>(
+          'SELECT s.handle FROM subjects s JOIN account_subjects a ON a.subject=s.id WHERE s.id=?',
+          value.id,
+        )
+      : undefined;
+  if (
+    previous &&
+    previous.handle !== value.handle &&
+    previous.handle !== `主播 #${value.providerId}`
+  )
     await db
       .prepare(
         'INSERT INTO subject_name_history VALUES(?,?,?) ON CONFLICT(subject,handle) DO UPDATE SET changed_at=excluded.changed_at',
@@ -577,9 +630,10 @@ async function addSubject(value: SubjectInput, trackNames = false): Promise<void
   await db
     .prepare(
       `INSERT INTO subjects(id,provider_id,handle) VALUES(?,?,?)
-    ON CONFLICT(id) DO UPDATE SET handle=excluded.handle WHERE subjects.handle<>excluded.handle`,
+    ON CONFLICT(id) DO UPDATE SET handle=excluded.handle
+    WHERE subjects.handle<>excluded.handle AND ?=0`,
     )
-    .run(value.id, value.providerId, value.handle);
+    .run(value.id, value.providerId, value.handle, value.subjectProfilePending ? 1 : 0);
   if (value.previewSourceUrl)
     await db
       .prepare(
@@ -1176,13 +1230,22 @@ const handlers: Record<string, (input: RequestInput) => unknown> = {
     await transaction(() => pruneEmptyHistory(db, eventStore, { fromMs: from, toMs: to })),
   markUnitsSeen: async ({ id, seenEvidence }) =>
     await transaction(() => personalStore.markSeen(id, seenEvidence!)),
-  prepareAccountSubjects: async ({ subjects, generation }) =>
-    await transaction(async () => await accountSubjects.prepare(subjects, generation!)),
+  prepareAccountSubjects: async ({ subjects, generation, resetUnfollows }) =>
+    await transaction(
+      async () => await accountSubjects.prepare(subjects, generation!, resetUnfollows),
+    ),
   activateAccountSubjects: async ({ generation }) =>
     await transaction(async () => await accountSubjects.activate(generation!)),
+  addIndexedAccountSubjects: async ({ indexedIds, generation }) =>
+    await transaction(() => accountSubjects.addIndexed(indexedIds, generation!)),
   discardAccountPreparation: async ({ generation }) =>
     await transaction(async () => await accountSubjects.discard(generation!)),
   accountActivation: async () => await accountSubjects.current(),
+  followedAccountSubjects: ({ includeUnassigned }) => accountSubjects.followed(includeUnassigned),
+  archivedAccountSubjects: ({ afterProviderId, limit, matchingProviderIds }) =>
+    accountSubjects.archived(afterProviderId, limit, matchingProviderIds),
+  acceptedSubjectCleanupIds: ({ afterProviderId, limit }) =>
+    unfollowedSubjects.acceptedIds(afterProviderId, limit),
   prepareSnapshotLayout: async ({ id, window }) =>
     await snapshotLayouts.prepare(id, window, 'layout'),
   beginMediaSelection: async ({ id, window, selectionMode, selectionOptions }) =>
@@ -1369,15 +1432,46 @@ const handlers: Record<string, (input: RequestInput) => unknown> = {
   expediteMediaDeletions: async ({ limit }) => await deletionStore.expediteRetries(limit),
   upsert: async ({ subjects, syncAccount }) =>
     await transaction(async () => await accountSubjects.upsert(subjects, syncAccount)),
-  list: async ({ activity }) =>
-    (await many<SubjectRow>(`${subjectSelect(activity)} ORDER BY s.handle,s.id`)).map(subject),
+  recordVerifiedUnfollowed: ({ id, generation }) =>
+    cleanupStep(id, generation, () => unfollowedSubjects.prepareUnfollowed(id)),
+  manualUnfollowState: async ({ id, generation }) =>
+    generation && (await accountSubjects.current()) === generation
+      ? accountSubjects.manualUnfollowState(id)
+      : 'stale',
+  confirmManualUnfollow: ({ id, generation }) =>
+    cleanupStep(id, generation, async () => {
+      const state = await accountSubjects.confirmManualUnfollow(id);
+      return state === 'ready' ? unfollowedSubjects.prepareUnfollowed(id) : state;
+    }),
+  prepareBlockedUnfollow: ({ id, generation }) =>
+    cleanupStep(id, generation, () => unfollowedSubjects.prepareBlocked(id)),
+  confirmBlockedUnfollow: ({ id, generation }) =>
+    cleanupStep(id, generation, () => unfollowedSubjects.confirmBlockedUnfollow(id)),
+  resumeAcceptedSubjectCleanup: ({ id, generation }) =>
+    cleanupStep(id, generation, () => unfollowedSubjects.resumeAccepted(id)),
+  finishSubjectCleanup: ({ id, generation, cleanupReason }) =>
+    cleanupReason
+      ? cleanupStep(id, generation, () => unfollowedSubjects.finish(id, cleanupReason))
+      : 'stale',
+  recordArchiveRestriction: ({ id, generation, restriction }) =>
+    transaction(() => accountSubjects.recordRestriction(id, generation!, restriction!)),
+  list: async ({ activity, includeCleanup }) =>
+    (
+      await many<SubjectRow>(
+        `${subjectSelect(activity)} ${includeCleanup ? '' : `WHERE NOT (${cleanupPending})`} ORDER BY s.handle,s.id`,
+      )
+    ).map(subject),
   findSubject: async ({ id, activity }) => {
-    const row = await one<SubjectRow>(`${subjectSelect(activity)} WHERE s.id=?`, id);
+    const row = await one<SubjectRow>(
+      `${subjectSelect(activity)} WHERE s.id=? AND NOT (${cleanupPending})`,
+      id,
+    );
     return row ? subject(row) : null;
   },
   subject: async ({ id }) => {
     const row = await one<SubjectRow>(`${subjectSelect(false)} WHERE s.id=?`, id);
     if (!row) throw Error('SUBJECT_NOT_FOUND');
+    if (row.cleanup_pending) throw Error('SUBJECT_ARCHIVED');
     return subject(row);
   },
   policy: async ({ id, patch }) =>
@@ -1493,11 +1587,15 @@ const handlers: Record<string, (input: RequestInput) => unknown> = {
       await privateSettings.set(key, value);
       return;
     }
+    // An in-flight image read may finish while its subject is being removed.
+    const owner = previewSettingSubject(key);
     await db
       .prepare(
-        'INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+        `INSERT INTO settings(key,value) SELECT ?,?
+         ${owner ? `WHERE EXISTS(${subjectSelect(false)} WHERE s.id=? AND NOT (${cleanupPending}))` : ''}
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
       )
-      .run(key, value);
+      .run(key, value, ...(owner ? [owner] : []));
   },
   head: async ({ id }) => await head(id),
   heads: async () => await db.prepare('SELECT subject,revision FROM journal_heads').all(),

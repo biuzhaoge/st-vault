@@ -9,26 +9,24 @@ export function ArchiveHealth({
 }: {
   health: SystemHealth | null;
   accessory?: ReactNode;
-  help?: ReactNode;
+  help?: (note?: string) => ReactNode;
 }): JSX.Element {
   const kind =
     health?.kind === 'ok' ? 'ok' : !health || health.kind === 'checking' ? 'checking' : 'error';
-  const reasons =
-    kind === 'error' && health ? (health.messages.length ? health.messages : [health.title]) : [];
+  const note = kind === 'error' && health ? health.messages.join(' · ') || health.title : undefined;
   return (
     <PanelStatus
       className="archive-health"
       label={
         <>
           {tr('归档服务')}
-          {help}
+          {help?.(note)}
         </>
       }
       kind={kind}
       value={tr(kind === 'ok' ? '可用' : kind === 'checking' ? '检查中' : '异常')}
+      note={note}
       accessory={accessory}
-    >
-      {reasons.length ? reasons.map((reason) => <p key={reason}>{reason}</p>) : undefined}
-    </PanelStatus>
+    />
   );
 }

@@ -127,14 +127,17 @@ export class AccountActivation<T> {
     next: T | null,
     validate: () => void,
     accepted: () => void,
-    replaceForeignPending = false,
-  ): Promise<void> {
-    if (this.recovering && !replaceForeignPending) throw Error('ACCOUNT_ACTIVATION_PENDING');
+    options: { replaceForeignPending?: boolean; resetUnfollows?: boolean } = {},
+  ): Promise<string> {
+    if (this.recovering && !options.replaceForeignPending)
+      throw Error('ACCOUNT_ACTIVATION_PENDING');
     const generation = randomUUID();
     const libraryId = (await this.options.archive.identity()).instanceId;
     let committed = false;
     try {
-      await this.options.archive.prepareAccountSubjects(subjects, generation);
+      if (next === null || options.resetUnfollows)
+        await this.options.archive.prepareAccountSubjects(subjects, generation, true);
+      else await this.options.archive.prepareAccountSubjects(subjects, generation);
       validate();
       const pending = { generation, libraryId, next };
       await this.write(this.active, pending);
@@ -143,6 +146,7 @@ export class AccountActivation<T> {
       accepted();
       this.options.changed();
       await this.recover();
+      return generation;
     } catch (error) {
       if (!committed && !this.uncertain)
         try {
@@ -174,7 +178,7 @@ export class AccountActivation<T> {
         null,
         () => undefined,
         () => undefined,
-        true,
+        { replaceForeignPending: true },
       );
       return;
     } else if (this.recovering) await this.recover();

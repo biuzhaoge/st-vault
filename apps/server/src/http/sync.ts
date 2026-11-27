@@ -31,7 +31,8 @@ export function createSyncHub(options: {
     pending: Promise<void> | undefined;
   let lastRunAtMs: number | null = null,
     lastSuccessAtMs: number | null = null,
-    failed = false;
+    lastFailedPeriod: number | undefined,
+    consecutiveFailures = 0;
   const minimum: Record<FingerprintedTopic, number> = {
     subjects: 1000,
     timeline: 5000,
@@ -64,6 +65,7 @@ export function createSyncHub(options: {
     if (!clients.size) return;
     running = true;
     lastRunAtMs = now();
+    const period = options.clock?.periodNumber();
     try {
       if (options.clock)
         for (const client of clients)
@@ -96,10 +98,12 @@ export function createSyncHub(options: {
         } else if (notification) write(client, notification);
         else if (now() - client.lastWrite >= 15000) write(client, ': heartbeat\n\n');
       }
-      failed = false;
+      consecutiveFailures = 0;
+      lastFailedPeriod = undefined;
       lastSuccessAtMs = now();
     } catch {
-      failed = true;
+      if (period === undefined || period !== lastFailedPeriod) consecutiveFailures++;
+      lastFailedPeriod = period;
       for (const client of clients) closeClient(client);
     } finally {
       running = false;
@@ -123,7 +127,14 @@ export function createSyncHub(options: {
     { everyPulse: true },
   );
   return {
-    status: () => ({ clients: clients.size, running, failed, lastRunAtMs, lastSuccessAtMs }),
+    status: () => ({
+      clients: clients.size,
+      running,
+      failed: consecutiveFailures > 0,
+      consecutiveFailures,
+      lastRunAtMs,
+      lastSuccessAtMs,
+    }),
     open(owner: string, response: ServerResponse): boolean {
       if (
         closed ||

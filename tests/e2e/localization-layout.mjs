@@ -10,7 +10,24 @@ const problems = [],
   checks = [];
 const geometry = new Map();
 let tasksRunning = true;
+let siteFailures = 0;
 const english = JSON.parse(await readFile('apps/ui/src/locales/en.json', 'utf8'));
+const typography = (locator) =>
+  locator.first().evaluate((node) => {
+    const style = getComputedStyle(node);
+    return [style.fontSize, style.lineHeight, style.fontWeight];
+  });
+const dividerAppearance = (locator) =>
+  locator.evaluateAll((nodes) =>
+    nodes.map((node) => {
+      const style = getComputedStyle(node);
+      const rules = ['::before', '::after'].map((side) => {
+        const rule = getComputedStyle(node, side);
+        return [rule.content, rule.height, rule.flexGrow, rule.backgroundColor];
+      });
+      return { alignment: [style.display, style.alignItems, style.columnGap], rules };
+    }),
+  );
 try {
   browser = await chromium.launch({
     executablePath: process.env.STV_QA_BROWSER_EXECUTABLE ?? '/usr/bin/chromium',
@@ -91,18 +108,35 @@ try {
       now = Date.now();
     data.backgroundTasks = [
       { id: 'capture-status', group: 'sync', state: 'running', processed: 121, total: 300 },
-      { id: 'account-list', group: 'sync', state: 'waiting', nextRunAtMs: now + 5000 },
-      { id: 'cover-sync', group: 'sync', state: 'idle', lastSuccessAtMs: now - 10000 },
+      {
+        id: 'account-list',
+        group: 'sync',
+        state: 'waiting',
+        nextRunAtMs: now + 5000,
+        accountRoster: { favoritesIndexCount: 132, pendingProfileCount: 4 },
+      },
+      {
+        id: 'cover-sync',
+        group: 'sync',
+        state: 'retrying',
+        error: 'cover_refresh_partial',
+        consecutiveFailures: 1,
+        lastSuccessAtMs: now - 10000,
+      },
       {
         id: 'avatar-sync',
         group: 'sync',
-        state: 'waiting',
+        state: 'retrying',
+        error: 'avatar_refresh_partial',
+        consecutiveFailures: 2,
         nextRunAtMs: now + 30000,
       },
       {
         id: 'site-access',
         group: 'sync',
-        state: 'running',
+        state: siteFailures ? 'error' : 'running',
+        error: siteFailures ? 'site_unavailable' : null,
+        consecutiveFailures: siteFailures,
         processed: 12,
         total: 34,
         target: 'aznudelive.com',
@@ -148,6 +182,9 @@ try {
       { id: 'run-heartbeat', group: 'protection', state: 'idle', lastSuccessAtMs: now },
       { id: 'client-sync', group: 'sync', state: 'waiting', nextRunAtMs: now + 5000 },
     ];
+    data.retryableTargets = [
+      ...new Set([...(data.retryableTargets ?? []), 'cover-sync', 'avatar-sync', 'site-access']),
+    ];
     data.capturedAtMs = now;
     if (!tasksRunning)
       data.backgroundTasks = data.backgroundTasks.map((task) =>
@@ -188,15 +225,18 @@ try {
             ?.getBoundingClientRect();
           const count = button.querySelector('.filter-count')?.getBoundingClientRect();
           const bounds = button.getBoundingClientRect();
+          const stacked = getComputedStyle(button).flexDirection === 'column';
           return Boolean(
             name &&
             name.left >= bounds.left &&
             name.right <= bounds.right &&
             (!count ||
-              (count.left >= name.right &&
-                Math.abs(count.top + count.height / 2 - name.top - name.height / 2) < 1 &&
-                count.left >= bounds.left &&
-                count.right <= bounds.right)),
+              (count.left >= bounds.left &&
+                count.right <= bounds.right &&
+                (stacked
+                  ? count.top >= name.bottom - 1 && count.bottom <= bounds.bottom
+                  : count.left >= name.right &&
+                    Math.abs(count.top + count.height / 2 - name.top - name.height / 2) < 1))),
           );
         });
         const account = document.querySelector('.directory').getBoundingClientRect();
@@ -286,6 +326,7 @@ try {
       if (headerIssue) problems.push({ language, width, panel: 'header', issues: [headerIssue] });
       let menuChrome;
       const menuWidths = {};
+      const sectionDividers = [];
       for (const [name, selector] of [
         ['settings', '.header-tool:nth-child(1) .tool-trigger'],
         ['status', '.header-tool:nth-child(2) .tool-trigger'],
@@ -321,6 +362,55 @@ try {
         assert(chrome.hasIcon, `${name} must use the shared menu title icon`);
         if (menuChrome) assert.deepEqual(chrome, menuChrome, `${name} menu geometry`);
         else menuChrome = chrome;
+        if (name === 'settings') {
+          const settings = page.locator('.runtime-settings');
+          for (const selector of ['.language-setting > span', '.field > span'])
+            assert.deepEqual(await typography(settings.locator(selector)), ['12px', '18px', '500']);
+          assert.deepEqual(await typography(settings.locator('.panel-section > h3')), [
+            '11px',
+            '16px',
+            '550',
+          ]);
+          sectionDividers.push(
+            ...(await dividerAppearance(settings.locator('.panel-section > h3'))),
+          );
+          assert.ok(
+            await settings
+              .locator(':scope > form')
+              .evaluateAll((forms) =>
+                forms.every((form) => getComputedStyle(form).borderTopWidth === '0px'),
+              ),
+          );
+          assert.equal(
+            await settings
+              .locator('.panel-section')
+              .first()
+              .evaluate((node) => getComputedStyle(node).rowGap),
+            '6px',
+          );
+        }
+        if (name === 'history') {
+          const event = page.locator('.history-event-line').first();
+          await event.waitFor();
+          assert.deepEqual((await typography(event.locator('.event-description'))).slice(0, 2), [
+            '12px',
+            '18px',
+          ]);
+          assert.equal(await event.evaluate((node) => node.getBoundingClientRect().height), 30);
+          const date = page.locator('.history-day').first();
+          await date.waitFor();
+          const [sample] = await dividerAppearance(date);
+          assert.deepEqual(sample.alignment, ['flex', 'center', '9px']);
+          assert.deepEqual(
+            sample.rules.map((rule) => rule.slice(0, 3)),
+            [
+              ['""', '1px', '1'],
+              ['""', '1px', '1'],
+            ],
+          );
+          assert.ok(sectionDividers.length >= 5);
+          for (const divider of sectionDividers) assert.deepEqual(divider, sample);
+        }
         if (name === 'account')
           await page.locator('.routing-item').filter({ hasText: 'primetime-cams.live' }).click();
         if (name === 'keys') {
@@ -388,6 +478,106 @@ try {
           await running.waitFor();
           assert.equal(await page.locator('.system-summary details').count(), 0);
           const summary = page.locator('.system-summary');
+          assert.deepEqual(await typography(summary.locator('.panel-row-label')), [
+            '12px',
+            '18px',
+            '500',
+          ]);
+          assert.deepEqual(await typography(summary.locator('.system-group > h3')), [
+            '11px',
+            '16px',
+            '550',
+          ]);
+          assert.equal(
+            await summary
+              .locator('[data-status-row="recording"] .panel-status-row')
+              .evaluate((node) => node.getBoundingClientRect().height),
+            30,
+          );
+          const separators = await summary
+            .locator(':scope > .system-group')
+            .evaluateAll((groups) => groups.map((group) => getComputedStyle(group).borderTopWidth));
+          assert.deepEqual(separators, ['0px', '0px', '0px', '0px']);
+          sectionDividers.push(...(await dividerAppearance(summary.locator('.system-group > h3'))));
+          assert.equal(
+            await summary.locator('[data-status-row="account-list"] .system-row-note').innerText(),
+            language === 'en' ? 'Profiles pending 4' : '待补资料 4',
+          );
+          const covers = summary.locator('[data-status-row="cover-sync"]');
+          const sync = summary.getByRole('region', {
+            name: language === 'en' ? english['数据同步'] : '数据同步',
+            exact: true,
+          });
+          for (const id of ['cover-sync', 'avatar-sync']) {
+            const badge = sync.locator(`[data-status-row="${id}"] .panel-badge.is-neutral`);
+            assert.equal(
+              await badge.textContent({ timeout: 5000 }),
+              language === 'en' ? 'Refresh incomplete' : '本轮未完成',
+            );
+          }
+          assert.equal(await sync.locator('.system-retry').count(), 0);
+          const note = covers.locator('.system-row-note');
+          const fullNote =
+            language === 'en'
+              ? 'Some downloads failed. Cached images remain available.'
+              : '部分图片下载失败，已有图片继续使用。';
+          assert.equal(await note.textContent(), fullNote);
+          const inline = await note.evaluate((node) => {
+            const row = node.parentElement;
+            if (!row.matches('.panel-status-row')) return null;
+            const note = node.getBoundingClientRect();
+            const line = row.getBoundingClientRect();
+            const label = row.querySelector('.panel-row-label').getBoundingClientRect();
+            const value = row.querySelector('.panel-row-value').getBoundingClientRect();
+            const style = getComputedStyle(node);
+            return {
+              rowHeight: line.height,
+              betweenLabelAndValue:
+                note.width > 0 && note.left >= label.right - 1 && note.right <= value.left + 1,
+              centered: Math.abs(note.top + note.bottom - line.top - line.bottom) <= 1,
+              whiteSpace: style.whiteSpace,
+              overflow: style.textOverflow,
+            };
+          });
+          assert.deepEqual(inline, {
+            rowHeight: 30,
+            betweenLabelAndValue: true,
+            centered: true,
+            whiteSpace: 'nowrap',
+            overflow: 'ellipsis',
+          });
+          assert.equal(await note.getAttribute('title'), fullNote);
+          const coverTooltip = covers.getByRole('tooltip');
+          await covers.locator('.status-help-trigger').click();
+          await coverTooltip.waitFor();
+          assert.equal(await coverTooltip.locator('small').last().textContent(), fullNote);
+          await page.keyboard.press('Escape');
+          await coverTooltip.waitFor({ state: 'hidden' });
+          if (language === 'zh-CN' && width === 1280) {
+            const site = sync.locator('[data-status-row="site-access"]');
+            const alert = page.getByRole('img', { name: '绑定站点访问异常', exact: true });
+            const refreshStatus = () =>
+              page.evaluate(() =>
+                window.dispatchEvent(new CustomEvent('stv-sync', { detail: ['system'] })),
+              );
+            siteFailures = 1;
+            await refreshStatus();
+            await site
+              .locator('.panel-badge.is-neutral')
+              .filter({ hasText: '本轮未完成' })
+              .waitFor();
+            assert.equal(await alert.count(), 0);
+            siteFailures = 3;
+            await refreshStatus();
+            await site.locator('.panel-badge.is-error').filter({ hasText: '异常' }).waitFor();
+            assert.match(await site.locator('.system-row-note').textContent(), /绑定站点访问失败/);
+            assert.equal(await site.locator('.system-retry').count(), 0);
+            await alert.waitFor();
+            siteFailures = 0;
+            await refreshStatus();
+            await site.locator('.panel-badge.is-busy').waitFor();
+            await alert.waitFor({ state: 'hidden' });
+          }
           assert.equal(
             await summary.locator('.status-help-trigger').count(),
             await summary.locator('.panel-status-row').count(),
@@ -489,12 +679,39 @@ try {
             window.dispatchEvent(new CustomEvent('stv-sync', { detail: ['system'] })),
           );
           await running.waitFor();
+          const panelInsets = await summary.evaluate((panel) => {
+            const body = panel.closest('.panel-content');
+            const style = getComputedStyle(body);
+            const bodyBounds = body.getBoundingClientRect();
+            const firstLabel = panel.querySelector('.panel-row-label').getBoundingClientRect();
+            return {
+              scrollLeft: body.scrollLeft,
+              scrollWidth: body.scrollWidth,
+              clientWidth: body.clientWidth,
+              leftInset: firstLabel.left - bodyBounds.left,
+              paddingLeft: parseFloat(style.paddingLeft),
+            };
+          });
+          assert.equal(panelInsets.scrollLeft, 0, JSON.stringify(panelInsets));
+          assert(
+            panelInsets.scrollWidth <= panelInsets.clientWidth + 1,
+            JSON.stringify(panelInsets),
+          );
+          assert(panelInsets.leftInset >= panelInsets.paddingLeft - 1, JSON.stringify(panelInsets));
           if (language === 'zh-CN' && width === 1280)
             await page.screenshot({ path: '.local/qa/task-state-stable.png' });
-          const scrolls = await page
+          const lastRowReachable = await page
             .locator('.panel-content:has(.system-summary)')
-            .evaluate((node) => node.scrollHeight > node.clientHeight + 1);
-          assert.equal(scrolls, false, 'Compact status rows fit without scrolling');
+            .evaluate((body) => {
+              const rows = body.querySelectorAll('.panel-status-row');
+              const oldScrollTop = body.scrollTop;
+              body.scrollTop = body.scrollHeight;
+              const last = rows[rows.length - 1].getBoundingClientRect();
+              const viewport = body.getBoundingClientRect();
+              body.scrollTop = oldScrollTop;
+              return last.top >= viewport.top - 1 && last.bottom <= viewport.bottom + 1;
+            });
+          assert(lastRowReachable, 'Status rows remain reachable in the panel body');
         }
         await page.evaluate(
           () =>

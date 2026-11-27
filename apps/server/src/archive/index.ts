@@ -23,6 +23,7 @@ import { Metadata } from './metadata.js';
 import { orphanCandidates } from './orphan-candidates.js';
 import { TaskPool, TaskWakeup } from './task-pool.js';
 import type {
+  ArchiveReason,
   CoverageResponse,
   EventMeta,
   EventsResponse,
@@ -43,8 +44,16 @@ import type {
   SnapshotPagesResponse,
   SnapshotItem,
 } from '@st-vault/api-schema';
-import type { ArchivePort, CommitInput, MediaChange, MediaObject, SubjectInput } from '../ports.js';
+import type {
+  ArchivePort,
+  CommitInput,
+  MediaChange,
+  MediaObject,
+  SubjectInput,
+  UnfollowedSubjectResult,
+} from '../ports.js';
 import { ARCHIVE_MEDIA_BATCH_LIMIT } from '../ports.js';
+import { removeSubjectLibraryImages } from '../library/images.js';
 import { MAX_SNAPSHOT_SELECTION, MAX_SNAPSHOT_PAGE_SIZE } from '@st-vault/api-schema';
 import {
   archiveWindows,
@@ -74,6 +83,32 @@ export interface ArchiveOptions {
   fault?: (point: ArchiveFaultPoint) => void | Promise<void>;
 }
 export interface ArchiveHandle extends ArchivePort {
+  addIndexedAccountSubjects(
+    indexedIds: readonly number[],
+    generation: string,
+    signal?: AbortSignal,
+  ): Promise<number>;
+  recordVerifiedUnfollowed(id: string, generation: string): Promise<UnfollowedSubjectResult>;
+  recordManualUnfollow(
+    id: string,
+    generation: string,
+    removeFavorite: () => Promise<void>,
+  ): Promise<UnfollowedSubjectResult>;
+  recordVerifiedBlocked(
+    id: string,
+    generation: string,
+    removeFavorite: () => Promise<void>,
+  ): Promise<UnfollowedSubjectResult>;
+  resumeAcceptedSubjectCleanup(id: string, generation: string): Promise<UnfollowedSubjectResult>;
+  acceptedSubjectCleanupIds(
+    afterProviderId: number,
+    limit: number,
+  ): Promise<{ id: string; providerId: number }[]>;
+  recordArchiveRestriction(
+    id: string,
+    generation: string,
+    reason: Exclude<ArchiveReason, 'unfollowed'>,
+  ): Promise<boolean>;
   /** Bounded integrity maintenance. Pass nextCursor to continue a later batch. */
   scrub(options?: {
     limit?: number;
@@ -96,7 +131,20 @@ function inputSubject(s: SubjectInput): void {
     subjectId(s.id) !== s.providerId ||
     typeof s.handle !== 'string' ||
     !s.handle.trim() ||
-    s.handle.length > 200
+    s.handle.length > 200 ||
+    (s.subjectProfilePending !== undefined &&
+      (s.subjectProfilePending !== true || s.handle !== `主播 #${s.providerId}`)) ||
+    (s.accountArchivePending !== undefined && s.accountArchivePending !== true) ||
+    (s.accountBlockedConfirmed !== undefined &&
+      (s.accountBlockedConfirmed !== true || s.accountArchiveReason !== 'account_disabled')) ||
+    (s.accountUnfollowConfirmed !== undefined &&
+      (s.accountUnfollowConfirmed !== true || s.accountArchiveReason !== 'unfollowed')) ||
+    (s.accountRegionCleared !== undefined &&
+      (s.accountRegionCleared !== true || s.accountArchiveReason === 'region_restricted')) ||
+    (s.accountArchiveReason !== undefined &&
+      !['region_restricted', 'account_disabled', 'account_deleted', 'unfollowed'].includes(
+        s.accountArchiveReason,
+      ))
   )
     failure('INVALID_SUBJECT');
   if (
@@ -295,7 +343,7 @@ class Archive implements ArchiveHandle {
     objectsVerified: 0,
   };
   constructor(
-    root: string,
+    private readonly mediaRoot: string,
     private readonly db: Metadata,
     private readonly options: ArchiveOptions,
   ) {
@@ -309,7 +357,7 @@ class Archive implements ArchiveHandle {
       failure('INVALID_ARCHIVE_CONCURRENCY');
     this.gcIo = new TaskPool(options.gcConcurrency ?? 1);
     this.backgroundPool = new TaskPool(this.backgroundConcurrency);
-    this.files = new MediaObjectStore(root, options.hashConcurrency ?? 1, (point) =>
+    this.files = new MediaObjectStore(mediaRoot, options.hashConcurrency ?? 1, (point) =>
       this.fault?.(point),
     );
   }
@@ -539,11 +587,17 @@ class Archive implements ArchiveHandle {
       await this.db.call('upsert', { subjects, syncAccount: options?.syncAccount === true });
     });
   }
-  prepareAccountSubjects(subjects: SubjectInput[], generation: string): Promise<void> {
+  prepareAccountSubjects(
+    subjects: SubjectInput[],
+    generation: string,
+    resetUnfollows?: true,
+  ): Promise<void> {
     if (!UUID.test(generation)) failure('INVALID_ACCOUNT_ACTIVATION');
     if (subjects.length > 10000) failure('SUBJECT_BATCH_TOO_LARGE');
     subjects.forEach(inputSubject);
-    return this.run(() => this.db.call('prepareAccountSubjects', { subjects, generation }));
+    return this.run(() =>
+      this.db.call('prepareAccountSubjects', { subjects, generation, resetUnfollows }),
+    );
   }
   activateAccountSubjects(generation: string): Promise<void> {
     if (!UUID.test(generation)) failure('INVALID_ACCOUNT_ACTIVATION');
@@ -552,17 +606,67 @@ class Archive implements ArchiveHandle {
   accountActivation(): Promise<string | null> {
     return this.run(() => this.db.read('accountActivation'));
   }
+  addIndexedAccountSubjects(
+    indexedIds: readonly number[],
+    generation: string,
+    signal?: AbortSignal,
+  ): Promise<number> {
+    return this.run(async () => {
+      signal?.throwIfAborted();
+      if (!UUID.test(generation)) failure('INVALID_ACCOUNT_ACTIVATION');
+      if (indexedIds.length > 10000) failure('SUBJECT_BATCH_TOO_LARGE');
+      if (indexedIds.some((id) => !Number.isSafeInteger(id) || id <= 0)) failure('INVALID_SUBJECT');
+      if (!indexedIds.length) return 0;
+      const added = await this.db.call<number>('addIndexedAccountSubjects', {
+        generation,
+        indexedIds,
+      });
+      // A refresh prompted by this commit must see the new membership.
+      if (added) this.directoryRead = undefined;
+      return added;
+    });
+  }
+  followedAccountSubjects(includeUnassigned?: true): Promise<SubjectInput[]> {
+    return this.run(() => this.db.read('followedAccountSubjects', { includeUnassigned }));
+  }
+  archivedAccountSubjects(
+    afterProviderId: number,
+    limit: number,
+    matchingProviderIds?: readonly number[],
+  ): Promise<SubjectInput[]> {
+    return this.run(async () => {
+      if (
+        !Number.isSafeInteger(afterProviderId) ||
+        afterProviderId < 0 ||
+        !Number.isSafeInteger(limit) ||
+        limit < 1 ||
+        limit > 128 ||
+        (matchingProviderIds &&
+          (matchingProviderIds.length > 10000 ||
+            matchingProviderIds.some((id) => !Number.isSafeInteger(id) || id <= 0)))
+      )
+        failure('INVALID_ARCHIVED_SUBJECT_QUERY');
+      return await this.db.read('archivedAccountSubjects', {
+        afterProviderId,
+        limit,
+        matchingProviderIds,
+      });
+    });
+  }
   discardAccountPreparation(generation: string): Promise<void> {
     if (!UUID.test(generation)) failure('INVALID_ACCOUNT_ACTIVATION');
     return this.run(() => this.db.call('discardAccountPreparation', { generation }));
   }
-  listSubjects(options?: { activity?: false }): Promise<Subject[]> {
+  listSubjects(options?: { activity?: false; includeCleanup?: true }): Promise<Subject[]> {
     return this.run(async () => {
-      if (options?.activity === false) return this.db.call<Subject[]>('list', options);
-      this.directoryRead ??= this.db.call<Subject[]>('list').finally(() => {
-        this.directoryRead = undefined;
+      if (options?.activity === false || options?.includeCleanup)
+        return this.db.call<Subject[]>('list', options);
+      if (this.directoryRead) return this.directoryRead;
+      const pending = this.db.call<Subject[]>('list').finally(() => {
+        if (this.directoryRead === pending) this.directoryRead = undefined;
       });
-      return this.directoryRead;
+      this.directoryRead = pending;
+      return pending;
     });
   }
   setGlobalRecording(enabled: boolean): Promise<string[]> {
@@ -572,6 +676,142 @@ class Archive implements ArchiveHandle {
   getSubject(id: string, options?: { activity?: false }): Promise<Subject | null> {
     subjectId(id);
     return this.run(() => this.db.call('findSubject', { id, ...options }));
+  }
+  recordVerifiedUnfollowed(id: string, generation: string): Promise<UnfollowedSubjectResult> {
+    subjectId(id);
+    if (!UUID.test(generation)) failure('INVALID_ACCOUNT_ACTIVATION');
+    return this.serial(id, async () => {
+      const step = await this.db.call<UnfollowedSubjectResult | 'purge'>(
+        'recordVerifiedUnfollowed',
+        { id, generation },
+      );
+      return step === 'purge' ? this.finishSubjectCleanup(id, generation, 'unfollowed') : step;
+    });
+  }
+  recordManualUnfollow(
+    id: string,
+    generation: string,
+    removeFavorite: () => Promise<void>,
+  ): Promise<UnfollowedSubjectResult> {
+    subjectId(id);
+    if (!UUID.test(generation)) failure('INVALID_ACCOUNT_ACTIVATION');
+    return this.serial(id, async () => {
+      const state = await this.db.read<Exclude<UnfollowedSubjectResult, 'purged'> | 'ready'>(
+        'manualUnfollowState',
+        { id, generation },
+      );
+      if (state !== 'ready') return state;
+      await removeFavorite();
+      const step = await this.db.call<UnfollowedSubjectResult | 'purge'>('confirmManualUnfollow', {
+        id,
+        generation,
+      });
+      if (step !== 'purge') return step;
+      try {
+        return await this.finishSubjectCleanup(id, generation, 'unfollowed');
+      } catch (error) {
+        // The accepted receipt will resume filesystem cleanup without a second site request.
+        console.warn(
+          JSON.stringify({
+            event: 'manual_unfollow_cleanup_deferred',
+            error: error instanceof Error ? error.name : 'unknown',
+          }),
+        );
+        return 'retained';
+      }
+    });
+  }
+  recordVerifiedBlocked(
+    id: string,
+    generation: string,
+    removeFavorite: () => Promise<void>,
+  ): Promise<UnfollowedSubjectResult> {
+    subjectId(id);
+    if (!UUID.test(generation)) failure('INVALID_ACCOUNT_ACTIVATION');
+    return this.serial(id, async () => {
+      let step = await this.db.call<UnfollowedSubjectResult | 'unfollow' | 'purge'>(
+        'prepareBlockedUnfollow',
+        { id, generation },
+      );
+      if (step === 'unfollow') {
+        if ((await this.db.read('accountActivation')) !== generation) return 'stale';
+        // Hold the subject's commit lane across the account request. Each SQL
+        // write uses a short transaction guarded by the active roster.
+        await removeFavorite();
+        step = await this.db.call<UnfollowedSubjectResult | 'purge'>('confirmBlockedUnfollow', {
+          id,
+          generation,
+        });
+      }
+      return step === 'purge'
+        ? this.finishSubjectCleanup(id, generation, 'account_disabled')
+        : step;
+    });
+  }
+  resumeAcceptedSubjectCleanup(id: string, generation: string): Promise<UnfollowedSubjectResult> {
+    subjectId(id);
+    if (!UUID.test(generation)) failure('INVALID_ACCOUNT_ACTIVATION');
+    return this.serial(id, async () => {
+      const step = await this.db.call<UnfollowedSubjectResult | 'unfollowed' | 'account_disabled'>(
+        'resumeAcceptedSubjectCleanup',
+        { id, generation },
+      );
+      return step === 'unfollowed' || step === 'account_disabled'
+        ? this.finishSubjectCleanup(id, generation, step)
+        : step;
+    });
+  }
+  acceptedSubjectCleanupIds(
+    afterProviderId: number,
+    limit: number,
+  ): Promise<{ id: string; providerId: number }[]> {
+    return this.run(async () => {
+      if (
+        !Number.isSafeInteger(afterProviderId) ||
+        afterProviderId < 0 ||
+        !Number.isSafeInteger(limit) ||
+        limit < 1 ||
+        limit > 128
+      )
+        failure('INVALID_ARCHIVED_SUBJECT_QUERY');
+      return this.db.read('acceptedSubjectCleanupIds', { afterProviderId, limit });
+    });
+  }
+  private async finishSubjectCleanup(
+    id: string,
+    generation: string,
+    cleanupReason: 'unfollowed' | 'account_disabled',
+  ): Promise<UnfollowedSubjectResult> {
+    let rejected: Exclude<UnfollowedSubjectResult, 'purged'> = 'stale';
+    const removed = await removeSubjectLibraryImages(this.mediaRoot, id, async () => {
+      const eligibility = await this.db.call<
+        Exclude<UnfollowedSubjectResult, 'purged'> | 'unfollowed' | 'account_disabled'
+      >('resumeAcceptedSubjectCleanup', { id, generation });
+      if (eligibility === 'unfollowed' || eligibility === 'account_disabled')
+        return eligibility === cleanupReason;
+      rejected = eligibility;
+      return false;
+    });
+    if (!removed) return rejected;
+    return this.db.call('finishSubjectCleanup', { id, generation, cleanupReason });
+  }
+  recordArchiveRestriction(
+    id: string,
+    generation: string,
+    reason: Exclude<ArchiveReason, 'unfollowed'>,
+  ): Promise<boolean> {
+    subjectId(id);
+    if (!UUID.test(generation)) failure('INVALID_ACCOUNT_ACTIVATION');
+    return this.serial(
+      id,
+      () =>
+        this.db.call('recordArchiveRestriction', {
+          id,
+          generation,
+          restriction: reason,
+        }),
+      true,
+    );
   }
   subjectPreview(id: string): Promise<string | null> {
     subjectId(id);

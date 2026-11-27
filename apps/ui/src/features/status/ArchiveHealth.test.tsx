@@ -16,7 +16,9 @@ it('distinguishes healthy, checking and failed service status and shows the caus
     <ArchiveHealth health={systemHealthStatus({ lowSpace: false, diskError: 'disk_read_only' })} />,
   );
   expect(html).toContain('is-error');
-  expect(html).toContain('数据目录只读');
+  expect(html).toMatch(
+    /class="system-row-note"[^>]*>数据目录只读[^<]*<\/span><span class="panel-row-value">/,
+  );
 });
 it('presents availability as a quiet labeled status instead of a prominent normal banner', () => {
   const html = renderToStaticMarkup(

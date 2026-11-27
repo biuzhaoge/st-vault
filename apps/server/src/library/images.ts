@@ -1,15 +1,79 @@
-import { lstat, mkdir, open, realpath } from 'node:fs/promises';
+import { lstat, mkdir, open, realpath, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { subjectImagePath, type SubjectImageKind } from './paths.js';
+import { syncDirectory } from './files.js';
 import { AtomicDerivativeWriter } from '../previews/atomic-derivative.js';
 import { DerivativeDiagnostics, ioCode } from '../previews/derivative-diagnostics.js';
 import { MediaBudget } from '../provider/media-budget.js';
+
+const canonicalKinds: readonly SubjectImageKind[] = ['avatar', 'cover', 'default-cover'];
+const imageWork = new Map<string, Promise<unknown>>();
+
+function serializeImages<T>(filenames: string[], operation: () => Promise<T>): Promise<T> {
+  const keys = filenames.map((filename) => path.resolve(filename));
+  const pending = keys.map((key) => imageWork.get(key)).filter((task) => task !== undefined);
+  // Each caller owns its error. A rejected predecessor must not strand a later operation.
+  const task = Promise.allSettled(pending).then(operation);
+  for (const key of keys) imageWork.set(key, task);
+  return task.finally(() => {
+    for (const key of keys) if (imageWork.get(key) === task) imageWork.delete(key);
+  });
+}
+
+async function existingEntry(filename: string) {
+  try {
+    return await lstat(filename);
+  } catch (error) {
+    if (ioCode(error) !== 'ENOENT') throw error;
+    return null;
+  }
+}
+
+/** Reclaim only the generated portrait and covers for an exact library subject. */
+export async function removeSubjectLibraryImages(
+  mediaRoot: string,
+  id: string,
+  canRemove?: () => Promise<boolean>,
+): Promise<boolean> {
+  const root = path.resolve(mediaRoot);
+  const files = canonicalKinds.map((kind) => subjectImagePath(root, id, kind));
+  const directory = path.dirname(files[0]);
+  return serializeImages(files, async () => {
+    if (canRemove && !(await canRemove())) return false;
+    for (const parent of [root, path.join(root, 'subjects'), path.dirname(directory), directory]) {
+      const info = await existingEntry(parent);
+      if (!info) return true;
+      if (!info.isDirectory() || info.isSymbolicLink()) throw Error('UNSAFE_LIBRARY_IMAGE_PATH');
+    }
+    if ((await realpath(directory)) !== directory) throw Error('UNSAFE_LIBRARY_IMAGE_PATH');
+    const existing: string[] = [];
+    for (const filename of files) {
+      const entry = await existingEntry(filename);
+      if (!entry) continue;
+      if (!entry.isFile() || entry.isSymbolicLink()) throw Error('UNSAFE_LIBRARY_IMAGE_PATH');
+      existing.push(filename);
+    }
+    try {
+      for (const filename of existing) {
+        try {
+          await unlink(filename);
+        } catch (error) {
+          if (ioCode(error) !== 'ENOENT') throw error;
+        }
+      }
+    } finally {
+      // A retry after interruption must also make an already-empty directory durable.
+      syncDirectory(directory);
+    }
+    return true;
+  });
+}
 
 /** Canonical library images are addressed directly, never LRU-evicted or recursively indexed. */
 export class LibraryImages {
   private readonly diagnostics = new DerivativeDiagnostics();
   private readonly writer: AtomicDerivativeWriter;
-  private readonly queues = new Map<string, Promise<boolean>>();
+  private readonly pending = new Set<Promise<boolean>>();
   private readonly budget: MediaBudget;
   private closed = false;
   constructor(
@@ -60,42 +124,48 @@ export class LibraryImages {
       return null;
     }
   }
-  put(key: string, bytes: Uint8Array): Promise<boolean> {
+  put(key: string, bytes: Uint8Array, canPublish?: () => Promise<boolean>): Promise<boolean> {
     if (this.closed || !bytes.length || bytes.length > 512 * 1024) return Promise.resolve(false);
-    const task = (this.queues.get(key) ?? Promise.resolve(true))
-      .then(async () => {
-        const release = await this.budget.acquire(new AbortController().signal);
-        try {
-          const filename = this.filename(key);
-          await mkdir(path.dirname(filename), { recursive: true, mode: 0o700 });
-          for (
-            let parent = path.dirname(filename);
-            parent !== path.dirname(this.mediaRoot);
-            parent = path.dirname(parent)
-          ) {
-            const info = await lstat(parent);
-            if (!info.isDirectory() || info.isSymbolicLink())
-              throw Error('UNSAFE_LIBRARY_IMAGE_PATH');
-          }
-          await this.writer.write(filename, bytes, { sync: true });
-          return true;
-        } finally {
-          release();
+    let filename: string;
+    try {
+      filename = this.filename(key);
+    } catch (error) {
+      this.diagnostics.record('library_image_write_failed', error);
+      return Promise.resolve(false);
+    }
+    const task = serializeImages([filename], async () => {
+      const release = await this.budget.acquire(new AbortController().signal);
+      try {
+        if (canPublish && !(await canPublish())) return false;
+        await mkdir(path.dirname(filename), { recursive: true, mode: 0o700 });
+        for (
+          let parent = path.dirname(filename);
+          parent !== path.dirname(this.mediaRoot);
+          parent = path.dirname(parent)
+        ) {
+          const info = await lstat(parent);
+          if (!info.isDirectory() || info.isSymbolicLink())
+            throw Error('UNSAFE_LIBRARY_IMAGE_PATH');
         }
-      })
+        await this.writer.write(filename, bytes, { sync: true });
+        return true;
+      } finally {
+        release();
+      }
+    })
       .catch((error: unknown) => {
         this.diagnostics.record('library_image_write_failed', error);
         return false;
       })
       .finally(() => {
-        if (this.queues.get(key) === task) this.queues.delete(key);
+        this.pending.delete(task);
       });
-    this.queues.set(key, task);
+    this.pending.add(task);
     return task;
   }
   async close(): Promise<void> {
     this.closed = true;
-    await Promise.all(this.queues.values());
+    await Promise.all(this.pending);
     await this.writer.close();
     this.diagnostics.close();
   }

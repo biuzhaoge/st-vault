@@ -34,12 +34,20 @@ try {
     order ??= records.map((record) => record.id);
     await route.fulfill({
       response,
-      json: records.map((record) => ({
-        ...record,
-        providerStatus: 'OFFLINE',
-        archived: removed.has(record.id),
-        lastRecordedAtMs: 1000000000 - order.indexOf(record.id),
-      })),
+      json: records.map((record) => {
+        const archived = removed.has(record.id);
+        return {
+          ...record,
+          providerStatus: 'OFFLINE',
+          archived,
+          directory: {
+            group: archived ? 'ARCHIVED' : 'OFFLINE',
+            orderStatus: archived ? 'UNKNOWN' : 'OFFLINE',
+            pending: false,
+          },
+          lastRecordedAtMs: 1000000000 - order.indexOf(record.id),
+        };
+      }),
     });
   });
   const refresh = () =>

@@ -180,9 +180,13 @@ describe('independent archive', () => {
   }, 15000);
   it('persists ID-namespaced avatar cache settings while rejecting filesystem-like keys', async () => {
     const a = await create();
-    const key = 'preview.avatar-version.stripchat:123';
-    await a.setSetting(key, 'https://static-cdn.strpst.com/avatars/synthetic');
-    expect(await a.getSetting(key)).toBe('https://static-cdn.strpst.com/avatars/synthetic');
+    const key = `preview.avatar-version.${subject.id}`;
+    const url = 'https://static-cdn.strpst.com/avatars/synthetic';
+    await a.setSetting(key, url);
+    expect(await a.getSetting(key)).toBeNull();
+    await a.upsertSubjects([subject]);
+    await a.setSetting(key, url);
+    expect(await a.getSetting(key)).toBe(url);
     await expect(a.setSetting('../private', 'invalid')).rejects.toThrow('INVALID_SETTING');
   });
   it('derives persisted offline activity from available recordings and confirmed online intervals', async () => {

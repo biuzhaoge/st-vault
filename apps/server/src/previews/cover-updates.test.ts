@@ -31,13 +31,7 @@ function fixture() {
     media: vi.fn(),
     hasMedia: vi.fn(),
   };
-  const fetch = vi.fn((input: string | URL | Request) =>
-    Promise.resolve(
-      addressOf(input).includes('/broadcasts/')
-        ? Response.json({ item: { status: 'off', isLive: false, snapshotTimestamp: 0 } })
-        : new Response(image),
-    ),
-  );
+  const fetch = vi.fn<typeof globalThis.fetch>(() => Promise.resolve(new Response(image)));
   return {
     archive,
     fetch,
@@ -130,8 +124,7 @@ it('warms all covers, skips unchanged source versions across restarts and replac
   try {
     await previews.warmCovers?.(['stripchat:42']);
     expect([...(await previews.cover('stripchat:42', undefined, true))]).toEqual([...image]);
-    const downloads = () =>
-      f.fetch.mock.calls.filter(([url]) => !addressOf(url).includes('/broadcasts/')).length;
+    const downloads = () => f.fetch.mock.calls.length;
     expect(downloads()).toBe(1);
     await previews.close();
     previews = createPreviews({ ...f, cacheRoot: root, decoder: vi.fn() });
@@ -189,7 +182,7 @@ it('uses status observations to download only new live snapshot versions, preser
   }
 });
 
-it('backs off the same missing source across foreground and heartbeat requests without delaying warm callers', async () => {
+it('keeps a missing cover quiet across foreground and heartbeat requests until a source arrives', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'stv-cover-missing-'));
   const f = fixture();
   f.source('');
@@ -202,14 +195,14 @@ it('backs off the same missing source across foreground and heartbeat requests w
     await expect(previews.cover('stripchat:42')).rejects.toMatchObject({
       code: 'preview_not_found',
     });
-    expect(f.fetch).toHaveBeenCalledTimes(1);
+    expect(f.fetch).not.toHaveBeenCalled();
     for (let i = 0; i < 4; i++) {
       await previews.warmCovers?.(['stripchat:42']);
       await expect(previews.cover('stripchat:42')).rejects.toMatchObject({
         code: 'preview_not_found',
       });
     }
-    expect(f.fetch).toHaveBeenCalledTimes(1);
+    expect(f.fetch).not.toHaveBeenCalled();
     expect(warning).not.toHaveBeenCalled();
     expect(
       (await previews.backgroundTasks!()).find((task) => task.id === 'cover-sync'),
@@ -221,7 +214,7 @@ it('backs off the same missing source across foreground and heartbeat requests w
     await expect(previews.cover('stripchat:42')).rejects.toMatchObject({
       code: 'preview_not_found',
     });
-    expect(f.fetch).toHaveBeenCalledTimes(2);
+    expect(f.fetch).not.toHaveBeenCalled();
     previews.observeCover?.('stripchat:42', 'https://img.doppiocdn.org/snapshot/42/new');
     await previews.warmCovers?.(['stripchat:42']);
     expect([...(await previews.cover('stripchat:42', undefined, true))]).toEqual([...image]);
@@ -270,20 +263,14 @@ it('retries an image transport failure on the clock without a second browser rea
 });
 
 it.each([false, true])(
-  'retries a discovered image unless an offline observation supersedes it (%s)',
+  'retries an observed image unless an offline observation supersedes it (%s)',
   async (offline) => {
-    const root = await mkdtemp(path.join(tmpdir(), 'stv-cover-discovered-'));
+    const root = await mkdtemp(path.join(tmpdir(), 'stv-cover-observed-'));
     const f = fixture(),
       id = 'stripchat:42';
     f.source('');
     let attempts = 0;
     f.fetch.mockImplementation((url) => {
-      if (addressOf(url).includes('/broadcasts/'))
-        return Promise.resolve(
-          Response.json({
-            item: { modelId: 42, status: 'public', isLive: true, snapshotTimestamp: 123 },
-          }),
-        );
       expect(addressOf(url)).toBe('https://img.doppiocdn.org/snapshot/42/123');
       attempts++;
       return Promise.resolve(
@@ -292,8 +279,12 @@ it.each([false, true])(
     });
     const previews = createPreviews({ ...f, cacheRoot: root, decoder: vi.fn() });
     try {
-      await expect(previews.cover(id)).rejects.toMatchObject({ code: 'preview_not_found' });
-      expect((await previews.backgroundTasks!())[0]).toMatchObject({ failed: 1 });
+      previews.observeCover!(id, 'https://img.doppiocdn.org/snapshot/42/123');
+      await previews.warmCovers!([id]);
+      expect((await previews.backgroundTasks!())[0]).toMatchObject({
+        failed: 1,
+        consecutiveFailures: 1,
+      });
       if (offline) {
         previews.observeCover!(id, null);
         await previews.warmCovers!([id]);
@@ -305,15 +296,18 @@ it.each([false, true])(
       } else {
         await previews.retryCovers!();
         expect(attempts).toBe(2);
-        expect((await previews.backgroundTasks!())[0]).toMatchObject({ failed: 1 });
+        expect((await previews.backgroundTasks!())[0]).toMatchObject({
+          failed: 1,
+          consecutiveFailures: 2,
+        });
         await previews.retryCovers!();
         expect(attempts).toBe(3);
         expect(await previews.cover(id, undefined, true)).toEqual(new Uint8Array(image));
       }
-      expect(
-        f.fetch.mock.calls.filter(([url]) => addressOf(url).includes('/broadcasts/')),
-      ).toHaveLength(1);
-      expect((await previews.backgroundTasks!())[0]).toMatchObject({ failed: 0 });
+      expect((await previews.backgroundTasks!())[0]).toMatchObject({
+        failed: 0,
+        consecutiveFailures: 0,
+      });
     } finally {
       await previews.close();
       await rm(root, { recursive: true, force: true });
@@ -362,7 +356,7 @@ it('retries every failed cover from one manual request, even across several down
   }
 });
 
-it('waits for a known image source without probing the broadcast API for background and archived covers', async () => {
+it('waits for an observed or stored cover source for active and archived rows', async () => {
   const root = await mkdtemp(path.join(tmpdir(), 'stv-cover-known-source-'));
   const f = fixture();
   f.source('');
@@ -371,13 +365,6 @@ it('waits for a known image source without probing the broadcast API for backgro
     { id: 'stripchat:43', providerId: 43, archived: true },
   ] as Subject[];
   const archive = { ...f.archive, listSubjects: () => Promise.resolve(subjects) };
-  f.fetch.mockImplementation((url) =>
-    Promise.resolve(
-      addressOf(url).includes('/broadcasts/')
-        ? Response.json({}, { status: 403 })
-        : new Response(image),
-    ),
-  );
   const previews = createPreviews({ archive, fetch: f.fetch, cacheRoot: root, decoder: vi.fn() });
   try {
     await previews.warmCovers!(subjects.map(({ id }) => id));
@@ -386,13 +373,11 @@ it('waits for a known image source without probing the broadcast API for backgro
     });
     expect(f.fetch).not.toHaveBeenCalled();
     expect((await previews.backgroundTasks!())[0]).toMatchObject({ failed: 0, error: null });
-    // A direct read may try once before an active subject has any status evidence.
     await expect(previews.cover('stripchat:42')).rejects.toMatchObject({
       code: 'preview_not_found',
     });
-    expect(f.fetch).toHaveBeenCalledTimes(1);
+    expect(f.fetch).not.toHaveBeenCalled();
     expect((await previews.backgroundTasks!())[0]).toMatchObject({ failed: 0, error: null });
-    f.fetch.mockClear();
     const source = 'https://img.doppiocdn.org/snapshot/42/123';
     previews.observeCover!('stripchat:42', source);
     await previews.warmCovers!(['stripchat:42']);
@@ -504,6 +489,25 @@ it('keeps a failed primary source cooling down even when the first list fallback
     previews.observeCover?.('stripchat:42', 'https://img.doppiocdn.org/snapshot/42/new');
     await previews.warmCovers?.(['stripchat:42']);
     expect(f.fetch).toHaveBeenCalledTimes(4);
+  } finally {
+    await previews.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+it('counts a failed live image and its fallback as one failed cover refresh', async () => {
+  const root = await mkdtemp(path.join(tmpdir(), 'stv-cover-fallback-failure-'));
+  const f = fixture();
+  f.fetch.mockImplementation(() => Promise.resolve(new Response(null, { status: 503 })));
+  const previews = createPreviews({ ...f, cacheRoot: root, decoder: vi.fn() });
+  try {
+    previews.observeCover?.('stripchat:42', 'https://img.doppiocdn.org/snapshot/42/bad');
+    await previews.warmCovers?.(['stripchat:42']);
+    expect(f.fetch).toHaveBeenCalledTimes(2);
+    expect((await previews.backgroundTasks!())[0]).toMatchObject({
+      failed: 1,
+      consecutiveFailures: 1,
+    });
   } finally {
     await previews.close();
     await rm(root, { recursive: true, force: true });

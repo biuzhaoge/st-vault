@@ -1,0 +1,54 @@
+.monitor-wall {
+  grid-area: 2 / 1;
+  position: relative;
+  display: grid;
+  grid-template: minmax(0, 1fr) / minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.monitor-wall-return {
+  position: absolute;
+  inset-inline-end: var(--workspace-gap);
+  inset-block-end: var(--workspace-gap);
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 4px 10px 4px 7px;
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 550;
+  white-space: nowrap;
+}
+
+.monitor-wall-return:hover:enabled {
+  box-shadow: var(--segment-active-shadow);
+}
+
+.monitor-wall-return svg {
+  width: 13px;
+  height: 13px;
+}
+
+.monitor-wall-viewport {
+  display: grid;
+  place-items: center;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.monitor-wall-grid {
+  display: grid;
+}
+
+.monitor-wall-grid:not([data-columns]) {
+  visibility: hidden;
+}
+
+.monitor-wall-grid > * {
+  min-width: 0;
+  min-height: 0;
+}

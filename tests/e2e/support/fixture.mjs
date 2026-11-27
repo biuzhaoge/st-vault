@@ -120,10 +120,15 @@ export async function startFixture(options = {}) {
         lease = await auth.beginSetup();
       await auth.completeSetup(options.pin ?? '012345', lease);
     }
+    const directoryImages = (id) => ({
+      previewSourceUrl: `https://static-cdn.strpst.com/previews/${id}`,
+      avatarSourceUrl: `https://static-cdn.strpst.com/avatars/${id}`,
+    });
     const subjects = Array.from({ length: 300 }, (_, index) => ({
       id: `stripchat:${index + 1}`,
       providerId: index + 1,
       handle: index === 41 ? '00 演示直播' : `演示主播 ${String(index + 1).padStart(3, '0')}`,
+      ...directoryImages(index + 1),
     }));
     await archive.upsertSubjects(subjects, { syncAccount: true });
     // A successful list is a complete snapshot, including every current follow.
@@ -191,7 +196,13 @@ export async function startFixture(options = {}) {
     await archive.setObservation('stripchat:42', 'PRIVATE', started + 1, 600000);
     await archive.setObservation('stripchat:42', 'PUBLIC', started + 2, 600000);
     const provider = {
-      importList: async () => subjects,
+      importList: async () => [
+        ...subjects,
+        ...(options.followingAdditions ?? []).map((subject) => ({
+          ...directoryImages(subject.providerId),
+          ...subject,
+        })),
+      ],
       status: async () => 'PUBLIC',
       capture: async () => {},
     };
@@ -282,24 +293,12 @@ export async function startFixture(options = {}) {
       validateSnapshot: (bytes, signal) => verifyJpeg(bytes, signal, decodeOptions),
       fetch: async (input) => {
         const url = new URL(typeof input === 'string' ? input : (input.url ?? input.href));
-        if (url.pathname.includes('/broadcasts/'))
-          return Response.json({
-            item: { snapshotTimestamp: Math.floor(Date.now() / 15000) },
-          });
-        const profile = /\/models\/(\d+)\/cam$/.exec(url.pathname);
-        if (profile)
-          return Response.json({
-            user: {
-              user: {
-                id: Number(profile[1]),
-                avatarUrl: `https://static-cdn.strpst.com/avatars/${profile[1]}`,
-              },
-            },
-          });
-        return new Response(
-          read(Number(url.pathname.split('/')[2]) % 2 ? 'portrait.jpg' : 'landscape.jpg'),
-          { headers: { 'content-type': 'image/jpeg' } },
-        );
+        const image = /^\/(?:avatars|previews)\/([1-9]\d*)$/.exec(url.pathname);
+        if (url.origin !== 'https://static-cdn.strpst.com' || !image)
+          throw new Error(`Unexpected synthetic preview request: ${url.origin}${url.pathname}`);
+        return new Response(read(Number(image[1]) % 2 ? 'portrait.jpg' : 'landscape.jpg'), {
+          headers: { 'content-type': 'image/jpeg' },
+        });
       },
     });
     const info = {

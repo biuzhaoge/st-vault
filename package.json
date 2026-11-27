@@ -1,6 +1,6 @@
 {
   "name": "st-vault",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "Personal public-live recorder and timeline browser for NAS deployments",
   "workspaces": [

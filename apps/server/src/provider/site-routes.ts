@@ -60,6 +60,7 @@ interface Options {
   fetch?: typeof fetch;
   now?: () => number;
   timeoutMs?: number;
+  observationPeriod?: () => number;
 }
 const configPath = '/api/front/v3/config/initial-dynamic?requestPath=/';
 function verifySiteConfig(text: string): void {
@@ -109,6 +110,12 @@ export class SiteRoutes {
   private access: NonNullable<SiteRoutesStatus['access']>;
   private sequence = 0;
   private accessSequence = 0;
+  private bindingSequence = 0;
+  private lastObservedPeriod: number | undefined;
+  private lastSuccessfulRound?: { period: number; atMs: number };
+  private failedRound?: NonNullable<NonNullable<SiteRoutesStatus['access']>['lastFailedRound']> & {
+    period: number;
+  };
   private transientFailure?: { confirmAfter: number; at: number };
   private lastProbeAtMs: number | null = null;
   private refreshing: Promise<void> | undefined;
@@ -157,9 +164,16 @@ export class SiteRoutes {
     return this.options.now?.() ?? Date.now();
   }
   status(): SiteRoutesStatus {
+    const round = this.failedRound;
     return {
       lastProbeAtMs: this.lastProbeAtMs,
-      access: { ...this.access },
+      access: {
+        ...this.access,
+        lastSuccessAtMs: this.lastSuccessfulRound?.atMs ?? this.access.lastSuccessAtMs,
+        lastFailedRound: round
+          ? { error: round.error, atMs: round.atMs, consecutiveFailures: round.consecutiveFailures }
+          : null,
+      },
       selectedOrigin: this.selected,
       probing: Boolean(this.refreshing),
       probeProgress: { ...this.probeProgress },
@@ -175,14 +189,39 @@ export class SiteRoutes {
       ),
     };
   }
+  activeBinding(): AbortSignal {
+    return this.binding.signal;
+  }
   configure(origin: string | null): void {
     if (origin !== null && !this.candidates.some((site) => site.origin === origin))
       throw new Error('INVALID_SITE_ORIGIN');
     this.measurement?.abort();
     const next = origin ?? this.candidates[0].origin;
     if (next === this.selected) return;
+    this.resetBinding(next);
+  }
+  resetTransport(): void {
+    this.measurement?.abort();
+    this.lastProbeAtMs = null;
+    this.probeProgress = { completed: 0, total: this.candidates.length, failed: 0 };
+    for (const site of this.candidates) {
+      site.latencyMs = null;
+      site.checkedAtMs = 0;
+      site.failures = 0;
+      site.testing = false;
+      site.error = null;
+      site.generation = this.sequence + 1;
+    }
+    this.resetBinding(this.selected ?? this.candidates[0].origin);
+  }
+  private resetBinding(next: string): void {
     this.binding.abort();
     this.binding = new AbortController();
+    this.bindingSequence = ++this.sequence;
+    this.accessSequence = this.bindingSequence;
+    this.lastObservedPeriod = undefined;
+    this.lastSuccessfulRound = undefined;
+    this.failedRound = undefined;
     this.transientFailure = undefined;
     this.access = { origin: next, checkedAtMs: null, lastSuccessAtMs: null, error: null };
     this.selected = next;
@@ -205,14 +244,38 @@ export class SiteRoutes {
         JSON.stringify({ event: 'public_site_failed', origin: site.origin, reason, status }),
       );
   }
-  private observeAccess(origin: string, error: string | null, sequence: number): void {
+  private observeAccess(
+    origin: string,
+    error: string | null,
+    sequence: number,
+    period: number,
+  ): void {
     if (
       this.controller.signal.aborted ||
       origin !== this.selected ||
-      sequence < this.accessSequence
+      sequence < this.bindingSequence
     )
       return;
     const at = this.now();
+    // Independent requests share a heartbeat. One valid response proves the site was
+    // reachable in that period; bursts of failures still count as one observation.
+    if (this.lastObservedPeriod === undefined || period >= this.lastObservedPeriod) {
+      this.lastObservedPeriod = period;
+      const previous = this.failedRound;
+      if (!error) {
+        this.lastSuccessfulRound = { period, atMs: at };
+        this.failedRound = undefined;
+      } else if (this.lastSuccessfulRound?.period !== period) {
+        this.failedRound = {
+          period,
+          error,
+          atMs: at,
+          consecutiveFailures:
+            (previous?.consecutiveFailures ?? 0) + Number(previous?.period !== period),
+        };
+      }
+    }
+    if (sequence < this.accessSequence) return;
     if (
       error &&
       transientAccess(error) &&
@@ -243,6 +306,7 @@ export class SiteRoutes {
   /** A real account request supplies the same connectivity evidence as an anonymous read. */
   beginAccess(origin: string): (error?: unknown) => void {
     const sequence = ++this.sequence;
+    const period = this.options.observationPeriod?.() ?? sequence;
     return (error) => {
       if (
         error instanceof ProviderError &&
@@ -253,7 +317,7 @@ export class SiteRoutes {
         ![408, 425, 429].includes(error.status) &&
         !error.challenge
       ) {
-        this.observeAccess(origin, null, sequence);
+        this.observeAccess(origin, null, sequence, period);
         return;
       }
       if (error && !retryable(error)) return;
@@ -265,6 +329,7 @@ export class SiteRoutes {
             : `${error.code}${error.status ? `:${error.status}` : ''}`
           : null,
         sequence,
+        period,
       );
     };
   }
@@ -277,6 +342,7 @@ export class SiteRoutes {
     verifyPayload = false,
   ): Promise<T> {
     const sequence = ++this.sequence,
+      period = this.options.observationPeriod?.() ?? sequence,
       started = this.now();
     let transportReady = false;
     if (site.failures || probe) site.testing = true;
@@ -293,7 +359,7 @@ export class SiteRoutes {
         }
         if (!verifyPayload) {
           transportReady = true;
-          this.observeAccess(site.origin, null, sequence);
+          this.observeAccess(site.origin, null, sequence, period);
         }
       }
       let value: T;
@@ -304,7 +370,7 @@ export class SiteRoutes {
         throw new ProviderError('invalid-upstream-json');
       }
       aborted(signal);
-      if (!probe && verifyPayload) this.observeAccess(site.origin, null, sequence);
+      if (!probe && verifyPayload) this.observeAccess(site.origin, null, sequence, period);
       // Order evidence by request admission, not a failure counter: a newer
       // in-flight success can recover, but an older late response cannot overwrite it.
       if (sequence >= site.generation) {
@@ -324,7 +390,7 @@ export class SiteRoutes {
         !verifyPayload &&
         ((error.status === 403 && !error.challenge) || error.code === 'upstream-item-unavailable');
       if (!probe && !signal.aborted && requestRestriction)
-        this.observeAccess(site.origin, null, sequence);
+        this.observeAccess(site.origin, null, sequence, period);
       if (!signal.aborted && retryable(error) && !requestRestriction && !transportReady) {
         if (sequence >= site.generation)
           this.fail(
@@ -343,6 +409,7 @@ export class SiteRoutes {
                 ? `${error.code}${error.status ? `:${error.status}` : ''}`
                 : 'upstream-request',
             sequence,
+            period,
           );
       }
       throw error;
@@ -398,7 +465,7 @@ export class SiteRoutes {
     const signal = AbortSignal.any([this.controller.signal, measurement.signal]);
     const candidates = this.candidates;
     this.lastProbeAtMs = this.now();
-    this.probeProgress = { completed: 0, total: candidates.length, failed: 0 };
+    const progress = (this.probeProgress = { completed: 0, total: candidates.length, failed: 0 });
     let index = 0;
     const worker = async (): Promise<void> => {
       while (index < candidates.length && !signal.aborted) {
@@ -406,7 +473,7 @@ export class SiteRoutes {
         try {
           await this.attempt(site, configPath, verifySiteConfig, signal, true);
         } catch (error) {
-          if (!signal.aborted) this.probeProgress.failed++;
+          if (!signal.aborted) progress.failed++;
           if (!signal.aborted && !retryable(error))
             console.warn(
               JSON.stringify({
@@ -416,7 +483,7 @@ export class SiteRoutes {
               }),
             );
         } finally {
-          this.probeProgress.completed++;
+          progress.completed++;
           this.changed();
         }
       }

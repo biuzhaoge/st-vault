@@ -16,20 +16,27 @@ const patchSchema = preferencesSchema
   .partial()
   .refine((value) => Object.keys(value).length > 0);
 type Preferences = NetworkRoutesStatus['preferences'];
+type Options = Pick<LiveSourceOptions, 'fetch' | 'keyLookup'> & {
+  transportSignal?: () => AbortSignal;
+};
 
-/** Only HLS CDN preferences; the account owns the website origin. */
-export class NetworkRouting {
-  private queue: Promise<unknown> = Promise.resolve();
-  private readonly controller = new AbortController();
-  private probe?: Promise<void>;
-  private cdnProbe: CdnProbeStatus = {
-    running: false,
+function cdnProbeState(running = false): CdnProbeStatus {
+  return {
+    running,
     completed: 0,
     total: HLS_EDGES.length,
     testingHost: null,
     error: null,
     results: {},
   };
+}
+
+/** Only HLS CDN preferences; the account owns the website origin. */
+export class NetworkRouting {
+  private queue: Promise<unknown> = Promise.resolve();
+  private readonly controller = new AbortController();
+  private probe?: Promise<void>;
+  private cdnProbe = cdnProbeState();
   private readonly listeners = new Set<() => void>();
   private readonly cdnListeners = new Set<() => void>();
   private readonly detachSites: () => void;
@@ -38,7 +45,7 @@ export class NetworkRouting {
     private readonly archive: Pick<ArchivePort, 'getSetting' | 'setSetting'>,
     readonly sites: SiteRoutes,
     private preferences: Preferences,
-    private readonly options: Pick<LiveSourceOptions, 'fetch' | 'keyLookup'>,
+    private readonly options: Options,
   ) {
     this.detachSites = sites.subscribe(() => this.changed());
   }
@@ -56,7 +63,7 @@ export class NetworkRouting {
   static async open(
     archive: Pick<ArchivePort, 'getSetting' | 'setSetting'>,
     sites: SiteRoutes,
-    options: Pick<LiveSourceOptions, 'fetch' | 'keyLookup'> = {},
+    options: Options = {},
   ): Promise<NetworkRouting> {
     const stored = await archive.getSetting('network.routes');
     const previous = stored
@@ -109,17 +116,23 @@ export class NetworkRouting {
   probeSites(): void {
     void this.sites.probe();
   }
+  resetTransport(): void {
+    this.active.clear();
+    this.cdnProbe = cdnProbeState();
+    this.changed();
+  }
+  private scope(signal?: AbortSignal): AbortSignal {
+    const transport = this.options.transportSignal?.();
+    return AbortSignal.any([
+      this.controller.signal,
+      ...(signal ? [signal] : []),
+      ...(transport ? [transport] : []),
+    ]);
+  }
   probeCdns(providerId?: number): void {
-    const lifetime = this.controller.signal;
+    const lifetime = this.scope();
     if (this.probe || lifetime.aborted) return;
-    const progress: CdnProbeStatus = {
-      running: true,
-      completed: 0,
-      total: HLS_EDGES.length,
-      testingHost: null,
-      error: null,
-      results: {},
-    };
+    const progress = cdnProbeState(true);
     this.cdnProbe = progress;
     this.probe = Promise.resolve()
       .then(async () => {
@@ -141,6 +154,7 @@ export class NetworkRouting {
             const address = source.segmentUrl(resolved, segment.address);
             const started = performance.now();
             const bytes = await source.sample(address, signal);
+            if (lifetime.aborted) break;
             if (!bytes.length) throw new ProviderError('empty-media-sample');
             progress.results[host] = {
               bytesPerSecond: Math.round(
@@ -202,8 +216,9 @@ export class NetworkRouting {
   }
   async keySample(
     key: { name: string; value: string },
-    signal: AbortSignal,
+    requested: AbortSignal,
   ): Promise<{ name: string; address: string } | undefined> {
+    const signal = this.scope(requested);
     const ids = await this.publicProbeRooms(signal);
     for (const id of ids.slice(0, 3)) {
       if (signal.aborted) return undefined;

@@ -9,6 +9,7 @@ export interface AddressKey {
   name: string;
   value: string;
 }
+type SealedSecretPurpose = 'account-sync' | 'socks-proxy';
 
 export class KeyVault {
   private current: AddressKey | null = null;
@@ -95,7 +96,7 @@ export class KeyVault {
     return Number(this.current !== null);
   }
   /** Purpose-bound v1 secrets share the existing master, never the address-key envelope. */
-  async readSealedSecret(purpose: 'account-sync'): Promise<string | null> {
+  async readSealedSecret(purpose: SealedSecretPurpose): Promise<string | null> {
     const saved = await this.archive.getSetting(`private.sealed.${purpose}`);
     if (!saved || saved === 'null') return null;
     try {
@@ -130,7 +131,7 @@ export class KeyVault {
       throw new Error('SEALED_SECRET_INVALID');
     }
   }
-  writeSealedSecret(purpose: 'account-sync', value: string | null): Promise<void> {
+  writeSealedSecret(purpose: SealedSecretPurpose, value: string | null): Promise<void> {
     const operation = this.queue.then(async () => {
       if (value === null) {
         await this.archive.setSetting(`private.sealed.${purpose}`, 'null');

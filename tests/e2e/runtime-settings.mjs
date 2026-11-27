@@ -9,6 +9,27 @@ try {
   browser = await chromium.launch({ executablePath: '/usr/bin/chromium', headless: true });
   const page = await browser.newPage();
   const endpoint = base + '/api/settings';
+  const proxyEndpoint = `${endpoint}/socks-proxy`;
+  let proxy = { enabled: false, endpoint: '', username: '', passwordSet: false };
+  const proxyWrites = [];
+  await page.route(proxyEndpoint, async (route) => {
+    if (route.request().method() === 'PUT') {
+      const data = route.request().postDataJSON();
+      proxyWrites.push(data);
+      proxy = {
+        enabled: data.enabled,
+        endpoint: data.endpoint,
+        username: data.username,
+        passwordSet:
+          data.password !== undefined
+            ? data.password.length > 0
+            : proxy.endpoint === data.endpoint &&
+              proxy.username === data.username &&
+              proxy.passwordSet,
+      };
+    }
+    await route.fulfill({ json: proxy });
+  });
   const put = async (data) => {
     const response = await page.request.put(endpoint, { headers: { origin: base }, data });
     assert.equal(response.status(), 200);
@@ -72,9 +93,76 @@ try {
   assert.equal(zero.saved.minFreeBytes, 0);
   await poll.fill('1.001');
   assert.deepEqual((await save()).sent, { pollMs: 1001 });
-  console.log(
-    '[qa] Concurrent partial settings, untouched field refresh, blank and explicit zero passed',
-  );
+  const proxyToggle = dialog.getByRole('switch', { name: '启用 SOCKS5 代理', exact: true });
+  const proxyAddress = dialog.getByRole('textbox', { name: /代理地址/ });
+  const proxyUsername = dialog.getByRole('textbox', { name: /代理用户名/ });
+  const proxyPassword = dialog.getByLabel('代理密码', { exact: true });
+  const saveProxy = dialog.getByRole('button', { name: '保存代理设置', exact: true });
+  await proxyToggle.waitFor();
+  assert.equal(await proxyToggle.getAttribute('aria-checked'), 'false');
+  await proxyToggle.click();
+  for (const invalid of [
+    'http://proxy.test:8080',
+    'socks5://proxy.test',
+    'socks5://user:password@proxy.test:1080',
+  ]) {
+    await proxyAddress.fill(invalid);
+    await saveProxy.click();
+    await dialog
+      .getByRole('alert')
+      .filter({ hasText: /代理地址/ })
+      .waitFor();
+  }
+  assert.deepEqual(proxyWrites, []);
+  await proxyAddress.fill(' socks5://proxy.test:1080 ');
+  await proxyUsername.fill('test-user');
+  await saveProxy.click();
+  await dialog
+    .getByRole('alert')
+    .filter({ hasText: /启用代理认证时须填写密码/ })
+    .waitFor();
+  assert.deepEqual(proxyWrites, []);
+  await proxyPassword.fill('test-password');
+  await saveProxy.click();
+  await dialog.getByText('代理设置已保存', { exact: true }).waitFor();
+  assert.deepEqual(proxyWrites[0], {
+    enabled: true,
+    endpoint: 'socks5://proxy.test:1080',
+    username: 'test-user',
+    password: 'test-password',
+  });
+  assert.equal(await proxyPassword.inputValue(), '');
+  await proxyToggle.click();
+  await saveProxy.click();
+  await dialog.getByText('代理设置已保存', { exact: true }).waitFor();
+  assert.deepEqual(proxyWrites[1], {
+    enabled: false,
+    endpoint: 'socks5://proxy.test:1080',
+    username: 'test-user',
+  });
+  await dialog.getByRole('button', { name: '清除已保存密码', exact: true }).click();
+  await saveProxy.click();
+  await dialog.getByText('代理设置已保存', { exact: true }).waitFor();
+  assert.equal(proxyWrites[2].password, '');
+  assert.equal(await proxyPassword.inputValue(), '');
+  await settings.click();
+  await page.locator('.toolbar-popover[aria-label="设置"]').waitFor({ state: 'detached' });
+  proxy = {
+    enabled: false,
+    endpoint: '',
+    username: '',
+    passwordSet: false,
+    error: 'proxy_settings_unavailable',
+  };
+  await settings.click();
+  await dialog
+    .getByRole('alert')
+    .filter({ hasText: /服务器已暂停出站请求/ })
+    .waitFor();
+  await saveProxy.click();
+  await dialog.getByText('代理设置已保存', { exact: true }).waitFor();
+  assert.deepEqual(proxyWrites[3], { enabled: false, endpoint: '', username: '' });
+  console.log('[qa] Runtime settings and independent SOCKS5 proxy controls passed');
 } finally {
   await browser?.close();
   await fixture.close();
