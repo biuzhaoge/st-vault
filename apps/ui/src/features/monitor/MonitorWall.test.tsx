@@ -1,5 +1,4 @@
 import type { PublicStatus, Subject } from '@st-vault/api-schema';
-import { setTimeout as wait } from 'node:timers/promises';
 import type * as React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { expect, it, vi } from 'vitest';
@@ -99,7 +98,7 @@ it('starts every release immediately and waits for the remaining streams after a
     });
     expect(broken).toHaveBeenCalledOnce();
     expect(slow).toHaveBeenCalledOnce();
-    await wait(0);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
     expect(released).not.toHaveBeenCalled();
     finish();
     await returnReady;
