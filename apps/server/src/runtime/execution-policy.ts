@@ -98,7 +98,7 @@ export function deriveExecutionPolicy(input: Inputs): ExecutionPolicy {
       mediaConcurrency: network,
       maxRequests: network * 4,
       maxSessions: bounded(cpu * 4, 16, 128),
-      maxOwnerSessions: bounded(cpu * 2, 4, 32),
+      maxOwnerSessions: bounded(cpu * 4, 8, 64),
     },
     status: {
       publicConcurrency: network,

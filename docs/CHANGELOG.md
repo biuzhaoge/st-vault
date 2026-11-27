@@ -4,13 +4,13 @@
 
 ### 中文
 
-- 新增动态监控墙，按在线列表排列公开和私密房间，支持连接失败自动重试。
+- 新增动态监控墙，按在线列表排列公开和私密房间，支持连接失败自动重试，单用户同时播放额度提高到 8–64 路。
 - 统一关注清单、批量直播状态与归档原因的来源，增加 SOCKS5 代理设置。
 - 周期同步连续三轮失败才告警，恢复后自动清除。历史面板扩展至约 20 行，播放等待封面完整显示并带柔和模糊。
 
 ### English
 
-- Added a live monitor wall with ordered public and private rooms and automatic connection retries.
+- Added a live monitor wall with ordered public and private rooms and automatic connection retries. Per-user live playback capacity now ranges from 8 to 64 streams.
 - Unified following, batch live status and archive classification sources. Added SOCKS5 proxy settings.
 - Scheduled sync raises an alert after three consecutive failed rounds and clears it on recovery. History shows around 20 rows, and waiting players display the full cover with a soft blur.
 

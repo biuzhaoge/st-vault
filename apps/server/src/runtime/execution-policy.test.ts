@@ -2,6 +2,17 @@ import { expect, it } from 'vitest';
 import { cpuQuota, deriveExecutionPolicy } from './execution-policy.js';
 
 const GIB = 1024 ** 3;
+it.each([
+  [1, 8],
+  [4, 16],
+  [16, 64],
+  [32, 64],
+])('allocates monitor wall capacity for %i CPUs', (cpuCount, expected) => {
+  const { live } = deriveExecutionPolicy({ cpuCount, memoryBytes: 4 * GIB });
+  expect(live.maxOwnerSessions).toBe(expected);
+  expect(live.maxOwnerSessions).toBeLessThanOrEqual(live.maxSessions);
+});
+
 it('uses strong hardware while reserving memory and connection headroom', () => {
   const policy = deriveExecutionPolicy({ cpuCount: 16, memoryBytes: 8 * GIB });
   expect(policy.previews.decoderConcurrency).toBe(8);
