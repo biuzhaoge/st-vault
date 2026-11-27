@@ -7,13 +7,14 @@ import { ffmpegRuntime, generateMedia, outputRoot, projectRoot } from './media.m
 export async function startFixture(options = {}) {
   const modules = (name) =>
     import(pathToFileURL(path.join(projectRoot, 'build', 'apps', 'server', 'src', name)).href);
-  let archive, app, runtime, root, network, sites, legacyToken;
+  let archive, app, runtime, root, network, sites, socksProxy, legacyToken;
   const close = async () => {
     const failures = [];
     for (const cleanup of [
       () => app?.close(),
       () => sites?.close(),
       () => network?.close(),
+      () => socksProxy?.close(),
       () => archive?.close(),
       () => runtime?.close(),
     ]) {
@@ -44,6 +45,7 @@ export async function startFixture(options = {}) {
       { NetworkRouting },
       { SiteRoutes },
       { LocalAuth },
+      { SocksProxySettings },
     ] = await Promise.all(
       [
         'archive/index.js',
@@ -56,6 +58,7 @@ export async function startFixture(options = {}) {
         'network/network-routing.js',
         'provider/site-routes.js',
         'http/auth.js',
+        'runtime/socks-proxy.js',
       ].map(modules),
     );
     runtime = await ffmpegRuntime();
@@ -330,7 +333,9 @@ export async function startFixture(options = {}) {
     };
     sites = new SiteRoutes({ fetch: routeFetch });
     network = await NetworkRouting.open(archive, sites, { fetch: routeFetch });
+    socksProxy = await SocksProxySettings.open(vault);
     app = await buildApp({
+      socksProxy,
       accountSync: options.accountSync,
       network,
       archive,
