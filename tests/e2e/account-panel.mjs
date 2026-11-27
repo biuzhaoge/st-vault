@@ -77,7 +77,7 @@ try {
   await page.getByRole('button', { name: '更换 Cookies', exact: true }).waitFor();
   assert.match(
     await page.getByRole('button', { name: '归档', exact: true }).getAttribute('title'),
-    /临时网络或状态异常不会直接归档/,
+    /封禁或取关的主播有录像时归入归档/,
   );
   await page.evaluate(() => localStorage.setItem('stv-language', 'en'));
   await page.reload();
